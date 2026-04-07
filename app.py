@@ -12,6 +12,10 @@ import requests
 from itertools import product
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import accuracy_score
 
 st.set_page_config(
     page_title="Momentum Candle Backtester",
@@ -83,6 +87,33 @@ SL_LABELS    = {0.005: "0.5%", 0.010: "1.0%", 0.015: "1.5%", 0.020: "2.0%"}
 
 TP_MODES = ["2R", "3R", "Partial"]
 
+ANALYSIS_SYSTEM_PROMPT = """You are a systematic momentum trading analyst. You produce structured trade decisions — not commentary, not education, not opinions. Every response follows the exact output format below. No exceptions.
+
+OUTPUT FORMAT (mandatory):
+
+1. REGIME: [GREEN/YELLOW/RED] — Score [X]/100 — [one sentence]
+2. CANDLE: [body%]% body | [vol]x vol | ADX [X] — [STRONG/MODERATE/WEAK]
+3. EVIDENCE: [N] similar -> [X]% win rate [CI] | ML: [Y]% | Combined: [Z]%
+4. FAILURE MODE: [How this setup typically loses — 1-2 sentences]
+5. ENTRY (only if TRADE): use the backtested parameters from Section D exactly.
+   Dir: [LONG/SHORT] | Entry: [price from D] | SL: [price from D] | TP: [price from D] | Hold: per TP mode | Size: [FULL/HALF]
+6. VERDICT: **[TRADE / NO TRADE / WAIT]** — [one sentence reason]
+7. FLIP: [what changes this verdict]
+
+HARD OVERRIDES (always NO TRADE):
+- Regime RED (< 45)
+- ML < 40%
+- ML-historical gap > 20pp with N >= 20
+- ATR ratio > 3.0
+
+SCORING:
+- Combined >= 60% AND GREEN -> TRADE (full)
+- Combined >= 65% AND YELLOW -> TRADE (half)
+- Combined 50-59% AND GREEN -> WAIT
+- Combined < 50% -> NO TRADE
+
+RULES: Biased toward NO TRADE in ambiguity. Never exceed 250 words. Never say "it depends." Never give entry for NO TRADE/WAIT. Lead with weakest signal when candle is strong but regime is weak. Never construct narratives for why candles won — report statistics only."""
+
 HISTORY_OPTIONS = {
     "3 months": 90, "6 months": 180, "1 year": 365,
     "2 years": 730, "3 years": 1095, "5 years": 1825,
@@ -143,6 +174,21 @@ def _clean_df(df: pd.DataFrame) -> pd.DataFrame:
         (df["low"]  - df["close"].shift()).abs(),
     ], axis=1).max(axis=1)
     df["atr14"] = tr.rolling(14).mean()
+    # ── New computed fields ──────────────────────────────────────────────────
+    # 1. ATR ratio: current ATR vs its 20-bar rolling average (volatility expansion)
+    df["atr_ratio"] = df["atr14"] / df["atr14"].rolling(20).mean()
+    # 2. Volume delta proxy: approximates buying vs selling pressure, 5-bar rolling sum
+    close_pos = (df["close"] - df["low"]) / cr   # cr already has 0→NaN from above
+    vol_delta = df["volume"] * (2 * close_pos - 1)
+    df["vol_delta_5"] = vol_delta.rolling(5).sum()
+    # 3. EMA stack with shift(1) to avoid lookahead bias
+    df["ema5"]  = df["close"].shift(1).ewm(span=5,  adjust=False).mean()
+    df["ema15"] = df["close"].shift(1).ewm(span=15, adjust=False).mean()
+    df["ema21"] = df["close"].shift(1).ewm(span=21, adjust=False).mean()
+    # 4. Candle rank: percentile rank of |body_pct| over 20 bars
+    df["candle_rank_20"] = df["body_pct"].abs().rolling(20).rank(pct=True)
+    # 5. Volume rank: percentile rank of volume over 20 bars
+    df["vol_rank_20"] = df["volume"].rolling(20).rank(pct=True)
     return df
 
 
@@ -178,6 +224,1501 @@ def calculate_adx(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
     return pd.DataFrame({"adx": adx, "di_plus": di_plus, "di_minus": di_minus},
                         index=df.index)
 
+
+def calculate_ema(df: pd.DataFrame, period: int) -> pd.Series:
+    """
+    Compute EMA(period) on close prices.
+    Uses shift(1) so the EMA at bar N is computed from bars 0..N-1 only.
+    This avoids lookahead bias — the current bar's close is NOT included
+    in its own EMA calculation.
+    Returns a Series aligned to df.index.
+    """
+    return df["close"].shift(1).ewm(span=period, adjust=False).mean()
+
+
+def calculate_regime_score(df, bar_index, direction, adx_df,
+                           htf_ema_series=None, timeframe="1D", ticker=""):
+    """
+    Compute a 0-100 regime score from 5 components:
+    - ADX(14): 30 points max
+    - ATR Ratio: 25 points max
+    - EMA/HTF alignment: 25 points max
+    - Session: 15 points max (intraday only, redistributed for daily)
+    - DI Gap: 5 points max
+
+    Returns dict with: score (0-100), verdict (GREEN/YELLOW/RED),
+    breakdown_line (string), flip_condition (string), hard_overrides (list)
+    """
+    import datetime as _dt
+
+    is_daily  = timeframe in ("1D", "1W")
+    is_crypto = str(ticker).upper().endswith("USDT")
+
+    # ── Resolve bar ────────────────────────────────────────────────────────────
+    try:
+        bar = df.iloc[bar_index]
+    except (IndexError, TypeError):
+        bar = df.iloc[-1]
+
+    close      = float(bar.get("close",      0))
+    atr        = float(bar.get("atr14",      0) or 0)
+    atr_ratio  = float(bar.get("atr_ratio",  1) or 1)
+    ema5       = float(bar.get("ema5",       close) or close)
+    ema15      = float(bar.get("ema15",      close) or close)
+    ema21      = float(bar.get("ema21",      close) or close)
+    vol_delta5 = float(bar.get("vol_delta_5", 0) or 0)
+    bar_ts     = df.index[bar_index] if bar_index < len(df) else df.index[-1]
+
+    adx_val    = float(adx_df["adx"].iloc[bar_index])      if adx_df is not None and "adx"      in adx_df.columns else 0
+    di_plus    = float(adx_df["di_plus"].iloc[bar_index])  if adx_df is not None and "di_plus"  in adx_df.columns else 0
+    di_minus   = float(adx_df["di_minus"].iloc[bar_index]) if adx_df is not None and "di_minus" in adx_df.columns else 0
+
+    # ADX 3-bars-ago for declining check
+    adx_3ago   = 0.0
+    if adx_df is not None and "adx" in adx_df.columns and bar_index >= 3:
+        adx_3ago = float(adx_df["adx"].iloc[bar_index - 3])
+
+    # ATR ratio 10-bars-ago for compression-to-expansion bonus
+    atr_ratio_10ago = 1.0
+    if bar_index >= 10 and "atr_ratio" in df.columns:
+        atr_ratio_10ago = float(df["atr_ratio"].iloc[bar_index - 10] or 1)
+
+    # ATR ratio streak > 1.5 check (last 10 bars)
+    atr_high_streak = 0
+    if "atr_ratio" in df.columns and bar_index >= 10:
+        atr_high_streak = int(
+            (df["atr_ratio"].iloc[max(0, bar_index - 10):bar_index + 1] > 1.5).sum()
+        )
+
+    # ── 1. ADX score (0-30) ────────────────────────────────────────────────────
+    if adx_val < 15:
+        adx_pts = 0
+    elif adx_val < 20:
+        adx_pts = 8
+    elif adx_val < 25:
+        adx_pts = 18
+    elif adx_val < 30:
+        adx_pts = 28
+    elif adx_val <= 40:
+        adx_pts = 30
+    else:
+        adx_pts = 25   # overheated penalty
+
+    adx_declining = adx_val > 25 and adx_3ago > 0 and adx_val < adx_3ago
+    if adx_declining:
+        adx_pts -= 5
+
+    adx_max = 30
+
+    # ── 2. ATR Ratio score (0-25) ──────────────────────────────────────────────
+    if atr_ratio < 0.6:
+        atr_pts = 5
+    elif atr_ratio < 0.8:
+        atr_pts = 12
+    elif atr_ratio < 1.0:
+        atr_pts = 18
+    elif atr_ratio < 1.5:
+        atr_pts = 25
+    elif atr_ratio < 2.0:
+        atr_pts = 20
+    else:
+        atr_pts = 10
+
+    # Compression→expansion bonus
+    if atr_ratio > 1.0 and atr_ratio_10ago < 0.8:
+        atr_pts = min(25, atr_pts + 5)
+    # Prolonged overheated penalty
+    if atr_high_streak >= 10:
+        atr_pts = max(0, atr_pts - 5)
+
+    atr_max = 25
+
+    # ── 3. EMA / HTF alignment score (0-25) ───────────────────────────────────
+    # EMA stack: ema5 > ema15 > ema21 for long; reverse for short
+    if direction == "long":
+        stack_full    = ema5 > ema15 and ema15 > ema21
+        stack_partial = (ema5 > ema15) or (ema15 > ema21)
+    else:
+        stack_full    = ema5 < ema15 and ema15 < ema21
+        stack_partial = (ema5 < ema15) or (ema15 < ema21)
+
+    stack_pts = 10 if stack_full else (5 if stack_partial else 0)
+
+    # HTF EMA
+    htf_pts   = 0
+    htf_score = 0
+    if htf_ema_series is not None:
+        try:
+            htf_ema_val = float(htf_ema_series.reindex([bar_ts], method="ffill").iloc[0])
+        except Exception:
+            htf_ema_val = None
+
+        if htf_ema_val is not None and htf_ema_val > 0 and atr > 0:
+            dist = close - htf_ema_val
+            if direction == "long":
+                on_correct_side = dist > 0
+                within_1atr     = abs(dist) <= atr
+            else:
+                on_correct_side = dist < 0
+                within_1atr     = abs(dist) <= atr
+
+            if on_correct_side:
+                htf_pts   = 10
+                htf_score = 10
+            elif within_1atr:
+                htf_pts   = 5
+                htf_score = 5
+            # else 0
+    else:
+        htf_score = 5   # neutral when no HTF data
+
+    # Cross-TF agreement bonus
+    cross_tf_pts = 5 if (stack_pts >= 5 and htf_score >= 5) else 0
+
+    ema_pts = min(25, stack_pts + htf_pts + cross_tf_pts)
+    ema_max = 25
+
+    # ── 4. Session score (0-15) ────────────────────────────────────────────────
+    sess_pts = 0
+    sess_max = 15
+    if is_daily:
+        sess_pts = 0
+        # Redistribute 15 pts: +5 to each of ADX, ATR, EMA caps
+        adx_max  = 35
+        atr_max  = 30
+        ema_max  = 30
+        adx_pts  = min(adx_max, adx_pts)
+        atr_pts  = min(atr_max, atr_pts)
+        ema_pts  = min(ema_max, ema_pts)
+    else:
+        # Determine WIB hour from bar timestamp
+        try:
+            if hasattr(bar_ts, "to_pydatetime"):
+                _naive = bar_ts.to_pydatetime()
+            else:
+                _naive = bar_ts
+            # Binance timestamps are UTC; WIB = UTC+7
+            wib_hour = (_naive.hour + 7) % 24
+        except Exception:
+            wib_hour = 12
+
+        sess_name = get_session(wib_hour)
+
+        if is_crypto:
+            sess_pts = 7 if sess_name == "Dead Zone" else 10
+        else:
+            _sess_map = {"NY+London": 15, "London": 13, "Asian": 4, "Dead Zone": 2}
+            sess_pts  = _sess_map.get(sess_name, 4)
+
+    # ── 5. DI Gap score (0-5) ─────────────────────────────────────────────────
+    di_gap = di_plus - di_minus
+    if direction == "long":
+        di_aligned = di_plus > di_minus
+        gap_abs    = di_gap
+    else:
+        di_aligned = di_minus > di_plus
+        gap_abs    = -di_gap
+
+    if di_aligned and gap_abs >= 15:
+        di_pts = 5
+    elif di_aligned and gap_abs >= 5:
+        di_pts = 3
+    elif abs(di_gap) < 5:
+        di_pts = 1
+    else:
+        di_pts = 0   # opposed
+
+    # ── 6. Volume delta modifier (±3) ─────────────────────────────────────────
+    if direction == "long":
+        vol_mod = 3 if vol_delta5 > 0 else (-3 if vol_delta5 < 0 else 0)
+    else:
+        vol_mod = 3 if vol_delta5 < 0 else (-3 if vol_delta5 > 0 else 0)
+
+    # ── Total ──────────────────────────────────────────────────────────────────
+    raw_score = adx_pts + atr_pts + ema_pts + sess_pts + di_pts + vol_mod
+    score     = max(0, min(100, raw_score))
+
+    # ── Hard overrides ─────────────────────────────────────────────────────────
+    hard_overrides = []
+
+    if atr_ratio > 3.0:
+        hard_overrides.append(f"ATR Ratio {atr_ratio:.1f} > 3.0 — extreme volatility")
+
+    if not is_crypto and not is_daily:
+        try:
+            if hasattr(bar_ts, "to_pydatetime"):
+                _bdt = bar_ts.to_pydatetime()
+            else:
+                _bdt = bar_ts
+            _wib_hour = (_bdt.hour + 7) % 24
+            if _bdt.weekday() == 4 and _wib_hour >= 16:   # Friday WIB ≥ 16:00
+                hard_overrides.append("Friday 16:00+ WIB — liquidity drying up")
+        except Exception:
+            pass
+
+    if htf_ema_series is not None and htf_score == 0 and atr > 0:
+        try:
+            htf_ema_val2 = float(htf_ema_series.reindex([bar_ts], method="ffill").iloc[0])
+            if abs(close - htf_ema_val2) > 2 * atr:
+                hard_overrides.append("Counter-HTF extreme: price > 2×ATR from HTF EMA")
+        except Exception:
+            pass
+
+    verdict = "RED"
+    if not hard_overrides:
+        if score >= 70:
+            verdict = "GREEN"
+        elif score >= 45:
+            verdict = "YELLOW"
+
+    # ── Breakdown line ─────────────────────────────────────────────────────────
+    def _icon(pts, max_pts):
+        ratio = pts / max_pts if max_pts > 0 else 0
+        return "✅" if ratio >= 0.7 else ("⚠️" if ratio >= 0.35 else "❌")
+
+    adx_icon  = _icon(adx_pts,  adx_max)
+    atr_icon  = _icon(atr_pts,  atr_max)
+    ema_icon  = _icon(ema_pts,  ema_max)
+    sess_icon = _icon(sess_pts, sess_max) if not is_daily else "—"
+    di_icon   = _icon(di_pts,   5)
+
+    breakdown_line = (
+        f"ADX: {adx_val:.1f} {adx_icon} ({adx_pts}/{adx_max}) | "
+        f"ATR×: {atr_ratio:.2f} {atr_icon} ({atr_pts}/{atr_max}) | "
+        f"EMA: {ema_icon} ({ema_pts}/{ema_max}) | "
+        f"Session: {sess_icon} ({sess_pts}/{sess_max}) | "
+        f"DI: {di_icon} ({di_pts}/5) | "
+        f"VolΔ: {'+' if vol_mod >= 0 else ''}{vol_mod}"
+    )
+
+    # ── Flip condition ─────────────────────────────────────────────────────────
+    flip_condition = ""
+    if verdict == "RED" and adx_val < 20:
+        flip_condition = f"ADX crosses 20 (currently {adx_val:.1f})"
+    elif verdict == "YELLOW" and adx_val < 25:
+        needed = 25 - adx_val
+        flip_condition = f"ADX crosses 25 (currently {adx_val:.1f}, needs +{needed:.1f})"
+    elif verdict == "GREEN" and adx_declining:
+        flip_condition = f"Watch: ADX declining. Below 25 → YELLOW."
+
+    return {
+        "score":          score,
+        "verdict":        verdict,
+        "breakdown_line": breakdown_line,
+        "flip_condition": flip_condition,
+        "hard_overrides": hard_overrides,
+        # component breakdown for callers that want raw values
+        "adx_pts":        adx_pts,
+        "atr_pts":        atr_pts,
+        "ema_pts":        ema_pts,
+        "sess_pts":       sess_pts,
+        "di_pts":         di_pts,
+        "vol_mod":        vol_mod,
+    }
+
+
+def render_regime_banner(regime_data):
+    """
+    Full-width colored banner at top of page.
+    Green background for GREEN, yellow-ish for YELLOW, red-ish for RED.
+    Shows: icon + verdict label + score + breakdown line + flip condition.
+    """
+    if regime_data is None:
+        return
+
+    verdict    = regime_data.get("verdict",        "RED")
+    score      = regime_data.get("score",          0)
+    breakdown  = regime_data.get("breakdown_line", "")
+    flip_cond  = regime_data.get("flip_condition", "")
+    overrides  = regime_data.get("hard_overrides", [])
+
+    _styles = {
+        "GREEN":  ("background:#0d2818;border:1px solid #238636;",
+                   "#3fb950", "✅", "REGIME: GO"),
+        "YELLOW": ("background:#2d2200;border:1px solid #d29922;",
+                   "#e3b341", "⚠️", "REGIME: CAUTION"),
+        "RED":    ("background:#2d0d0d;border:1px solid #da3633;",
+                   "#f85149", "❌", "REGIME: WAIT"),
+    }
+    box_style, accent, icon, label = _styles.get(verdict, _styles["RED"])
+
+    override_html = ""
+    if overrides:
+        items = "".join(
+            f'<div style="color:#f85149;font-size:12px;margin-top:2px;">🚫 {o}</div>'
+            for o in overrides
+        )
+        override_html = f'<div style="margin-top:6px;">{items}</div>'
+
+    flip_html = ""
+    if flip_cond:
+        flip_html = (f'<div style="color:#8b949e;font-size:12px;margin-top:4px;">'
+                     f'↳ {flip_cond}</div>')
+
+    st.markdown(f"""
+<div style="{box_style}border-radius:8px;padding:14px 18px;margin-bottom:12px;">
+  <div style="display:flex;align-items:baseline;gap:10px;">
+    <span style="font-size:18px;">{icon}</span>
+    <span style="color:{accent};font-weight:700;font-size:16px;">{label}</span>
+    <span style="color:{accent};font-size:22px;font-weight:800;">{score}/100</span>
+  </div>
+  <div style="color:#8b949e;font-size:12px;margin-top:6px;font-family:monospace;">
+    {breakdown}
+  </div>
+  {flip_html}{override_html}
+</div>
+""", unsafe_allow_html=True)
+
+
+# ─── Similarity Engine ─────────────────────────────────────────────────────────
+
+def compute_buckets(df, feature_cols):
+    """
+    For each feature in feature_cols, compute 33rd/66th percentile thresholds
+    and classify each row into 'Low', 'Med', or 'High'.
+    Adds {feature}_bucket columns. Returns modified DataFrame.
+    """
+    df = df.copy()
+    for col in feature_cols:
+        if col not in df.columns:
+            df[col + "_bucket"] = "Med"
+            continue
+        p33 = df[col].quantile(0.33)
+        p66 = df[col].quantile(0.66)
+        def _classify(v, lo=p33, hi=p66):
+            if v <= lo:
+                return "Low"
+            elif v <= hi:
+                return "Med"
+            return "High"
+        df[col + "_bucket"] = df[col].apply(_classify)
+    return df
+
+
+def find_similar_candles(target, historical_qualifying, direction,
+                         regime_zone, session=None, min_matches=15,
+                         ticker=""):
+    """
+    Match the target candle against historical qualifying candles by bucket
+    proximity, then rank by weighted Euclidean distance.
+
+    Returns (matched_df, metadata_dict).
+    metadata keys: n, relaxed_dim, quality_pct, target_buckets
+    """
+    import math
+
+    FEATURE_COLS  = ["body_pct_abs", "vol_mult", "atr_ratio", "adx_value"]
+    WEIGHTS       = {"body_pct_abs": 0.35, "vol_mult": 0.30,
+                     "atr_ratio": 0.20,    "adx_value": 0.15}
+    RELAX_ORDER   = ["atr_ratio", "adx_value", "vol_mult", "body_pct_abs"]
+
+    # ── Prepare historical df ─────────────────────────────────────────────────
+    hq = historical_qualifying.copy()
+    if hq.empty:
+        return pd.DataFrame(), {"n": 0, "relaxed_dim": None,
+                                 "quality_pct": 0, "target_buckets": {}}
+
+    # body_pct_abs
+    if "body_pct_abs" not in hq.columns:
+        hq["body_pct_abs"] = hq["body_pct"].abs() if "body_pct" in hq.columns else 0.0
+
+    # adx_value column (may be pre-joined or absent)
+    if "adx_value" not in hq.columns:
+        hq["adx_value"] = 25.0   # neutral fallback
+
+    # Bucket thresholds from historical distribution
+    thresholds = {}
+    for col in FEATURE_COLS:
+        if col in hq.columns:
+            thresholds[col] = (hq[col].quantile(0.33), hq[col].quantile(0.66))
+        else:
+            thresholds[col] = (0.5, 1.0)
+
+    hq = compute_buckets(hq, FEATURE_COLS)
+
+    # ── Determine target buckets using same thresholds ────────────────────────
+    target_buckets = {}
+    for col in FEATURE_COLS:
+        val = float(target.get(col, 0) if isinstance(target, dict)
+                    else getattr(target, col, 0))
+        lo, hi = thresholds[col]
+        if val <= lo:
+            target_buckets[col] = "Low"
+        elif val <= hi:
+            target_buckets[col] = "Med"
+        else:
+            target_buckets[col] = "High"
+
+    # ── Direction filter ──────────────────────────────────────────────────────
+    if "body" in hq.columns:
+        if direction == "long":
+            hq = hq[hq["body"] > 0]
+        else:
+            hq = hq[hq["body"] < 0]
+
+    # ── Regime zone filter ────────────────────────────────────────────────────
+    if regime_zone and "regime_zone" in hq.columns:
+        hq = hq[hq["regime_zone"] == regime_zone]
+
+    # ── Session filter ────────────────────────────────────────────────────────
+    if session and "session" in hq.columns:
+        hq = hq[hq["session"] == session]
+
+    if hq.empty:
+        return pd.DataFrame(), {"n": 0, "relaxed_dim": None,
+                                 "quality_pct": 0, "target_buckets": target_buckets}
+
+    # ── Adjacent bucket helper ────────────────────────────────────────────────
+    _adjacent = {"Low": {"Low", "Med"}, "Med": {"Low", "Med", "High"},
+                 "High": {"Med", "High"}}
+
+    def _bucket_filter(frame, fixed_dims, relaxed_dim=None):
+        mask = pd.Series(True, index=frame.index)
+        for col in FEATURE_COLS:
+            bcol = col + "_bucket"
+            if bcol not in frame.columns:
+                continue
+            tgt = target_buckets[col]
+            if col == relaxed_dim:
+                allowed = _adjacent[tgt]
+                mask &= frame[bcol].isin(allowed)
+            else:
+                mask &= frame[bcol] == tgt
+        return frame[mask]
+
+    # ── Primary match: all 4 dims exact ──────────────────────────────────────
+    matched      = _bucket_filter(hq, FEATURE_COLS)
+    relaxed_dim  = None
+
+    # ── Relaxation passes ────────────────────────────────────────────────────
+    if len(matched) < min_matches:
+        for dim in RELAX_ORDER:
+            candidate = _bucket_filter(hq, FEATURE_COLS, relaxed_dim=dim)
+            if len(candidate) >= min_matches:
+                matched     = candidate
+                relaxed_dim = dim
+                break
+        else:
+            # Use all relaxations if still insufficient
+            matched = hq.copy()
+
+    # ── Z-score normalise features for distance ───────────────────────────────
+    avail_feats = [c for c in FEATURE_COLS if c in matched.columns]
+    matched     = matched.copy()
+
+    means = {c: hq[c].mean() for c in avail_feats if c in hq.columns}
+    stds  = {c: max(hq[c].std(), 1e-9) for c in avail_feats if c in hq.columns}
+
+    tgt_z = {}
+    for c in avail_feats:
+        val = float(target.get(c, 0) if isinstance(target, dict)
+                    else getattr(target, c, 0))
+        tgt_z[c] = (val - means[c]) / stds[c]
+
+    def _dist(row):
+        d = 0.0
+        for c in avail_feats:
+            w   = WEIGHTS.get(c, 0.25)
+            z   = (row[c] - means[c]) / stds[c]
+            d  += w * (z - tgt_z[c]) ** 2
+        return math.sqrt(d)
+
+    matched["_distance"] = matched.apply(_dist, axis=1)
+
+    # ── Temporal weight: exp(-0.693 * days_ago / half_life) ──────────────────
+    half_life = 365 if "USDT" in str(ticker).upper() else 730
+    now_ts    = pd.Timestamp.now(tz=None).normalize()
+
+    def _tw(idx_val):
+        try:
+            ts = pd.Timestamp(idx_val)
+            if ts.tzinfo is not None:
+                ts = ts.tz_localize(None)
+            days_ago = max(0, (now_ts - ts).days)
+        except Exception:
+            days_ago = 365
+        return math.exp(-0.693 * days_ago / half_life)
+
+    matched["_temporal_weight"] = [_tw(i) for i in matched.index]
+    matched = matched.sort_values("_distance")
+
+    quality_pct = min(100, round(len(matched) / max(1, len(hq)) * 100))
+
+    meta = {
+        "n":              len(matched),
+        "relaxed_dim":    relaxed_dim,
+        "quality_pct":    quality_pct,
+        "target_buckets": target_buckets,
+    }
+    return matched, meta
+
+
+def aggregate_outcomes(matched_candles, all_trades, validated_params=None):
+    """
+    Join matched candles to trade outcomes. Only TP and SL exits count.
+    Apply temporal weighting. Return outcome dict.
+    """
+    if matched_candles.empty or all_trades.empty:
+        return {"n": 0, "confidence": "INSUFFICIENT"}
+
+    # Normalise trade index to date for joining
+    trades = all_trades.copy()
+    if hasattr(trades.index, "normalize"):
+        trades.index = trades.index.normalize()
+
+    # Keep only TP/SL exits
+    if "exit_type" in trades.columns:
+        trades = trades[trades["exit_type"].isin(["TP", "SL", "tp", "sl",
+                                                   "Take Profit", "Stop Loss"])]
+
+    if trades.empty:
+        return {"n": 0, "confidence": "INSUFFICIENT"}
+
+    # Join on date index
+    mc_dates = matched_candles.index
+    if hasattr(mc_dates, "normalize"):
+        mc_dates = mc_dates.normalize()
+
+    joined = trades[trades.index.isin(mc_dates)].copy()
+    if joined.empty:
+        return {"n": 0, "confidence": "INSUFFICIENT"}
+
+    # Attach temporal weights
+    tw_map = dict(zip(
+        matched_candles.index.normalize()
+        if hasattr(matched_candles.index, "normalize")
+        else matched_candles.index,
+        matched_candles["_temporal_weight"]
+    ))
+    joined["_tw"] = joined.index.map(lambda x: tw_map.get(x, 1.0))
+
+    # r_multiple column (try common names)
+    r_col = next((c for c in ["r_multiple", "r", "R", "r_mult"] if c in joined.columns), None)
+    if r_col is None:
+        return {"n": 0, "confidence": "INSUFFICIENT"}
+
+    n = len(joined)
+
+    # Wins: r > 0
+    wins   = joined[joined[r_col] > 0]
+    losses = joined[joined[r_col] <= 0]
+
+    tw_total  = joined["_tw"].sum()
+    tw_wins   = wins["_tw"].sum()
+
+    win_rate_w   = tw_wins / tw_total if tw_total > 0 else 0.0
+    win_rate_raw = len(wins) / n if n > 0 else 0.0
+
+    # Wilson score interval (90% CI, z=1.645)
+    z = 1.645
+    p = win_rate_w
+    denom = 1 + z * z / n
+    centre = (p + z * z / (2 * n)) / denom
+    margin = (z * ((p * (1 - p) / n + z * z / (4 * n * n)) ** 0.5)) / denom
+    ci_lower = max(0.0, centre - margin)
+    ci_upper = min(1.0, centre + margin)
+
+    avg_win_r  = float(wins[r_col].mean())  if not wins.empty  else 0.0
+    avg_loss_r = float(losses[r_col].mean()) if not losses.empty else 0.0
+
+    gross_profit = wins[r_col].sum()
+    gross_loss   = abs(losses[r_col].sum())
+    profit_factor = gross_profit / gross_loss if gross_loss > 0 else float("inf")
+
+    hold_col = next((c for c in ["hold_bars", "bars_held", "hold"] if c in joined.columns), None)
+    avg_hold = float(joined[hold_col].mean()) if hold_col else 0.0
+
+    # Confidence label
+    if n >= 50:       confidence = "HIGH"
+    elif n >= 30:     confidence = "MODERATE"
+    elif n >= 20:     confidence = "LOW"
+    elif n >= 10:     confidence = "VERY LOW"
+    else:             confidence = "INSUFFICIENT"
+
+    # Best params combo: (retracement, sl, tp) with highest PF, min 5 trades
+    best_params = None
+    param_cols  = [c for c in ["retracement", "sl", "tp"] if c in joined.columns]
+    if param_cols:
+        try:
+            grp = joined.groupby(param_cols)
+            candidates = []
+            for key, g in grp:
+                if len(g) < 5:
+                    continue
+                gw = g[g[r_col] > 0][r_col].sum()
+                gl = abs(g[g[r_col] <= 0][r_col].sum())
+                pf = gw / gl if gl > 0 else float("inf")
+                candidates.append((pf, key))
+            if candidates:
+                best_params = max(candidates, key=lambda x: x[0])[1]
+        except Exception:
+            pass
+
+    # Exit breakdown
+    tp_count = len(wins)
+    sl_count = len(losses)
+    total    = tp_count + sl_count
+    exit_breakdown = {
+        "tp_pct": round(tp_count / total * 100, 1) if total > 0 else 0.0,
+        "sl_pct": round(sl_count / total * 100, 1) if total > 0 else 0.0,
+    }
+
+    return {
+        "n":              n,
+        "win_rate":       win_rate_w,
+        "win_rate_raw":   win_rate_raw,
+        "ci_lower":       ci_lower,
+        "ci_upper":       ci_upper,
+        "avg_win_r":      avg_win_r,
+        "avg_loss_r":     avg_loss_r,
+        "profit_factor":  profit_factor,
+        "avg_hold_bars":  avg_hold,
+        "confidence":     confidence,
+        "best_params":    best_params,
+        "exit_breakdown": exit_breakdown,
+    }
+
+
+def generate_probability_anchor(outcomes, target_buckets, regime_zone,
+                                 session, ml_score, ml_meta):
+    """
+    Build a multiline probability anchor string from similarity outcomes.
+    Returns a plain string (no HTML) with newline separators.
+    """
+    import math
+
+    n = outcomes.get("n", 0)
+
+    if n < 10:
+        return (
+            "Insufficient historical data for probability estimate.\n"
+            f"Found only {n} similar candles (need >= 10).\n"
+            "Run more history or loosen filter settings."
+        )
+
+    confidence  = outcomes.get("confidence",    "INSUFFICIENT")
+    win_rate    = outcomes.get("win_rate",       0.0)
+    ci_lower    = outcomes.get("ci_lower",       0.0)
+    ci_upper    = outcomes.get("ci_upper",       0.0)
+    pf          = outcomes.get("profit_factor",  0.0)
+    avg_loss_r  = outcomes.get("avg_loss_r",     0.0)
+    avg_hold    = outcomes.get("avg_hold_bars",  0.0)
+    best_params = outcomes.get("best_params",    None)
+
+    # Bucket label mapping
+    _blabel = {"Low": "moderate", "Med": "strong", "High": "exceptional"}
+    body_lbl = _blabel.get(target_buckets.get("body_pct_abs", "Med"), "strong")
+    vol_lbl  = _blabel.get(target_buckets.get("vol_mult",     "Med"), "strong")
+
+    zone_str = regime_zone or "—"
+    sess_str = session     or "—"
+
+    # Line 4 — Win Rate
+    wr_pct   = round(win_rate * 100, 1)
+    ci_lo_p  = round(ci_lower * 100, 1)
+    ci_hi_p  = round(ci_upper * 100, 1)
+    pf_str   = f"{pf:.2f}" if pf < 90 else "inf"
+
+    # Line 7 — context
+    if best_params:
+        if isinstance(best_params, (list, tuple)):
+            ctx_line = f"Best entry params: {best_params}"
+        else:
+            ctx_line = f"Best entry params: {best_params}"
+    else:
+        ctx_line = f"Typical resolution: ~{avg_hold:.0f} bars"
+
+    # Lines 9-10 — ML
+    ml_pct      = round(float(ml_score or 0) * 100, 1)
+    gap         = ml_pct - wr_pct
+    if abs(gap) <= 10:
+        agree = "ML confirms historical"
+    elif gap > 20:
+        agree = "ML and historical DISAGREE"
+    elif gap > 10:
+        agree = "ML more optimistic"
+    else:
+        agree = "ML more cautious"
+
+    # Sigmoid-weighted combined estimate
+    hist_weight = 1 / (1 + math.exp(-0.08 * (n - 30)))
+    ml_weight   = 1 - hist_weight
+    combined    = hist_weight * win_rate + ml_weight * float(ml_score or 0)
+    combined_pct = round(combined * 100, 1)
+
+    lines = [
+        f"[{n}] similar candles found ({confidence})",
+        f"Body: {body_lbl} | Volume: {vol_lbl} | Regime: {zone_str} | Session: {sess_str}",
+        "",
+        f"Win Rate: {wr_pct}% [90% CI: {ci_lo_p}%-{ci_hi_p}%]",
+        f"Profit Factor: {pf_str}",
+        f"Avg heat before resolution: {avg_loss_r:.2f}R",
+        ctx_line,
+        "",
+        f"ML Model: {ml_pct}% probability  {agree}",
+        f"Combined Estimate: {combined_pct}%",
+    ]
+    return "\n".join(lines)
+
+
+# ─── End Similarity Engine ─────────────────────────────────────────────────────
+
+# ─── ML Classifier ────────────────────────────────────────────────────────────
+
+ML_FEATURES = ["body_pct_abs", "vol_mult", "atr_ratio",
+               "adx_value", "ema_aligned", "di_gap_signed", "candle_rank_20"]
+
+
+def build_ml_training_data(qualifying_df, all_trades, direction,
+                            validated_params=None):
+    """
+    Build (X, y) from qualifying candles that produced a TP or SL trade.
+    validated_params: optional tuple (retracement, sl_dist, tp_mode) to filter.
+    Returns (X DataFrame, y numpy array).
+    """
+    rows   = []
+    labels = []
+
+    # Flatten all_trades to a date→trade lookup
+    # all_trades may be a list of dicts, or a dict keyed by param tuple
+    if isinstance(all_trades, dict):
+        # keyed by (ret, sl, tp) — flatten with optional param filter
+        trade_list = []
+        for key, trades in all_trades.items():
+            if validated_params is not None and key != validated_params:
+                continue
+            trade_list.extend(trades)
+    else:
+        trade_list = list(all_trades)
+
+    # Keep only TP / SL exits
+    _tp_labels = {"TP", "tp", "Take Profit"}
+    _sl_labels = {"SL", "sl", "Stop Loss"}
+    trade_list = [t for t in trade_list
+                  if t.get("exit_type") in _tp_labels | _sl_labels]
+
+    if not trade_list:
+        return pd.DataFrame(), np.array([])
+
+    # Build a lookup: entry_date → exit_type
+    date_to_exit = {}
+    for t in trade_list:
+        ed = t.get("entry_date") or t.get("date")
+        if ed is None:
+            continue
+        # Normalise to date
+        try:
+            ed = pd.Timestamp(ed).normalize()
+        except Exception:
+            continue
+        # If multiple trades on same date, prefer TP
+        if ed not in date_to_exit or t["exit_type"] in _tp_labels:
+            date_to_exit[ed] = t["exit_type"]
+
+    if not date_to_exit:
+        return pd.DataFrame(), np.array([])
+
+    # Match qualifying candles to trade exits
+    qdf = qualifying_df.copy()
+    if "body_pct_abs" not in qdf.columns:
+        qdf["body_pct_abs"] = qdf["body_pct"].abs() if "body_pct" in qdf.columns else 0.0
+
+    for ts in qdf.index:
+        date_key = pd.Timestamp(ts).normalize()
+        if date_key not in date_to_exit:
+            continue
+
+        exit_type = date_to_exit[date_key]
+        label     = 1 if exit_type in _tp_labels else 0
+
+        row_s = qdf.loc[ts]
+
+        body_pct_abs  = float(row_s.get("body_pct_abs",  abs(float(row_s.get("body_pct", 0.7)))))
+        vol_mult      = float(row_s.get("vol_mult",       1.5))
+        atr_ratio     = float(row_s.get("atr_ratio",      1.0))
+        adx_val       = float(row_s.get("adx_value",      20.0))
+        if np.isnan(adx_val):
+            adx_val = 20.0
+        candle_rank   = float(row_s.get("candle_rank_20", 0.5))
+        if np.isnan(candle_rank):
+            candle_rank = 0.5
+
+        ema5  = float(row_s.get("ema5",  float(row_s.get("close", 0))))
+        ema15 = float(row_s.get("ema15", float(row_s.get("close", 0))))
+        ema21 = float(row_s.get("ema21", float(row_s.get("close", 0))))
+        if direction == "long":
+            ema_aligned = 1 if (ema5 > ema15 and ema15 > ema21) else 0
+        else:
+            ema_aligned = 1 if (ema5 < ema15 and ema15 < ema21) else 0
+
+        di_plus  = float(row_s.get("di_plus",  0.0))
+        di_minus = float(row_s.get("di_minus", 0.0))
+        if direction == "long":
+            di_gap_signed = di_plus - di_minus
+        else:
+            di_gap_signed = di_minus - di_plus
+
+        rows.append({
+            "body_pct_abs":  body_pct_abs,
+            "vol_mult":      vol_mult,
+            "atr_ratio":     atr_ratio,
+            "adx_value":     adx_val,
+            "ema_aligned":   ema_aligned,
+            "di_gap_signed": di_gap_signed,
+            "candle_rank_20": candle_rank,
+        })
+        labels.append(label)
+
+    if not rows:
+        return pd.DataFrame(), np.array([])
+
+    X = pd.DataFrame(rows, columns=ML_FEATURES)
+    y = np.array(labels, dtype=int)
+    return X, y
+
+
+def train_signal_classifier(qualifying_df, all_trades, direction,
+                              validated_params=None):
+    """
+    Train a logistic-regression signal classifier with time-series CV.
+    Returns a model dict, or {"error": "..."} if insufficient data.
+    """
+    X, y = build_ml_training_data(qualifying_df, all_trades, direction,
+                                   validated_params)
+
+    if len(y) < 30:
+        return {"error": f"Only {len(y)} samples. Need >= 30."}
+
+    # Fill NaNs with column median before scaling (some features missing on early bars)
+    X = X.fillna(X.median())
+
+    scaler   = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    tscv        = TimeSeriesSplit(n_splits=5)
+    cv_scores   = []
+    for train_idx, val_idx in tscv.split(X_scaled):
+        clf = LogisticRegression(C=1.0, solver="lbfgs", max_iter=1000)
+        clf.fit(X_scaled[train_idx], y[train_idx])
+        preds = clf.predict(X_scaled[val_idx])
+        cv_scores.append(accuracy_score(y[val_idx], preds))
+
+    cv_accuracy = float(np.mean(cv_scores))
+
+    # Holdout: last 20%
+    split_at        = int(len(X_scaled) * 0.80)
+    X_ho, y_ho      = X_scaled[split_at:], y[split_at:]
+    final_model     = LogisticRegression(C=1.0, penalty="l2", solver="lbfgs",
+                                          max_iter=1000)
+    final_model.fit(X_scaled, y)
+
+    holdout_accuracy = (float(accuracy_score(y_ho, final_model.predict(X_ho)))
+                        if len(y_ho) > 0 else cv_accuracy)
+
+    feature_importance = dict(zip(ML_FEATURES,
+                                   final_model.coef_[0].tolist()))
+
+    n_pos = int(y.sum())
+    n_neg = len(y) - n_pos
+    class_balance = f"{n_pos} TP / {n_neg} SL ({n_pos/len(y)*100:.0f}% win)"
+
+    return {
+        "model":               final_model,
+        "scaler":              scaler,
+        "cv_accuracy":         cv_accuracy,
+        "holdout_accuracy":    holdout_accuracy,
+        "n_samples":           len(y),
+        "class_balance":       class_balance,
+        "feature_importance":  feature_importance,
+        "trained_at":          datetime.now(),
+    }
+
+
+def score_candle_ml(candle_series, model_data, direction):
+    """
+    Score a single candle using the trained classifier.
+    Returns dict: probability, confidence, available.
+    """
+    if not model_data or "model" not in model_data:
+        return {"probability": 0.5, "confidence": "LOW", "available": False}
+
+    try:
+        row_s = candle_series
+
+        body_pct_abs  = float(row_s.get("body_pct_abs",
+                               abs(float(row_s.get("body_pct", 0.7)))))
+        vol_mult      = float(row_s.get("vol_mult",      1.5))
+        atr_ratio     = float(row_s.get("atr_ratio",     1.0))
+        adx_val       = float(row_s.get("adx_value",     20.0))
+        if np.isnan(adx_val):
+            adx_val = 20.0
+        candle_rank   = float(row_s.get("candle_rank_20", 0.5))
+        if np.isnan(candle_rank):
+            candle_rank = 0.5
+
+        ema5  = float(row_s.get("ema5",  float(row_s.get("close", 0))))
+        ema15 = float(row_s.get("ema15", float(row_s.get("close", 0))))
+        ema21 = float(row_s.get("ema21", float(row_s.get("close", 0))))
+        if direction == "long":
+            ema_aligned = 1 if (ema5 > ema15 and ema15 > ema21) else 0
+        else:
+            ema_aligned = 1 if (ema5 < ema15 and ema15 < ema21) else 0
+
+        di_plus  = float(row_s.get("di_plus",  0.0))
+        di_minus = float(row_s.get("di_minus", 0.0))
+        di_gap_signed = (di_plus - di_minus) if direction == "long" else (di_minus - di_plus)
+
+        feat_vec = np.array([[body_pct_abs, vol_mult, atr_ratio, adx_val,
+                               ema_aligned, di_gap_signed, candle_rank]])
+        # Replace any NaN with 0 before scaling (safe neutral value after StandardScaler)
+        feat_vec = np.where(np.isnan(feat_vec), 0.0, feat_vec)
+        feat_scaled = model_data["scaler"].transform(feat_vec)
+        prob        = float(model_data["model"].predict_proba(feat_scaled)[0][1])
+
+        ho_acc = model_data.get("holdout_accuracy", 0.5)
+        if ho_acc >= 0.65:
+            conf = "HIGH"
+        elif ho_acc >= 0.55:
+            conf = "MODERATE"
+        else:
+            conf = "LOW"
+
+        return {"probability": prob, "confidence": conf, "available": True}
+
+    except Exception:
+        return {"probability": 0.5, "confidence": "LOW", "available": False}
+
+
+# ─── WFO Pipeline ─────────────────────────────────────────────────────────────
+
+def run_wfo_pipeline(df, qualifying_func, adx_df, timeframe, direction,
+                     transaction_cost=0.001):
+    """
+    Walk-forward optimisation.  For each rolling IS/OOS window:
+      1. Find best params on IS (highest PF, >=5 trades).
+      2. Apply best params to OOS.
+    Returns dict with cycles, summary, best_params, validated_at, timeframe.
+    """
+    _WFO_WINDOWS = {
+        "1D": {"is_bars": 252,  "oos_bars": 63},
+        "4H": {"is_bars": 1512, "oos_bars": 378},
+        "1H": {"is_bars": 5040, "oos_bars": 1260},
+    }
+    cfg      = _WFO_WINDOWS.get(timeframe, _WFO_WINDOWS["1D"])
+    is_bars  = cfg["is_bars"]
+    oos_bars = cfg["oos_bars"]
+    step     = oos_bars   # non-overlapping
+
+    # WFO-specific param grid (smaller than full optimiser)
+    _BODY_PCTS   = [0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90]
+    _VOL_MULTS   = [1.5, 2.0, 2.5, 3.0]
+    _RETS        = [0.0, 0.236, 0.382, 0.50]
+    _SL_DISTS    = [0.005, 0.010, 0.015, 0.020]
+    _TP_MODES    = ["2R", "3R"]
+
+    n_total = len(df)
+    starts  = list(range(0, n_total - is_bars - oos_bars + 1, step))
+
+    if not starts:
+        return {
+            "cycles":       [],
+            "summary":      {"verdict": "FAIL", "reason": "Insufficient data for WFO"},
+            "best_params":  None,
+            "validated_at": datetime.now(),
+            "timeframe":    timeframe,
+        }
+
+    cycles      = []
+    prog_bar    = st.progress(0, text="Running Walk-Forward Optimisation...")
+
+    for cycle_i, start in enumerate(starts):
+        is_end   = start + is_bars
+        oos_end  = min(is_end + oos_bars, n_total)
+
+        df_is    = df.iloc[start:is_end]
+        df_oos   = df.iloc[is_end:oos_end]
+
+        if df_is.empty or df_oos.empty:
+            continue
+
+        # ── IS optimisation ───────────────────────────────────────────────────
+        best_is_pf     = -1.0
+        best_is_params = None
+        best_is_trades = 0
+
+        for body_p, vol_m in product(_BODY_PCTS, _VOL_MULTS):
+            qual_is = qualifying_func(
+                df_is, min_body_pct=body_p, min_vol_mult=vol_m,
+                adx_filter=False, direction=direction,
+            )
+            if qual_is.empty:
+                continue
+            for ret, sl, tp in product(_RETS, _SL_DISTS, _TP_MODES):
+                trades_is = run_backtest(
+                    df_is, qual_is, ret, sl, tp,
+                    sl_mode="Fixed", trail_atr_mult=1.5,
+                    transaction_cost=transaction_cost,
+                    max_hold_bars=9999, use_time_exit=False,
+                    direction=direction,
+                )
+                m = calc_metrics(trades_is)
+                if m and m["total_trades"] >= 5 and m["profit_factor"] > best_is_pf:
+                    best_is_pf     = m["profit_factor"]
+                    best_is_params = {
+                        "body_pct":    body_p,
+                        "vol_mult":    vol_m,
+                        "retracement": ret,
+                        "sl_dist":     sl,
+                        "tp_mode":     tp,
+                    }
+                    best_is_trades = m["total_trades"]
+
+        if best_is_params is None:
+            continue
+
+        # ── OOS evaluation ────────────────────────────────────────────────────
+        qual_oos = qualifying_func(
+            df_oos,
+            min_body_pct=best_is_params["body_pct"],
+            min_vol_mult=best_is_params["vol_mult"],
+            adx_filter=False,
+            direction=direction,
+        )
+        trades_oos = run_backtest(
+            df_oos, qual_oos,
+            best_is_params["retracement"],
+            best_is_params["sl_dist"],
+            best_is_params["tp_mode"],
+            sl_mode="Fixed", trail_atr_mult=1.5,
+            transaction_cost=transaction_cost,
+            max_hold_bars=9999, use_time_exit=False,
+            direction=direction,
+        ) if not qual_oos.empty else []
+
+        m_oos      = calc_metrics(trades_oos) if trades_oos else {}
+        oos_pf     = float(m_oos.get("profit_factor", 0.0)) if m_oos else 0.0
+        oos_wr     = float(m_oos.get("win_rate",       0.0)) if m_oos else 0.0
+        oos_trades = int(m_oos.get("total_trades",     0))   if m_oos else 0
+        ratio      = oos_pf / best_is_pf if best_is_pf > 0 else 0.0
+
+        cycles.append({
+            "cycle":         cycle_i + 1,
+            "is_start":      str(df_is.index[0])[:10],
+            "is_end":        str(df_is.index[-1])[:10],
+            "oos_start":     str(df_oos.index[0])[:10],
+            "oos_end":       str(df_oos.index[-1])[:10],
+            "best_params":   best_is_params,
+            "is_pf":         round(best_is_pf, 3),
+            "oos_pf":        round(oos_pf, 3),
+            "oos_is_ratio":  round(ratio, 3),
+            "oos_trades":    oos_trades,
+            "oos_wr":        round(oos_wr * 100, 1),
+        })
+
+        prog_bar.progress(
+            min(1.0, (cycle_i + 1) / max(1, len(starts))),
+            text=f"WFO cycle {cycle_i + 1}/{len(starts)} — OOS PF {oos_pf:.2f}",
+        )
+
+    prog_bar.empty()
+
+    if not cycles:
+        return {
+            "cycles":       [],
+            "summary":      {"verdict": "FAIL", "reason": "No valid cycles produced"},
+            "best_params":  None,
+            "validated_at": datetime.now(),
+            "timeframe":    timeframe,
+        }
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    oos_pfs         = [c["oos_pf"]       for c in cycles]
+    ratios          = [c["oos_is_ratio"] for c in cycles]
+    avg_oos_pf      = float(np.mean(oos_pfs))
+    pct_profitable  = sum(1 for p in oos_pfs if p > 1.0) / len(oos_pfs) * 100
+    ratio_avg       = float(np.mean(ratios))
+
+    verdict = ("PASS"
+               if avg_oos_pf > 1.0 and ratio_avg > 0.65 and len(cycles) >= 6
+               else "FAIL")
+
+    # Most common best_params across cycles (by serialised key)
+    from collections import Counter
+    param_counts = Counter(
+        str(sorted(c["best_params"].items())) for c in cycles
+    )
+    most_common_str = param_counts.most_common(1)[0][0]
+    # Recover the actual dict from cycles
+    best_params = next(
+        c["best_params"] for c in cycles
+        if str(sorted(c["best_params"].items())) == most_common_str
+    )
+
+    summary = {
+        "verdict":              verdict,
+        "n_cycles":             len(cycles),
+        "avg_oos_pf":           round(avg_oos_pf, 3),
+        "pct_profitable_cycles": round(pct_profitable, 1),
+        "oos_is_ratio_avg":     round(ratio_avg, 3),
+    }
+
+    return {
+        "cycles":       cycles,
+        "summary":      summary,
+        "best_params":  best_params,
+        "validated_at": datetime.now(),
+        "timeframe":    timeframe,
+    }
+
+
+# ─── End ML / WFO ─────────────────────────────────────────────────────────────
+
+# ─── AI Analysis ──────────────────────────────────────────────────────────────
+
+def build_analysis_prompt(candle, regime, anchor_text, ml_score,
+                           strategy_params, wfo_results, direction,
+                           ticker, timeframe, risk_context):
+    """
+    Build a structured user prompt for the AI analysis endpoint.
+    Returns a plain string with 5 labelled sections.
+    """
+    # ── Section A — Regime Context ────────────────────────────────────────────
+    verdict_str   = regime.get("verdict",        "UNKNOWN") if regime else "UNKNOWN"
+    score_str     = str(regime.get("score",      0))        if regime else "0"
+    breakdown_str = regime.get("breakdown_line", "—")       if regime else "—"
+    overrides     = regime.get("hard_overrides", [])        if regime else []
+    override_str  = "; ".join(overrides) if overrides else "None"
+
+    section_a = (
+        f"=== A. REGIME CONTEXT ===\n"
+        f"Verdict: {verdict_str}  Score: {score_str}/100\n"
+        f"Breakdown: {breakdown_str}\n"
+        f"Hard overrides: {override_str}"
+    )
+
+    # ── Section B — Candle ────────────────────────────────────────────────────
+    def _fget(key, default=0.0):
+        try:
+            v = candle.get(key, default) if isinstance(candle, dict) else getattr(candle, key, default)
+            return float(v) if v is not None and str(v) != "nan" else default
+        except Exception:
+            return default
+
+    body_pct    = _fget("body_pct",    0.0)
+    vol_mult    = _fget("vol_mult",    1.0)
+    atr_ratio   = _fget("atr_ratio",  1.0)
+    adx_val     = _fget("adx_value",  0.0)
+    rank_20     = _fget("candle_rank_20", 0.5)
+    vol_rank    = _fget("vol_rank_20",    0.5)
+    vol_delta5  = _fget("vol_delta_5",    0.0)
+    ema5        = _fget("ema5",  0.0)
+    ema15       = _fget("ema15", 0.0)
+    ema21       = _fget("ema21", 0.0)
+    di_plus     = _fget("di_plus",  0.0)
+    di_minus    = _fget("di_minus", 0.0)
+
+    # EMA stack alignment
+    if ema5 > 0 and ema15 > 0 and ema21 > 0:
+        if ema5 > ema15 > ema21:
+            ema_stack = "BULLISH (EMA5>EMA15>EMA21)"
+        elif ema5 < ema15 < ema21:
+            ema_stack = "BEARISH (EMA5<EMA15<EMA21)"
+        else:
+            ema_stack = "MIXED (no clean stack)"
+    else:
+        ema_stack = "N/A"
+
+    # Vol delta interpretation
+    vol_delta_str = (f"+{vol_delta5:.0f} (net buying pressure)"
+                     if vol_delta5 > 0 else
+                     f"{vol_delta5:.0f} (net selling pressure)")
+
+    # DI alignment
+    di_gap = abs(di_plus - di_minus)
+    if di_plus > di_minus:
+        di_str = f"DI+ {di_plus:.1f} > DI- {di_minus:.1f} | gap {di_gap:.1f} (bullish)"
+    elif di_minus > di_plus:
+        di_str = f"DI- {di_minus:.1f} > DI+ {di_plus:.1f} | gap {di_gap:.1f} (bearish)"
+    else:
+        di_str = f"DI neutral (gap {di_gap:.1f})"
+
+    try:
+        if isinstance(candle, dict):
+            bar_date = candle.get("_date_str") or "—"
+        else:
+            bar_date = str(candle.name)[:10] if hasattr(candle, "name") else "—"
+    except Exception:
+        bar_date = "—"
+
+    section_b = (
+        f"=== B. CANDLE ===\n"
+        f"Ticker: {ticker}  TF: {timeframe}  Direction: {direction.upper()}  Date: {bar_date}\n"
+        f"Body: {abs(body_pct)*100:.1f}%  Vol mult: {vol_mult:.2f}x  "
+        f"ATR ratio: {atr_ratio:.2f}  ADX: {adx_val:.1f}  Candle rank(20): {rank_20:.2f}\n"
+        f"EMA stack: {ema_stack}\n"
+        f"Vol delta 5-bar: {vol_delta_str}  Vol rank(20): {vol_rank:.2f}\n"
+        f"DI alignment: {di_str}"
+    )
+
+    # ── Section C — Evidence ──────────────────────────────────────────────────
+    ml_pct_str = f"{float(ml_score or 0)*100:.1f}%" if ml_score is not None else "N/A"
+    section_c = (
+        f"=== C. EVIDENCE ===\n"
+        f"ML probability: {ml_pct_str}\n"
+        f"{anchor_text if anchor_text else 'No similarity data available.'}"
+    )
+
+    # ── Section D — Parameters ────────────────────────────────────────────────
+    wfo_status = "UNVALIDATED"
+    wfo_detail = ""
+    if wfo_results and isinstance(wfo_results, dict):
+        summary = wfo_results.get("summary", {})
+        wfo_status = summary.get("verdict", "UNVALIDATED")
+        bp         = wfo_results.get("best_params", {})
+        if bp:
+            wfo_detail = (
+                f"  Best params: body>={bp.get('body_pct','?')} "
+                f"vol>={bp.get('vol_mult','?')} "
+                f"ret={bp.get('retracement','?')} "
+                f"SL={bp.get('sl_dist','?')} "
+                f"TP={bp.get('tp_mode','?')}"
+            )
+        avg_pf = summary.get("avg_oos_pf", 0)
+        n_cycles = summary.get("n_cycles", 0)
+        wfo_detail += f"\n  OOS avg PF: {avg_pf:.2f}  Cycles: {n_cycles}"
+
+    sp = strategy_params or {}
+    ret   = float(sp.get("retracement", 0.0) or 0.0)
+    sl_d  = float(sp.get("sl_dist",     0.01) or 0.01)
+    tp_m  = str(sp.get("tp_mode", "2R"))
+    wr_sp = float(sp.get("win_rate", 0.0) or 0.0)
+    pf_sp = float(sp.get("pf",      0.0) or 0.0)
+
+    # Compute actual price levels from close price
+    close_for_entry = _fget("close", 0.0)
+    if close_for_entry > 0:
+        body_val = _fget("body", 0.0)
+        if direction == "long":
+            entry_px  = round(close_for_entry - abs(body_val) * ret, 6)
+            sl_px     = round(entry_px * (1 - sl_d), 6)
+            risk_amt  = entry_px - sl_px
+        else:
+            entry_px  = round(close_for_entry + abs(body_val) * ret, 6)
+            sl_px     = round(entry_px * (1 + sl_d), 6)
+            risk_amt  = sl_px - entry_px
+        tp1_px = round(entry_px + (1 * risk_amt if direction == "long" else -1 * risk_amt), 6)
+        tp2_px = round(entry_px + (2 * risk_amt if direction == "long" else -2 * risk_amt), 6)
+        tp3_px = round(entry_px + (3 * risk_amt if direction == "long" else -3 * risk_amt), 6)
+        if tp_m == "1R":
+            tp_str = f"TP={tp1_px} (1R)"
+        elif tp_m == "3R":
+            tp_str = f"TP={tp3_px} (3R)"
+        else:
+            tp_str = f"TP1={tp1_px} (1R partial), TP2={tp2_px} (2R full)"
+        ret_label = "Immediate (0% retrace — enter at close)" if ret == 0.0 else f"{ret*100:.0f}% retrace from close body"
+        entry_detail = (
+            f"  Entry method: {ret_label}\n"
+            f"  Entry price: {entry_px}  SL: {sl_px} ({sl_d*100:.1f}% distance)  {tp_str}\n"
+            f"  TP mode: {tp_m}  Historical win rate: {wr_sp:.1f}%  PF: {pf_sp:.2f}"
+        )
+    else:
+        ret_label = "Immediate (0%)" if ret == 0.0 else f"{ret*100:.0f}% retrace"
+        entry_detail = (
+            f"  Entry: {ret_label}  SL dist: {sl_d*100:.1f}%  TP mode: {tp_m}\n"
+            f"  Historical win rate: {wr_sp:.1f}%  PF: {pf_sp:.2f}"
+        )
+
+    section_d = (
+        f"=== D. PARAMETERS (from backtester — use these for entry) ===\n"
+        f"WFO status: {wfo_status}{wfo_detail}\n"
+        f"Backtested params:{entry_detail}"
+    )
+
+    # ── Section E — Risk ──────────────────────────────────────────────────────
+    rc             = risk_context or {}
+    consec_losses  = rc.get("consecutive_losses", 0)
+    trades_today   = rc.get("trades_today",       0)
+
+    section_e = (
+        f"=== E. RISK ===\n"
+        f"Consecutive losses: {consec_losses}  "
+        f"Trades today: {trades_today}"
+    )
+
+    return "\n\n".join([section_a, section_b, section_c, section_d, section_e])
+
+
+def rule_based_fallback(regime, outcomes, ml_score):
+    """
+    Simple rule-based verdict when the AI API is unavailable.
+    Returns dict: verdict, full_text, source='fallback'.
+    """
+    import math
+
+    verdict_label = regime.get("verdict", "RED") if regime else "RED"
+    score         = regime.get("score",   0)     if regime else 0
+    ml            = float(ml_score or 0)
+    n             = outcomes.get("n", 0)          if outcomes else 0
+    win_rate      = outcomes.get("win_rate", 0.0) if outcomes else 0.0
+
+    # Sigmoid-weighted combined (same as generate_probability_anchor)
+    hist_weight = 1 / (1 + math.exp(-0.08 * (n - 30)))
+    ml_weight   = 1 - hist_weight
+    combined    = hist_weight * win_rate + ml_weight * ml
+
+    # Hard overrides
+    if verdict_label == "RED" or score < 45:
+        verdict = "NO TRADE"
+        reason  = f"Regime {verdict_label} (score {score}/100) — waiting for better conditions."
+    elif ml < 0.40:
+        verdict = "NO TRADE"
+        reason  = f"ML probability {ml*100:.0f}% is below 40% threshold."
+    elif combined >= 0.60 and verdict_label == "GREEN":
+        verdict = "TRADE"
+        reason  = f"Combined estimate {combined*100:.0f}% with GREEN regime — proceed full size."
+    elif combined >= 0.65 and verdict_label == "YELLOW":
+        verdict = "TRADE"
+        reason  = f"Combined estimate {combined*100:.0f}% with YELLOW regime — half size."
+    elif combined >= 0.50 and verdict_label == "GREEN":
+        verdict = "WAIT"
+        reason  = f"Combined estimate {combined*100:.0f}% — borderline, wait for confirmation."
+    elif combined < 0.50:
+        verdict = "NO TRADE"
+        reason  = f"Combined estimate {combined*100:.0f}% below 50% — edge insufficient."
+    else:
+        verdict = "NO TRADE"
+        reason  = "Insufficient evidence to justify entry."
+
+    full_text = (
+        f"[Rule-based fallback — AI unavailable]\n\n"
+        f"VERDICT: **{verdict}** — {reason}\n\n"
+        f"Regime: {verdict_label} ({score}/100)  "
+        f"ML: {ml*100:.0f}%  "
+        f"Combined: {combined*100:.0f}%  "
+        f"N: {n}"
+    )
+
+    return {"verdict": verdict, "full_text": full_text, "source": "fallback"}
+
+
+def analyze_candle_ai(candle, regime, anchor_text, ml_score,
+                      strategy_params, wfo_results, direction,
+                      ticker, timeframe, risk_context):
+    """
+    Call AI API (Anthropic or Groq) for a structured trade decision.
+    Provider is selected from session_state["ai_provider"].
+    Falls back to rule_based_fallback on missing key or any API error.
+    Returns dict: verdict, full_text, source, error (if failed).
+    """
+    import os
+
+    outcomes = None  # used by fallback
+
+    # ── Resolve provider and key from sidebar session_state ──────────────────
+    provider  = st.session_state.get("ai_provider", "Groq (Free)")
+    use_groq  = "Groq" in provider
+
+    if use_groq:
+        api_key = st.session_state.get("groq_api_key", "")
+        if not api_key:
+            api_key = os.environ.get("GROQ_API_KEY", "")
+    else:
+        api_key = st.session_state.get("anthropic_api_key", "")
+        if not api_key:
+            api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+            if not api_key:
+                try:
+                    api_key = st.secrets.get("ANTHROPIC_API_KEY", "")
+                except Exception:
+                    api_key = ""
+
+    if not api_key:
+        fb = rule_based_fallback(regime, outcomes, ml_score)
+        fb["error"] = "No API key — set key in sidebar"
+        return fb
+
+    # ── Build prompt ──────────────────────────────────────────────────────────
+    prompt = build_analysis_prompt(
+        candle, regime, anchor_text, ml_score,
+        strategy_params, wfo_results, direction,
+        ticker, timeframe, risk_context,
+    )
+
+    # ── Call API ──────────────────────────────────────────────────────────────
+    error_detail = ""
+    raw_text     = ""
+    try:
+        if use_groq:
+            # Groq uses OpenAI-compatible /chat/completions format
+            resp = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={
+                    "Content-Type":  "application/json",
+                    "Authorization": f"Bearer {api_key}",
+                },
+                json={
+                    "model":       "llama-3.3-70b-versatile",
+                    "max_tokens":  900,
+                    "temperature": 0.1,
+                    "messages": [
+                        {"role": "system", "content": ANALYSIS_SYSTEM_PROMPT},
+                        {"role": "user",   "content": prompt},
+                    ],
+                },
+                timeout=20,
+            )
+            resp.raise_for_status()
+            data     = resp.json()
+            raw_text = data["choices"][0]["message"]["content"]
+            source   = "groq/llama-3.3-70b"
+        else:
+            # Anthropic Messages API
+            resp = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "Content-Type":      "application/json",
+                    "x-api-key":         api_key,
+                    "anthropic-version": "2023-06-01",
+                },
+                json={
+                    "model":       "claude-3-5-sonnet-20241022",
+                    "max_tokens":  900,
+                    "temperature": 0.1,
+                    "system":      ANALYSIS_SYSTEM_PROMPT,
+                    "messages":    [{"role": "user", "content": prompt}],
+                },
+                timeout=20,
+            )
+            resp.raise_for_status()
+            data     = resp.json()
+            raw_text = data["content"][0]["text"]
+            source   = "anthropic/claude-3.5-sonnet"
+
+    except Exception as exc:
+        error_detail = str(exc)
+        # Try to extract HTTP error body for better diagnostics
+        try:
+            error_detail = f"{exc} | {resp.text[:300]}"
+        except Exception:
+            pass
+        fb = rule_based_fallback(regime, outcomes, ml_score)
+        fb["error"] = error_detail
+        return fb
+
+    # ── Detect verdict ────────────────────────────────────────────────────────
+    if "**NO TRADE**" in raw_text:
+        verdict = "NO TRADE"
+    elif "**WAIT**" in raw_text:
+        verdict = "WAIT"
+    elif "**TRADE**" in raw_text:
+        verdict = "TRADE"
+    else:
+        verdict = "WAIT"   # safe default if format is unexpected
+
+    return {"verdict": verdict, "full_text": raw_text, "source": source}
+
+
+# ─── End AI Analysis ──────────────────────────────────────────────────────────
 
 _BINANCE_INTERVAL = {"1D": "1d", "4H": "4h", "1H": "1h", "1W": "1w"}
 
@@ -344,7 +1885,9 @@ def detect_qualifying_candles(df, min_body_pct=0.70, min_vol_mult=1.5,
                                di_plus_series: pd.Series = None,
                                di_minus_series: pd.Series = None,
                                di_gap_min: float = 0.0,
-                               direction: str = "long"):
+                               direction: str = "long",
+                               ema_filter: bool = False,
+                               ema_series: pd.Series = None):
     """Return qualifying momentum candles.
     When adx_filter=True: requires ADX >= threshold AND DI gap >= di_gap_min
     AND DI aligned with direction (DI+ > DI- for long, DI- > DI+ for short).
@@ -378,6 +1921,17 @@ def detect_qualifying_candles(df, min_body_pct=0.70, min_vol_mult=1.5,
             else:
                 # DI- must lead DI+ by at least di_gap_min
                 mask = mask & (dim > dip) & (gap >= di_gap_min)
+
+    # ── EMA Trend Filter
+    # Only take LONG signals when close > EMA (price above trend)
+    # Only take SHORT signals when close < EMA (price below trend)
+    # ema_series is already shift(1) — no lookahead bias
+    if ema_filter and ema_series is not None:
+        ema_aligned = ema_series.reindex(df.index, method="ffill")
+        if direction == "long":
+            mask = mask & (df["close"] > ema_aligned)
+        else:
+            mask = mask & (df["close"] < ema_aligned)
 
     result = df.loc[mask].copy()
     if adx_filter and adx_series is not None:
@@ -1417,7 +2971,9 @@ hits TP or SL. "Still Open" at candle 20 means the trade truly hasn't resolved y
 def render_live_scanner(ticker, timeframe, min_body_pct, min_vol_mult,
                          best_ret, best_sl_dist, best_tp, best_wr,
                          direction="long", adx_filter_on=False, adx_di_gap_min=0.0,
-                         adx_threshold=25):
+                         adx_threshold=25,
+                         ema_filter=False, ema_period=200,
+                         ema_tf_mode="Same as signal timeframe", ema_htf_period=200):
     htf         = _HTF_MAP.get(timeframe, "1D")
     htf_label   = _HTF_LABEL.get(timeframe, "Daily")
     tf_label    = {"1D": "Daily", "4H": "4H", "1H": "1H"}[timeframe]
@@ -1440,10 +2996,18 @@ Signal TF: <b>{tf_label}</b> &nbsp;|&nbsp; Higher TF (HTF): <b>{htf_label}</b>
         refresh = st.button("Refresh Scanner", key="scanner_refresh",
                             use_container_width=True)
 
-    # Re-fetch whenever ticker OR timeframe changes, or refresh pressed
-    live_key = f"{ticker}_{timeframe}"
+    # Re-fetch on: explicit refresh, ticker/TF change, or TTL expired
+    # TTL: 1H → 20 min, 4H → 60 min, 1D → 240 min
+    _LIVE_TTL = {"1H": 20, "4H": 60, "1D": 240}
+    live_key  = f"{ticker}_{timeframe}"
+    _fetched_at = st.session_state.get("live_fetched_at")
+    _ttl_minutes = _LIVE_TTL.get(timeframe, 30)
+    _ttl_expired = (
+        _fetched_at is None or
+        (datetime.now() - _fetched_at).total_seconds() > _ttl_minutes * 60
+    )
     if refresh or "live_df" not in st.session_state or \
-            st.session_state.get("live_key") != live_key:
+            st.session_state.get("live_key") != live_key or _ttl_expired:
         with st.spinner("Fetching latest candles..."):
             live_df     = fetch_live(ticker, timeframe)
             # Fetch HTF for ADX context — always, regardless of ADX filter toggle
@@ -1451,17 +3015,19 @@ Signal TF: <b>{tf_label}</b> &nbsp;|&nbsp; Higher TF (HTF): <b>{htf_label}</b>
             live_df_htf = _binance_klines(ticker, _BINANCE_INTERVAL[htf], htf_days)
             if live_df_htf.empty:
                 live_df_htf = _gateio_klines(ticker, _BINANCE_INTERVAL[htf], htf_days)
-        st.session_state["live_df"]     = live_df
-        st.session_state["live_df_htf"] = live_df_htf
-        st.session_state["live_ts"]     = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        st.session_state["live_key"]    = live_key
+        st.session_state["live_df"]        = live_df
+        st.session_state["live_df_htf"]    = live_df_htf
+        st.session_state["live_ts"]        = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        st.session_state["live_key"]       = live_key
+        st.session_state["live_fetched_at"] = datetime.now()
 
     live_df     = st.session_state.get("live_df",     pd.DataFrame())
     live_df_htf = st.session_state.get("live_df_htf", pd.DataFrame())
     live_ts     = st.session_state.get("live_ts",     "unknown")
 
     with col_a:
-        st.caption(f"Last updated: {live_ts}")
+        _next_refresh_min = _ttl_minutes - max(0, int((datetime.now() - st.session_state.get("live_fetched_at", datetime.now())).total_seconds() / 60))
+        st.caption(f"Last updated: {live_ts} (WIB)  |  Auto-refresh in ~{_next_refresh_min} min")
 
     if live_df.empty:
         st.error("Could not fetch live data.")
@@ -1477,6 +3043,20 @@ Signal TF: <b>{tf_label}</b> &nbsp;|&nbsp; Higher TF (HTF): <b>{htf_label}</b>
     adx_htf_raw  = adx_df_htf_raw["adx"]     if adx_df_htf_raw is not None else pd.Series(dtype=float)
     # Forward-fill HTF ADX onto signal TF index
     adx_htf = adx_htf_raw.reindex(live_df.index, method="ffill") if not adx_htf_raw.empty else pd.Series(dtype=float)
+
+    # ── EMA for Live Scanner ─────────────────────────────────────────────────
+    # live_df only has ~30 days — not enough to initialize EMA 50/100/200.
+    # Fetch cached longer history specifically for EMA warm-up.
+    # EMA needs ~3× the period in bars to converge properly.
+    _ema_tf_days = {"1D": max(ema_period * 3, 90), "4H": max(ema_period // 2, 60),
+                    "1H": max(ema_period // 6, 30)}.get(timeframe, max(ema_period * 3, 90))
+    _df_for_ema = _binance_fetch(ticker, timeframe, _ema_tf_days)
+    _ema_base_df = _df_for_ema if not _df_for_ema.empty else live_df
+    ema_signal_series = calculate_ema(_ema_base_df, ema_period)   # shift(1) inside
+    ema_htf_series    = pd.Series(dtype=float)
+    if ema_filter and ema_tf_mode == "Higher timeframe" and not live_df_htf.empty:
+        _ema_htf_raw   = calculate_ema(live_df_htf, ema_htf_period)
+        ema_htf_series = _ema_htf_raw.reindex(live_df.index, method="ffill")
 
     # Take last 20 completed candles (exclude the current incomplete one)
     scan = live_df.iloc[-21:-1].copy() if len(live_df) > 20 else live_df.iloc[:-1].copy()
@@ -1499,6 +3079,19 @@ Signal TF: <b>{tf_label}</b> &nbsp;|&nbsp; Higher TF (HTF): <b>{htf_label}</b>
         # ADX values at this candle — must be fetched BEFORE the adx_filter_on check
         adx_s_val = adx_signal.get(idx, float("nan"))
         adx_h_val = adx_htf.get(idx,    float("nan"))
+
+        # EMA checks — same-TF and HTF
+        ema_s_val = ema_signal_series.get(idx, float("nan"))
+        ema_h_val = ema_htf_series.get(idx,   float("nan")) if not ema_htf_series.empty else float("nan")
+        close_val = row["close"]
+        if pd.notna(ema_s_val):
+            ema_same_ok = (close_val > ema_s_val) if direction == "long" else (close_val < ema_s_val)
+        else:
+            ema_same_ok = False
+        if pd.notna(ema_h_val):
+            ema_htf_ok = (close_val > ema_h_val) if direction == "long" else (close_val < ema_h_val)
+        else:
+            ema_htf_ok = None  # HTF not available / not enabled
 
         # DI gap check — mandatory when ADX filter is ON, informational otherwise
         dip_val   = dip_signal.get(idx,  float("nan"))
@@ -1584,11 +3177,23 @@ Signal TF: <b>{tf_label}</b> &nbsp;|&nbsp; Higher TF (HTF): <b>{htf_label}</b>
             "_adx_h":          adx_h_val,
             "_dip":            dip_val,
             "_dim":            dim_val,
+            "_ema_same_ok":    ema_same_ok,
+            "_ema_htf_ok":     ema_htf_ok,
+            "_ema_s_val":      ema_s_val,
+            "_ema_h_val":      ema_h_val,
         })
 
     scan_df   = pd.DataFrame(table_rows)
-    adx_s_col = f"ADX ({tf_label})"
-    adx_h_col = f"ADX ({htf_label})"
+    adx_s_col  = f"ADX ({tf_label})"
+    adx_h_col  = f"ADX ({htf_label})"
+    ema_s_col  = f"EMA{ema_period} ({tf_label})"
+    ema_h_col  = f"EMA{ema_htf_period} ({htf_label})" if ema_tf_mode == "Higher timeframe" else None
+    # Populate EMA display columns from hidden private columns
+    scan_df[ema_s_col] = scan_df["_ema_same_ok"].apply(
+        lambda v: "✅" if v else ("❌" if v is False else "—"))
+    if ema_h_col:
+        scan_df[ema_h_col] = scan_df["_ema_htf_ok"].apply(
+            lambda v: "✅" if v else ("❌" if v is False else "—"))
 
     # Show confluence requirement note
     if adx_filter_on and adx_di_gap_min > 0:
@@ -1613,9 +3218,11 @@ Signal TF: <b>{tf_label}</b> &nbsp;|&nbsp; Higher TF (HTF): <b>{htf_label}</b>
             return ["background-color: rgba(255,215,0,0.10); color:#ccd6f6"] * len(row)
         return ["color:#6e7681"] * len(row)
 
+    _ema_display_cols = [ema_s_col] + ([ema_h_col] if ema_h_col else [])
     display_cols = ["#", "Date", "Body %", "Vol Mult", "Body OK", "Vol OK",
-                    "SIGNAL", adx_s_col, "Trend Dir", "DI≥10", "DI≥20", adx_h_col, "ADX Align"]
-    hidden_cols  = ["_body_ok", "_vol_ok", "_signal", "_adx_s", "_adx_h", "_dip", "_dim"]
+                    "SIGNAL"] + _ema_display_cols + [adx_s_col, "Trend Dir", "DI≥10", "DI≥20", adx_h_col, "ADX Align"]
+    hidden_cols  = ["_body_ok", "_vol_ok", "_signal", "_adx_s", "_adx_h", "_dip", "_dim",
+                    "_ema_same_ok", "_ema_htf_ok", "_ema_s_val", "_ema_h_val"]
 
     st.dataframe(
         scan_df[display_cols + hidden_cols].style.apply(
@@ -1630,6 +3237,11 @@ Signal TF: <b>{tf_label}</b> &nbsp;|&nbsp; Higher TF (HTF): <b>{htf_label}</b>
             "Body OK":     st.column_config.TextColumn("Body",       width=48),
             "Vol OK":      st.column_config.TextColumn("Vol",        width=43),
             "SIGNAL":      st.column_config.TextColumn("Signal",     width=68),
+            ema_s_col:     st.column_config.TextColumn(ema_s_col,    width=90,
+                               help=f"✅ = close {'above' if direction == 'long' else 'below'} EMA{ema_period} on {tf_label}. EMA filter {'ON' if ema_filter else 'OFF (informational)'}"),
+            **(  {ema_h_col: st.column_config.TextColumn(ema_h_col, width=90,
+                               help=f"✅ = close {'above' if direction == 'long' else 'below'} EMA{ema_htf_period} on {htf_label} HTF. Multi-TF EMA confluence.")}
+                 if ema_h_col else {}  ),
             adx_s_col:     st.column_config.TextColumn(adx_s_col,    width=72,
                                help=f"ADX(14) strength on {tf_label}. ≥25 = trending market"),
             "Trend Dir":   st.column_config.TextColumn("Trend Dir",  width=195,
@@ -1763,12 +3375,37 @@ Signal TF: <b>{tf_label}</b> &nbsp;|&nbsp; Higher TF (HTF): <b>{htf_label}</b>
         check_di10 = "✅ DI≥10" if sr["DI≥10"] == "✅" else "❌ DI≥10"
         check_di20 = "✅ DI≥20" if sr["DI≥20"] == "✅" else "❌ DI≥20"
 
+        # EMA checklist items
+        _ema_s_ok  = sr["_ema_same_ok"]
+        _ema_h_ok  = sr["_ema_htf_ok"]
+        _ema_s_val = sr["_ema_s_val"]
+        _ema_h_val = sr["_ema_h_val"]
+        _ema_s_str = f"{_ema_s_val:.4f}" if pd.notna(_ema_s_val) else "N/A"
+        _ema_h_str = f"{_ema_h_val:.4f}" if pd.notna(_ema_h_val) else "N/A"
+        check_ema_same = (f"{'✅' if _ema_s_ok else '❌'} EMA{ema_period} ({tf_label})"
+                          f" <span style='color:#8892b0;font-size:11px;'>= {_ema_s_str}</span>")
+        if ema_h_col and _ema_h_ok is not None:
+            check_ema_htf = (f"{'✅' if _ema_h_ok else '❌'} EMA{ema_htf_period} ({htf_label} HTF)"
+                             f" <span style='color:#8892b0;font-size:11px;'>= {_ema_h_str}</span>")
+        else:
+            check_ema_htf = None
+
         if adx_filter_on and adx_di_gap_min > 0:
             req_label  = f"Required: Body + Volume + DI gap ≥ {adx_di_gap_min:.0f}"
             checklist  = f"{check_body} &nbsp; {check_vol} &nbsp; {'✅' if sr['DI≥10'] == '✅' and adx_di_gap_min <= 10 or sr['DI≥20'] == '✅' and adx_di_gap_min <= 20 else '✅'} DI gap ≥ {adx_di_gap_min:.0f}"
         else:
             req_label  = "Required: Body + Volume &nbsp;|&nbsp; DI columns = extra confluence"
             checklist  = f"{check_body} &nbsp; {check_vol} &nbsp; {check_di10} &nbsp; {check_di20}"
+
+        # Append EMA checklist items
+        _ema_status = "ON — must pass to qualify" if ema_filter else "OFF (informational only)"
+        ema_checklist_html = (
+            f'<div class="signal-line" style="margin-top:6px;font-size:12px;color:#8892b0;">'
+            f'EMA Trend Filter: <span style="color:#64ffda;">{_ema_status}</span></div>'
+            f'<div class="signal-line" style="letter-spacing:1px;">{check_ema_same}'
+            + (f' &nbsp; {check_ema_htf}' if check_ema_htf else '') +
+            '</div>'
+        )
 
         st.markdown(f"""<div class="signal-card">
 <h4>SIGNAL FOUND — {date_str}</h4>
@@ -1778,7 +3415,7 @@ Vol mult: <span>{sr['Vol Mult']:.2f}x</span></div>
 <hr style="border-color:#1e2d1e; margin:8px 0;">
 <div class="signal-line" style="font-size:12px;color:#8892b0;">{req_label}</div>
 <div class="signal-line" style="letter-spacing:2px;">{checklist}</div>
-<hr style="border-color:#1e2d1e; margin:8px 0;">
+{ema_checklist_html}<hr style="border-color:#1e2d1e; margin:8px 0;">
 <div class="signal-line">ADX strength ({tf_label}): <span style="color:{adx_s_color};">{adx_s_disp}</span>
 &nbsp;|&nbsp; ADX strength ({htf_label} HTF): <span style="color:{adx_h_color};">{adx_h_disp}</span>
 &nbsp;|&nbsp; <span style="color:{adx_vcolor};">{adx_verdict}</span></div>
@@ -1791,6 +3428,82 @@ Vol mult: <span>{sr['Vol Mult']:.2f}x</span></div>
 {tp_lines}
 <div class="signal-line" style="margin-top:8px;">Historical win rate: <span>{wr_str}</span> ({best_tp} TP)</div>
 </div>""", unsafe_allow_html=True)
+
+        # ── Quick Analyze button (Intelligence engine inline) ─────────────────
+        _scan_btn_key = f"scan_analyze_{date_str.replace(' ','_').replace(':','')}"
+        with st.expander(f"🧠 Analyze this signal — {date_str}", expanded=False):
+            # Build enriched candle dict from live_df bar
+            _scan_bar = row.to_dict() if hasattr(row, "to_dict") else dict(row)
+            _scan_bar["adx_value"] = adx_s_v if pd.notna(adx_s_v) else 0.0
+            _scan_bar["di_plus"]   = dip_v   if pd.notna(dip_v)   else 0.0
+            _scan_bar["di_minus"]  = dim_v   if pd.notna(dim_v)   else 0.0
+            _scan_bar["_date_str"] = date_str
+
+            # EMA stack from live_df bar (if _clean_df ran on live_df)
+            _scan_ml_model = st.session_state.get("ml_model_data")
+
+            # Regime snapshot: use last regime from session or compute quickly
+            _scan_regime = st.session_state.get("_regime_data", {})
+
+            # ML score
+            _scan_ml_result = score_candle_ml(_scan_bar, _scan_ml_model, direction) if _scan_ml_model else {"probability": 0.5, "available": False}
+            _scan_ml_prob   = _scan_ml_result.get("probability", 0.5)
+
+            # Rule-based verdict (instant, no API)
+            _scan_rb = rule_based_fallback(_scan_regime, {}, _scan_ml_prob)
+
+            col_ana_l, col_ana_r = st.columns(2)
+            with col_ana_l:
+                st.markdown(f"**ADX** {adx_s_disp} ({tf_label}) / {adx_h_disp} ({htf_label} HTF)")
+                st.markdown(f"**Trend:** {di_dir_str}")
+                _ema_line = f"EMA{ema_period}: {'✅ aligned' if sr['_ema_same_ok'] else '❌ not aligned'}"
+                if sr["_ema_htf_ok"] is not None:
+                    _ema_line += f" | HTF EMA{ema_htf_period}: {'✅' if sr['_ema_htf_ok'] else '❌'}"
+                st.markdown(f"**{_ema_line}**")
+                _scan_rb_vrd = _scan_rb.get("verdict", "WAIT")
+                _vrdc = {"TRADE": "#3fb950", "WAIT": "#e3b341", "NO TRADE": "#f85149"}
+                st.markdown(
+                    f'<div style="margin-top:8px;padding:8px 12px;border-radius:6px;'
+                    f'border:1px solid {_vrdc.get(_scan_rb_vrd,"#8b949e")};'
+                    f'color:{_vrdc.get(_scan_rb_vrd,"#8b949e")};font-weight:700;">'
+                    f'Rule-based: {_scan_rb_vrd}</div>',
+                    unsafe_allow_html=True)
+                st.caption(_scan_rb.get("full_text", "").split("\n")[-1])
+
+            with col_ana_r:
+                _scan_ai_key = st.session_state.get("anthropic_api_key", "")
+                if _scan_ai_key:
+                    if st.button("Run AI Analysis", key=_scan_btn_key, type="primary"):
+                        with st.spinner("Calling AI…"):
+                            _scan_ai_result = analyze_candle_ai(
+                                _scan_bar, _scan_regime, "", _scan_ml_prob,
+                                strategy_params={"retracement": best_ret,
+                                                 "sl_dist": best_sl_dist,
+                                                 "tp_mode": best_tp},
+                                wfo_results=st.session_state.get("wfo_results"),
+                                direction=direction,
+                                ticker=ticker,
+                                timeframe=timeframe,
+                                risk_context={},
+                            )
+                        st.session_state[f"_scan_ai_{_scan_btn_key}"] = _scan_ai_result
+                    _cached_ai = st.session_state.get(f"_scan_ai_{_scan_btn_key}")
+                    if _cached_ai:
+                        _ai_vrd  = _cached_ai.get("verdict", "WAIT")
+                        _ai_col  = _vrdc.get(_ai_vrd, "#8b949e")
+                        st.markdown(
+                            f'<div style="padding:8px 12px;border-radius:6px;'
+                            f'border:1px solid {_ai_col};color:{_ai_col};font-weight:700;">'
+                            f'AI: {_ai_vrd}</div>',
+                            unsafe_allow_html=True)
+                        st.markdown(
+                            f'<div style="font-size:11px;color:#ccd6f6;'
+                            f'white-space:pre-wrap;margin-top:6px;">'
+                            f'{_cached_ai.get("full_text","")}</div>',
+                            unsafe_allow_html=True)
+                else:
+                    st.info("Add Anthropic API key in sidebar to enable AI analysis here.")
+                    st.caption(f"ML probability: {_scan_ml_prob*100:.0f}%")
 
 def _apply_strategy_to_sidebar(row: dict):
     """Store strategy as a pending dict. Applied at top of sidebar on next rerun
@@ -1839,471 +3552,550 @@ def _apply_strategy_to_sidebar(row: dict):
 
 
 def render_strategy_guide():
-    """Interactive strategy guide with diagrams for newcomers."""
+    """Comprehensive beginner guide covering every feature and the full execution workflow."""
 
-    st.markdown("## 📖 Momentum Candle Strategy — Complete Guide")
-    st.caption("Everything you need to understand this strategy from zero. Read top to bottom.")
+    _BOX  = "background:#0d1117;border:1px solid #21262d;border-radius:8px;padding:14px 18px;margin:8px 0;"
+    _BLUE = "background:#0d1f2d;border:1px solid #1f6feb;border-radius:8px;padding:14px 18px;margin:8px 0;"
+    _GRN  = "background:#0d2818;border:1px solid #238636;border-radius:8px;padding:14px 18px;margin:8px 0;"
+    _YLW  = "background:#2d2200;border:1px solid #d29922;border-radius:8px;padding:14px 18px;margin:8px 0;"
+    _RED  = "background:#2d0d0d;border:1px solid #da3633;border-radius:8px;padding:14px 18px;margin:8px 0;"
 
-    # ─── Section 1: The Problem ───────────────────────────────────────────────
+    st.markdown("## 📖 Complete Beginner Guide — Momentum Candle Strategy")
+    st.caption("Read top to bottom the first time. Use the section headers to navigate when you return.")
+
+    # ─── Section 0: Quick Start ────────────────────────────────────────────
     st.markdown("---")
-    st.markdown("### 🤔 What Problem Does This Solve?")
-
-    st.markdown("""
-<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px;margin:8px 0;">
-<div style="color:#ccd6f6;font-size:14px;line-height:1.7;">
-Most traders lose because they <b>enter trades randomly</b> — they see price moving and jump in,
-or they buy/sell based on gut feeling.<br><br>
-This strategy fixes that by giving you a <b>rule-based system</b> that only enters when 3 specific
-things happen at the same time. No guessing, no emotion.<br><br>
-<b>The core idea:</b> Big institutions make huge moves. When they do, they leave a
-footprint — a candle with a large body AND unusually high volume. That's your signal.
-</div>
-<div>
-<div style="margin-bottom:8px;color:#ff6b6b;font-weight:600;">Without a system:</div>
-<div style="color:#ccd6f6;font-size:13px;line-height:1.9;">
-❌ Random entries — sometimes right, often wrong<br>
-❌ Emotional decisions — buy high, sell low<br>
-❌ No way to measure if you're improving
-</div>
-<div style="margin:10px 0 8px;color:#64ffda;font-weight:600;">With this system:</div>
-<div style="color:#ccd6f6;font-size:13px;line-height:1.9;">
-✅ Defined entry rules — same criteria every time<br>
-✅ Fixed stop loss — know max loss before entering<br>
-✅ Backtested results — historical proof first<br>
-✅ Measurable edge — win rate &amp; profit factor tracked
-</div>
-</div>
+    st.markdown("### ⚡ Quick Start — 5 Steps to Your First Trade")
+    st.markdown(f"""
+<div style="{_BLUE}">
+<ol style="color:#ccd6f6;line-height:2;margin:0;padding-left:20px;font-size:14px;">
+<li><b>Strategy Finder tab</b> — Enter ticker (e.g. BTCUSDT), pick timeframe (1D for beginners), click <b>Run Analysis</b></li>
+<li><b>Read the Best Setup box</b> — Optimizer shows best Body%, Volume, SL, TP with historical win rate and profit factor</li>
+<li><b>Backtest Results tab</b> — Verify profit factor ≥ 1.5 and at least 20 trades before trusting the result</li>
+<li><b>WFO Validation tab</b> — Run Walk-Forward Validation to confirm edge holds on unseen data (look for PASS)</li>
+<li><b>Live Scanner tab</b> — Monitor for live signals; click Quick Analyze on any signal card for AI review before entering</li>
+</ol>
 </div>
 """, unsafe_allow_html=True)
 
-    # ─── Section 2: The Momentum Candle ──────────────────────────────────────
+    # ─── Section 1: What Is This Strategy ────────────────────────────────────
     st.markdown("---")
-    st.markdown("### 🕯️ What Is a Momentum Candle?")
-    st.markdown("A **momentum candle** is a special candle that passes two filters simultaneously:")
-
-    # FIX 1: equal-height cards using a single HTML block instead of st.columns
+    st.markdown("### 🗺️ Section 1 — What Is the Momentum Candle Strategy?")
     st.markdown("""
-<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px;margin:12px 0;">
-
-<div style="background:#0d1f2d;border:1px solid #1f6feb;border-radius:8px;padding:20px;box-sizing:border-box;">
-<h4 style="color:#58a6ff;margin:0 0 10px 0;font-size:15px;">Filter 1: Body %</h4>
-<p style="font-size:32px;margin:8px 0;text-align:center;">📏</p>
-<p style="color:#ccd6f6;">The candle body must be <b>≥ 70%</b> of the total candle range.</p>
-<p style="color:#8892b0;font-size:12px;margin:8px 0 0 0;">Body = close − open<br>Range = high − low<br>Body % = Body ÷ Range</p>
-<p style="color:#64ffda;margin:10px 0 0 0;font-size:13px;">Strong directional move — no indecision.</p>
-</div>
-
-<div style="background:#0d1f2d;border:1px solid #1f6feb;border-radius:8px;padding:20px;box-sizing:border-box;">
-<h4 style="color:#58a6ff;margin:0 0 10px 0;font-size:15px;">Filter 2: Volume ×</h4>
-<p style="font-size:32px;margin:8px 0;text-align:center;">📊</p>
-<p style="color:#ccd6f6;">Volume must be <b>≥ 1.5×</b> the 7-candle average volume.</p>
-<p style="color:#8892b0;font-size:12px;margin:8px 0 0 0;">Vol Mult = Today's Vol ÷ Avg(last 7 days)<br>≥ 1.5 = above average activity</p>
-<p style="color:#64ffda;margin:10px 0 0 0;font-size:13px;">Institutional participation — smart money moving.</p>
-</div>
-
-<div style="background:#0d1f2d;border:1px solid #1f6feb;border-radius:8px;padding:20px;box-sizing:border-box;">
-<h4 style="color:#58a6ff;margin:0 0 10px 0;font-size:15px;">Direction</h4>
-<p style="font-size:32px;margin:8px 0;text-align:center;">🧭</p>
-<p style="color:#ccd6f6;"><b>Long mode:</b> Bullish candle (close &gt; open) — green</p>
-<p style="color:#ccd6f6;margin-top:8px;"><b>Short mode:</b> Bearish candle (close &lt; open) — red</p>
-<p style="color:#8892b0;font-size:12px;margin:8px 0 0 0;">Choose direction in the sidebar.</p>
-<p style="color:#64ffda;margin:10px 0 0 0;font-size:13px;">Trade WITH momentum, not against it.</p>
-</div>
-
-</div>
-""", unsafe_allow_html=True)
-
-    # Responsive two-panel candle anatomy (HTML flex — no SVG stretching)
-    st.markdown("#### Anatomy of a Qualifying Candle (Long)")
-    st.components.v1.html("""
-<style>
-  body{margin:0;padding:0;background:#0d1117;}
-  .ca-wrap{display:flex;gap:0;background:#0d1117;border-radius:8px;overflow:hidden;font-family:sans-serif;}
-  .ca-panel{flex:1;min-width:0;padding:18px 16px 14px;box-sizing:border-box;display:flex;flex-direction:column;align-items:center;}
-  .ca-left{border-right:1px solid #2d3250;}
-  .ca-title{font-size:13px;font-weight:700;margin-bottom:2px;text-align:center;}
-  .ca-sub{font-size:11px;margin-bottom:12px;text-align:center;}
-  .ca-candle-wrap{display:flex;align-items:flex-start;gap:10px;width:100%;justify-content:center;}
-  .ca-svg-col{flex-shrink:0;}
-  .ca-lbl-col{display:flex;flex-direction:column;justify-content:space-between;font-size:11px;line-height:1.5;padding-top:4px;}
-  .ca-vol{margin-top:10px;font-size:10px;text-align:center;}
-  .ca-volbar{height:10px;border-radius:3px;margin:3px auto 0;}
-  @media(max-width:400px){.ca-wrap{flex-direction:column;} .ca-left{border-right:none;border-bottom:1px solid #2d3250;}}
-</style>
-<div class="ca-wrap">
-  <!-- LEFT: Normal candle -->
-  <div class="ca-panel ca-left">
-    <div class="ca-title" style="color:#8892b0;">Normal candle</div>
-    <div class="ca-sub" style="color:#ff6b6b;">❌ Does NOT qualify</div>
-    <div class="ca-candle-wrap">
-      <div class="ca-svg-col">
-        <svg viewBox="0 0 40 180" width="40" height="180" xmlns="http://www.w3.org/2000/svg">
-          <!-- full wick -->
-          <line x1="20" y1="5" x2="20" y2="175" stroke="#8892b0" stroke-width="2.5"/>
-          <!-- small body -->
-          <rect x="5" y="88" width="30" height="38" fill="#64ffda" opacity="0.65" rx="2"/>
-        </svg>
-      </div>
-      <div class="ca-lbl-col" style="height:180px;">
-        <span style="color:#8892b0;">▲ Large top wick</span>
-        <span>
-          <span style="color:#ccd6f6;">Small body</span><br>
-          <span style="color:#ff6b6b;">Body% ≈ 30% → FAIL</span>
-        </span>
-        <span style="color:#8892b0;">▼ Large bottom wick</span>
-      </div>
-    </div>
-    <div class="ca-vol">
-      <div class="ca-volbar" style="width:44px;background:#4a5568;"></div>
-      <span style="color:#8892b0;">Vol = normal</span>
-    </div>
-  </div>
-  <!-- RIGHT: Momentum candle -->
-  <div class="ca-panel">
-    <div class="ca-title" style="color:#3fb950;">Momentum candle</div>
-    <div class="ca-sub" style="color:#64ffda;">✅ QUALIFIES</div>
-    <div class="ca-candle-wrap">
-      <div class="ca-svg-col">
-        <svg viewBox="0 0 40 180" width="40" height="180" xmlns="http://www.w3.org/2000/svg">
-          <!-- tiny top wick -->
-          <line x1="20" y1="5" x2="20" y2="14" stroke="#8892b0" stroke-width="2.5"/>
-          <!-- tiny bottom wick -->
-          <line x1="20" y1="166" x2="20" y2="175" stroke="#8892b0" stroke-width="2.5"/>
-          <!-- large body -->
-          <rect x="5" y="14" width="30" height="152" fill="#64ffda" opacity="0.9" rx="2"/>
-          <!-- bracket -->
-          <line x1="35" y1="14"  x2="38" y2="14"  stroke="#64ffda" stroke-width="1.5" stroke-dasharray="2"/>
-          <line x1="35" y1="166" x2="38" y2="166" stroke="#64ffda" stroke-width="1.5" stroke-dasharray="2"/>
-          <line x1="37" y1="14"  x2="37" y2="166" stroke="#64ffda" stroke-width="1.5"/>
-        </svg>
-      </div>
-      <div class="ca-lbl-col" style="height:180px;">
-        <span style="color:#8892b0;">Close (high)</span>
-        <span style="color:#64ffda;font-weight:700;">Body ≥ 70%<br>of range ✅</span>
-        <span style="color:#8892b0;">Open (low)</span>
-      </div>
-    </div>
-    <div class="ca-vol">
-      <div class="ca-volbar" style="width:44px;background:#7c83fd;"></div>
-      <span style="color:#7c83fd;">Vol ≥ 1.5× avg ✅</span>
-    </div>
-  </div>
-</div>
-""", height=280)
-
-    # ─── Section 3: The Trade Setup ───────────────────────────────────────────
-    st.markdown("---")
-    st.markdown("### 🎯 How the Trade is Set Up")
-    st.markdown("""
-Once a momentum candle fires, you **wait for a pullback** (retrace) before entering.
-This gives you a better price and tighter risk. Then you set a fixed Stop Loss below and a Take Profit target above.
+**Core idea:** Big institutions (banks, hedge funds) move markets. When they enter, they leave a
+footprint: a candle with a **large body** AND **unusually high volume**. This tool finds those candles,
+backtests entry rules on historical data, and gives you exact entry, stop loss, and take profit levels.
 """)
-
-    # Trade setup SVG: max-width 820px so height never overflows iframe
-    st.components.v1.html("""
-<style>body{margin:0;padding:0;background:#0d1117;}</style>
-<div style="max-width:820px;margin:0 auto;">
-<svg viewBox="0 0 960 360" xmlns="http://www.w3.org/2000/svg"
-     style="background:#0d1117;border-radius:8px;width:100%;display:block;">
-  <!-- axes -->
-  <line x1="70" y1="20" x2="70"  y2="320" stroke="#2d3250" stroke-width="1.5"/>
-  <line x1="70" y1="320" x2="810" y2="320" stroke="#2d3250" stroke-width="1.5"/>
-
-  <!-- Previous candles -->
-  <rect x="90"  y="210" width="28" height="40" fill="#4a5568" opacity="0.5" rx="1"/>
-  <rect x="128" y="195" width="28" height="50" fill="#4a5568" opacity="0.5" rx="1"/>
-  <rect x="166" y="205" width="28" height="38" fill="#4a5568" opacity="0.5" rx="1"/>
-  <rect x="204" y="185" width="28" height="48" fill="#4a5568" opacity="0.5" rx="1"/>
-
-  <!-- Trigger candle -->
-  <line x1="258" y1="160" x2="258" y2="310" stroke="#8892b0" stroke-width="1.5"/>
-  <rect x="242" y="165" width="32" height="130" fill="#64ffda" opacity="0.9" rx="2"/>
-  <text x="258" y="148" fill="#3fb950" font-size="11" text-anchor="middle" font-family="sans-serif" font-weight="bold">Trigger</text>
-  <text x="258" y="136" fill="#8892b0" font-size="10" text-anchor="middle" font-family="sans-serif">Momentum candle</text>
-
-  <!-- Horizontal price levels — labels on RIGHT side with plenty of room -->
-  <!-- TP -->
-  <line x1="242" y1="80"  x2="730" y2="80"  stroke="#64ffda" stroke-width="1.5" stroke-dasharray="5"/>
-  <text x="736" y="84"  fill="#64ffda" font-size="11" font-family="sans-serif">Take Profit (3R)</text>
-
-  <!-- Close -->
-  <line x1="242" y1="165" x2="730" y2="165" stroke="#ccd6f6" stroke-width="1" stroke-dasharray="4"/>
-  <text x="736" y="169" fill="#ccd6f6" font-size="11" font-family="sans-serif">Close of trigger</text>
-
-  <!-- Entry -->
-  <line x1="242" y1="200" x2="730" y2="200" stroke="#ffd700" stroke-width="1.5" stroke-dasharray="5"/>
-  <text x="736" y="204" fill="#ffd700" font-size="11" font-family="sans-serif">Entry (23.6% retrace)</text>
-
-  <!-- SL -->
-  <line x1="242" y1="235" x2="730" y2="235" stroke="#ff6b6b" stroke-width="1.5" stroke-dasharray="5"/>
-  <text x="736" y="239" fill="#ff6b6b" font-size="11" font-family="sans-serif">Stop Loss (2% below)</text>
-
-  <!-- Retrace + entry candle -->
-  <rect x="284" y="188" width="30" height="55" fill="#4a5568" opacity="0.7" rx="1"/>
-  <text x="299" y="260" fill="#8892b0" font-size="9" text-anchor="middle" font-family="sans-serif">Retrace</text>
-  <circle cx="299" cy="200" r="5" fill="#ffd700"/>
-  <text x="299" y="278" fill="#ffd700" font-size="10" text-anchor="middle" font-family="sans-serif">Entry fills</text>
-
-  <!-- Candles moving up to TP -->
-  <rect x="324" y="145" width="30" height="65" fill="#64ffda" opacity="0.6" rx="1"/>
-  <rect x="364" y="120" width="30" height="78" fill="#64ffda" opacity="0.7" rx="1"/>
-  <rect x="404" y="95"  width="30" height="88" fill="#64ffda" opacity="0.8" rx="1"/>
-  <circle cx="419" cy="80" r="6" fill="#64ffda"/>
-  <text x="419" y="68" fill="#64ffda" font-size="11" text-anchor="middle" font-family="sans-serif" font-weight="bold">TP Hit → WIN ✅</text>
-
-  <!-- R annotations on left axis -->
-  <line x1="75" y1="200" x2="75" y2="235" stroke="#ff6b6b" stroke-width="2"/>
-  <text x="65" y="221" fill="#ff6b6b" font-size="10" text-anchor="end" font-family="sans-serif">1R</text>
-  <line x1="75" y1="80"  x2="75" y2="200" stroke="#64ffda" stroke-width="2"/>
-  <text x="65" y="143" fill="#64ffda" font-size="10" text-anchor="end" font-family="sans-serif">3R</text>
-</svg>
+    st.markdown(f"""
+<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px;margin:8px 0;">
+<div style="{_BLUE}">
+<b style="color:#58a6ff;">Filter 1 — Body %</b><br>
+<span style="color:#ccd6f6;font-size:13px;">
+The candle body must be ≥ 70% of the total wick-to-wick range.<br>
+Body = |close − open|. Range = high − low. Body% = Body ÷ Range × 100.<br><br>
+<b style="color:#64ffda;">Why it matters:</b> A fat body with tiny wicks means conviction —
+price went one direction and stayed there. No indecision.
+</span>
 </div>
-""", height=310)
-
-    st.markdown("""
-<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px;margin-top:12px;">
-<div style="background:#0d1f2d;border:1px solid #1f6feb;border-radius:8px;padding:14px 16px;">
-<b style="color:#58a6ff;">Entry retracement</b><br>
-<span style="color:#ccd6f6;font-size:13px;">Wait for price to pull back before entering. At <b>23.6% Fib</b>:<br>
-• Trigger body = $1,000 ($50,000 → $51,000)<br>
-• 23.6% of $1,000 = $236<br>
-• Entry = $51,000 − $236 = <b style="color:#ffd700;">$50,764</b><br>
-Better price, tighter stop than entering at close.</span>
+<div style="{_BLUE}">
+<b style="color:#58a6ff;">Filter 2 — Volume ×</b><br>
+<span style="color:#ccd6f6;font-size:13px;">
+Volume must be ≥ 1.5× the 7-candle average.<br>
+Vol Mult = Today's volume ÷ Avg(last 7 candles).<br><br>
+<b style="color:#64ffda;">Why it matters:</b> High volume = big players participating.
+A large candle on low volume is a fake-out. High volume confirms real institutional activity.
+</span>
 </div>
-<div style="background:#0d1f2d;border:1px solid #1f6feb;border-radius:8px;padding:14px 16px;">
-<b style="color:#58a6ff;">R = your risk unit</b><br>
-<span style="color:#ccd6f6;font-size:13px;">Entry $50,764 / Stop $49,749 (2% below):<br>
-• 1R = $50,764 − $49,749 = $1,015<br>
-• 2R target = $52,794 &nbsp; 3R target = $53,809<br>
-Risk $100 per trade → win 3R = <b style="color:#64ffda;">+$300</b>. Lose = <b style="color:#ff6b6b;">−$100</b>.</span>
+<div style="{_BLUE}">
+<b style="color:#58a6ff;">Direction</b><br>
+<span style="color:#ccd6f6;font-size:13px;">
+<b>Long:</b> Only bullish candles (close &gt; open, green body)<br>
+<b>Short:</b> Only bearish candles (close &lt; open, red body)<br><br>
+Choose in sidebar. Beginners: start with <b>Long only on 1D</b>
+— crypto has long-term bullish bias and long setups are simpler to understand.
+</span>
 </div>
 </div>
 """, unsafe_allow_html=True)
 
-    # ─── Section 4: Risk Math ─────────────────────────────────────────────────
-    st.markdown("---")
-    st.markdown("### 📐 Why Low Win Rate Still Makes Money")
-
-    # FIX 4: uniform box sizes, last box red, proper spacing
-    st.components.v1.html("""
-<style>body{margin:0;padding:0;background:#0d1117;}</style>
-<div style="max-width:720px;margin:0 auto;">
-<svg viewBox="0 0 740 195" xmlns="http://www.w3.org/2000/svg"
-     style="background:#0d1117;border-radius:8px;width:100%;display:block;">
-  <text x="370" y="22" fill="#ccd6f6" font-size="13" text-anchor="middle"
-        font-family="sans-serif" font-weight="bold">
-    10 trades — 3R target, 2% risk, $1,000 account — Win rate 30%
-  </text>
-
-  <!-- 7 LOSS boxes — all same size 60×60, spaced evenly -->
-  <rect x="20"  y="38" width="60" height="60" fill="#ff6b6b" opacity="0.82" rx="5"/>
-  <text x="50"  y="66" fill="white" font-size="12" text-anchor="middle" font-family="sans-serif" font-weight="bold">LOSS</text>
-  <text x="50"  y="82" fill="white" font-size="11" text-anchor="middle" font-family="sans-serif">−$20</text>
-
-  <rect x="90"  y="38" width="60" height="60" fill="#ff6b6b" opacity="0.82" rx="5"/>
-  <text x="120" y="66" fill="white" font-size="12" text-anchor="middle" font-family="sans-serif" font-weight="bold">LOSS</text>
-  <text x="120" y="82" fill="white" font-size="11" text-anchor="middle" font-family="sans-serif">−$20</text>
-
-  <rect x="160" y="38" width="60" height="60" fill="#ff6b6b" opacity="0.82" rx="5"/>
-  <text x="190" y="66" fill="white" font-size="12" text-anchor="middle" font-family="sans-serif" font-weight="bold">LOSS</text>
-  <text x="190" y="82" fill="white" font-size="11" text-anchor="middle" font-family="sans-serif">−$20</text>
-
-  <rect x="230" y="38" width="60" height="60" fill="#ff6b6b" opacity="0.82" rx="5"/>
-  <text x="260" y="66" fill="white" font-size="12" text-anchor="middle" font-family="sans-serif" font-weight="bold">LOSS</text>
-  <text x="260" y="82" fill="white" font-size="11" text-anchor="middle" font-family="sans-serif">−$20</text>
-
-  <rect x="300" y="38" width="60" height="60" fill="#ff6b6b" opacity="0.82" rx="5"/>
-  <text x="330" y="66" fill="white" font-size="12" text-anchor="middle" font-family="sans-serif" font-weight="bold">LOSS</text>
-  <text x="330" y="82" fill="white" font-size="11" text-anchor="middle" font-family="sans-serif">−$20</text>
-
-  <rect x="370" y="38" width="60" height="60" fill="#ff6b6b" opacity="0.82" rx="5"/>
-  <text x="400" y="66" fill="white" font-size="12" text-anchor="middle" font-family="sans-serif" font-weight="bold">LOSS</text>
-  <text x="400" y="82" fill="white" font-size="11" text-anchor="middle" font-family="sans-serif">−$20</text>
-
-  <rect x="440" y="38" width="60" height="60" fill="#ff6b6b" opacity="0.82" rx="5"/>
-  <text x="470" y="66" fill="white" font-size="12" text-anchor="middle" font-family="sans-serif" font-weight="bold">LOSS</text>
-  <text x="470" y="82" fill="white" font-size="11" text-anchor="middle" font-family="sans-serif">−$20</text>
-
-  <!-- 3 WIN boxes — same size 60×60 -->
-  <rect x="510" y="38" width="60" height="60" fill="#64ffda" opacity="0.88" rx="5"/>
-  <text x="540" y="64" fill="#0d1117" font-size="12" text-anchor="middle" font-family="sans-serif" font-weight="bold">WIN</text>
-  <text x="540" y="80" fill="#0d1117" font-size="11" text-anchor="middle" font-family="sans-serif">+$60</text>
-  <text x="540" y="111" fill="#64ffda" font-size="10" text-anchor="middle" font-family="sans-serif">3R</text>
-
-  <rect x="580" y="38" width="60" height="60" fill="#64ffda" opacity="0.88" rx="5"/>
-  <text x="610" y="64" fill="#0d1117" font-size="12" text-anchor="middle" font-family="sans-serif" font-weight="bold">WIN</text>
-  <text x="610" y="80" fill="#0d1117" font-size="11" text-anchor="middle" font-family="sans-serif">+$60</text>
-
-  <rect x="650" y="38" width="60" height="60" fill="#64ffda" opacity="0.88" rx="5"/>
-  <text x="680" y="64" fill="#0d1117" font-size="12" text-anchor="middle" font-family="sans-serif" font-weight="bold">WIN</text>
-  <text x="680" y="80" fill="#0d1117" font-size="11" text-anchor="middle" font-family="sans-serif">+$60</text>
-
-  <!-- Summary bar -->
-  <rect x="20" y="120" width="700" height="60" fill="#1e2130" rx="6"/>
-  <text x="370" y="145" fill="#ccd6f6" font-size="12" text-anchor="middle" font-family="sans-serif">
-    7 losses × $20 = −$140   |   3 wins × $60 = +$180
-  </text>
-  <text x="370" y="168" fill="#64ffda" font-size="14" text-anchor="middle"
-        font-family="sans-serif" font-weight="bold">
-    NET = +$40 profit — even at only 30% win rate
-  </text>
-</svg>
-</div>
-""", height=205)
-
-    st.markdown("""
-> **The key insight:** you don't need to win most of the time. You just need your wins to be
-> bigger than your losses. At **3R target with 2% risk**, winning just **1 in 4 trades** breaks even.
-> Win 35%+ and you're consistently profitable.
-""")
-
-    # ─── Section 5: ADX ───────────────────────────────────────────────────────
-    st.markdown("---")
-    st.markdown("### 📡 The ADX Filter — Optional But Powerful")
-    st.markdown("""
-**ADX** tells you whether the market is **trending** or **ranging**.
-Momentum candles work far better in trending markets.
-""")
-
-    # FIX 5: two side-by-side panels, text never overlaps chart, plenty of padding
-    st.components.v1.html("""
-<style>body{margin:0;padding:0;background:#0d1117;}</style>
-<div style="max-width:740px;margin:0 auto;">
-<svg viewBox="0 0 760 260" xmlns="http://www.w3.org/2000/svg"
-     style="background:#0d1117;border-radius:8px;width:100%;display:block;">
-
-  <!-- ── LEFT PANEL: Ranging ── -->
-  <rect x="10" y="10" width="355" height="240" fill="#1a0d0d" rx="6" stroke="#ff6b6b" stroke-width="1" opacity="0.6"/>
-  <text x="187" y="32" fill="#ff6b6b" font-size="13" text-anchor="middle" font-family="sans-serif" font-weight="bold">
-    Ranging Market  (ADX &lt; 25)
-  </text>
-  <text x="187" y="50" fill="#8892b0" font-size="10" text-anchor="middle" font-family="sans-serif">
-    Signal fires but price chops sideways
-  </text>
-  <!-- choppy line -->
-  <polyline points="30,155 55,125 80,165 105,118 130,158 155,112 180,150 205,108 230,148 255,118 290,152 325,120"
-            fill="none" stroke="#ff6b6b" stroke-width="2"/>
-  <line x1="30" y1="135" x2="325" y2="135" stroke="#ff6b6b" stroke-width="1" stroke-dasharray="4" opacity="0.3"/>
-  <!-- signal candle -->
-  <rect x="97" y="107" width="16" height="36" fill="#64ffda" opacity="0.7" rx="1"/>
-  <text x="105" y="100" fill="#ffd700" font-size="10" text-anchor="middle" font-family="sans-serif">signal</text>
-  <!-- result -->
-  <text x="187" y="178" fill="#ff6b6b" font-size="12" text-anchor="middle" font-family="sans-serif" font-weight="bold">
-    ❌ Price reverses — false signal
-  </text>
-  <!-- ADX bar -->
-  <rect x="30" y="192" width="295" height="16" fill="#2d1a1a" rx="3"/>
-  <rect x="30" y="192" width="74"  height="16" fill="#ff6b6b" opacity="0.7" rx="3"/>
-  <text x="187" y="204" fill="#8892b0" font-size="10" text-anchor="middle" font-family="sans-serif">ADX ≈ 15 (ranging)</text>
-  <text x="187" y="228" fill="#ff6b6b" font-size="11" text-anchor="middle" font-family="sans-serif">
-    Strategy underperforms here
-  </text>
-
-  <!-- ── RIGHT PANEL: Trending ── -->
-  <rect x="395" y="10" width="355" height="240" fill="#0d1a0d" rx="6" stroke="#64ffda" stroke-width="1" opacity="0.6"/>
-  <text x="572" y="32" fill="#64ffda" font-size="13" text-anchor="middle" font-family="sans-serif" font-weight="bold">
-    Trending Market  (ADX ≥ 25)
-  </text>
-  <text x="572" y="50" fill="#8892b0" font-size="10" text-anchor="middle" font-family="sans-serif">
-    Signal fires — price follows through
-  </text>
-  <!-- trending line -->
-  <polyline points="415,195 445,178 475,160 510,138 545,115 580,92 615,70 650,50 690,32 730,18"
-            fill="none" stroke="#64ffda" stroke-width="2.5"/>
-  <!-- signal candle -->
-  <rect x="500" y="126" width="16" height="30" fill="#64ffda" opacity="0.9" rx="1"/>
-  <text x="508" y="120" fill="#ffd700" font-size="10" text-anchor="middle" font-family="sans-serif">signal</text>
-  <!-- arrow to TP -->
-  <line x1="516" y1="118" x2="645" y2="52" stroke="#64ffda" stroke-width="1.5" stroke-dasharray="5"/>
-  <text x="572" y="178" fill="#64ffda" font-size="12" text-anchor="middle" font-family="sans-serif" font-weight="bold">
-    ✅ Price keeps moving — clean win
-  </text>
-  <!-- ADX bar -->
-  <rect x="415" y="192" width="295" height="16" fill="#0d2d0d" rx="3"/>
-  <rect x="415" y="192" width="207" height="16" fill="#64ffda" opacity="0.7" rx="3"/>
-  <text x="572" y="204" fill="#64ffda" font-size="10" text-anchor="middle" font-family="sans-serif">ADX ≈ 32 (trending)</text>
-  <text x="572" y="228" fill="#64ffda" font-size="11" text-anchor="middle" font-family="sans-serif">
-    Strategy excels here
-  </text>
-</svg>
-</div>
-""", height=285)
-
-    # ─── Section 6: Full workflow ─────────────────────────────────────────────
-    st.markdown("---")
-    st.markdown("### 🔄 Full Workflow — Step by Step")
-
-    steps = [
-        ("1️⃣", "Set your ticker & timeframe", "Enter a crypto pair (e.g. BTC, ETH) and choose 1D, 4H, or 1H. Daily is most reliable for beginners."),
-        ("2️⃣", "Click Run Analysis", "The app backtests ALL combinations of entry retrace, stop loss, take profit, and ADX filter — and finds the best one."),
-        ("3️⃣", "Read the Best Setup", "The app shows the single best parameter combo based on historical Profit Factor. This is your trading blueprint."),
-        ("4️⃣", "Check Hold Time Analysis", "Tells you whether to hold until TP/SL or cut trades early at a specific candle count. Cutting early sometimes helps."),
-        ("5️⃣", "Monitor Live Scanner", "Checks the last 20 candles for fresh qualifying signals with entry, SL, and TP levels pre-calculated."),
-        ("6️⃣", "Use Auto Analyzer", "Run the full sweep to discover if Short mode, a different timeframe, or ADX filtering improves results further."),
-    ]
-
-    for emoji, title, desc in steps:
-        st.markdown(f"""<div style="display:flex;align-items:flex-start;padding:12px 0;border-bottom:1px solid #21262d;">
-<span style="font-size:24px;margin-right:14px;flex-shrink:0;">{emoji}</span>
-<div>
-<div style="color:#ccd6f6;font-weight:700;font-size:15px;margin-bottom:4px;">{title}</div>
-<div style="color:#8892b0;font-size:13px;">{desc}</div>
-</div>
-</div>""", unsafe_allow_html=True)
-
-    # FIX 6: metric cards — fixed height with min-height so all equal
-    st.markdown("---")
-    st.markdown("### 📊 Understanding the Numbers")
-    st.markdown("""
-<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin:12px 0;">
-
-<div style="background:#1e2130;border:1px solid #2d3250;border-radius:8px;padding:16px;min-height:130px;box-sizing:border-box;">
-<div style="color:#8892b0;font-size:11px;text-transform:uppercase;letter-spacing:1px;">Profit Factor</div>
-<div style="color:#64ffda;font-size:13px;margin-top:10px;">Total wins ÷ Total losses.<br><b>&gt; 1.0</b> = profitable.<br><b>1.5</b> = good. <b>2.0+</b> = excellent.</div>
-</div>
-
-<div style="background:#1e2130;border:1px solid #2d3250;border-radius:8px;padding:16px;min-height:130px;box-sizing:border-box;">
-<div style="color:#8892b0;font-size:11px;text-transform:uppercase;letter-spacing:1px;">Win Rate</div>
-<div style="color:#ffd700;font-size:13px;margin-top:10px;">% of trades that hit TP.<br>Low win rate (35%) is fine if your reward is 3× your risk.</div>
-</div>
-
-<div style="background:#1e2130;border:1px solid #2d3250;border-radius:8px;padding:16px;min-height:130px;box-sizing:border-box;">
-<div style="color:#8892b0;font-size:11px;text-transform:uppercase;letter-spacing:1px;">Avg R</div>
-<div style="color:#7c83fd;font-size:13px;margin-top:10px;">Average profit per trade in R units.<br>Positive = strategy makes money over time.</div>
-</div>
-
-<div style="background:#1e2130;border:1px solid #2d3250;border-radius:8px;padding:16px;min-height:130px;box-sizing:border-box;">
-<div style="color:#8892b0;font-size:11px;text-transform:uppercase;letter-spacing:1px;">Edge Score</div>
-<div style="color:#ff8c42;font-size:13px;margin-top:10px;">Return vs volatility.<br><b>&gt; 1.0</b> = good risk-adjusted returns.<br><b>&gt; 2.0</b> = excellent.</div>
-</div>
-
+    st.markdown(f"""
+<div style="{_YLW}">
+<b>📐 Example:</b> BTC closes $50,000. Open $48,000. High $50,200. Low $47,900.<br>
+Body = 50,000 − 48,000 = <b>$2,000</b>. Range = 50,200 − 47,900 = <b>$2,300</b>. Body% = <b>87%</b> → PASSES ✅<br>
+Volume today = 15,000 BTC, 7-day avg = 8,000 BTC → Vol Mult = <b>1.87×</b> → PASSES ✅<br>
+→ <b>This candle qualifies as a momentum signal.</b>
 </div>
 """, unsafe_allow_html=True)
 
-    # ─── Section 8: Quick tips ────────────────────────────────────────────────
+    # ─── Section 2: Strategy Finder ────────────────────────────────────────────
     st.markdown("---")
-    st.markdown("### 💡 Tips for Beginners")
+    st.markdown("### 🔍 Section 2 — Strategy Finder Tab")
     st.markdown("""
-<div class="info-box">
-<h4>Do's ✅</h4>
-<ul style="color:#ccd6f6;margin:0;padding-left:20px;">
-<li>Start with <b>Daily (1D)</b> timeframe — fewer signals but more reliable</li>
-<li>Use at least <b>1 year of data</b> before trusting results</li>
-<li>Aim for <b>≥ 20 qualifying signals</b> in your backtest period</li>
-<li>Prefer setups with <b>Profit Factor ≥ 1.3</b> and <b>≥ 15 trades</b></li>
-<li>Use <b>Hold Time Analysis</b> — cutting at 3–5 candles sometimes beats holding forever</li>
-<li>Paper trade (demo) first before using real money</li>
-</ul>
+The **Strategy Finder** sweeps through combinations of parameters and shows which settings
+produced the best historical results for your ticker and timeframe. This is where you calibrate the strategy.
+""")
+    st.markdown(f"""
+<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px;margin:8px 0;">
+<div style="{_BOX}">
+<b style="color:#ccd6f6;">Sidebar Inputs</b><br>
+<span style="color:#8892b0;font-size:13px;line-height:1.9;">
+<b>Ticker</b> — crypto pair on Binance (BTCUSDT, ETHUSDT...)<br>
+<b>Timeframe</b> — 1D = daily, 4H = 4-hour, 1H = hourly<br>
+<b>History</b> — how many past days to backtest<br>
+<b>Min Body %</b> — body filter threshold (default 70%)<br>
+<b>Min Vol ×</b> — volume multiplier (default 1.5×)<br>
+<b>Direction</b> — Long (bullish) or Short (bearish)
+</span>
 </div>
+<div style="{_BOX}">
+<b style="color:#ccd6f6;">Best Setup Box (output)</b><br>
+<span style="color:#8892b0;font-size:13px;line-height:1.9;">
+<b>Retracement</b> — how far to wait for pullback before entering<br>
+&nbsp;&nbsp;e.g. 38.2% = enter at 38.2% retrace of signal candle<br>
+<b>SL Distance</b> — stop loss as % from entry<br>
+<b>TP Mode</b> — 2R, 3R, or Partial (R = reward-to-risk)<br>
+<b>Win Rate</b> — % of historical trades profitable<br>
+<b>Profit Factor</b> — gross profit ÷ gross loss (≥ 1.5 = good)
+</span>
+</div>
+<div style="{_BOX}">
+<b style="color:#ccd6f6;">Retracement Explained</b><br>
+<span style="color:#8892b0;font-size:13px;line-height:1.9;">
+<b>0% (Immediate):</b> Enter next candle open after signal. Fast but less precise price.<br><br>
+<b>23.6–61.8% Fib:</b> Wait for price to pull back X% of signal candle range before entering.
+Better price but signals that don't retrace enough are skipped.
+</span>
+</div>
+</div>
+""", unsafe_allow_html=True)
 
-<div class="info-box" style="margin-top:12px;">
-<h4>Don'ts ❌</h4>
-<ul style="color:#ccd6f6;margin:0;padding-left:20px;">
-<li>Don't use 1H with only 3 months of data — too few signals to trust</li>
-<li>Don't cherry-pick results — use what the optimizer recommends</li>
-<li>Don't over-optimize — PF of 99 with only 3 trades is meaningless</li>
-<li>Don't ignore drawdown — losing 50% before recovering is not practical</li>
-<li>Don't expect every trade to win — 35% win rate is profitable with 3R target</li>
+    st.markdown(f"""
+<div style="{_GRN}">
+<b style="color:#3fb950;">Win Rate + Profit Factor — read them together:</b><br>
+<span style="color:#ccd6f6;font-size:13px;">
+A <b>35% win rate with 3R target</b> is profitable: win $3 for every $1 lost → even winning 1 in 3 = net positive.
+Never judge by win rate alone.<br><br>
+<b>PF ≥ 1.5</b> = acceptable. &nbsp;<b>PF ≥ 2.0</b> = strong. &nbsp;<b>PF ≥ 3.0</b> = exceptional.<br>
+Always require <b>at least 20 trades</b> — fewer trades = results could be lucky noise.
+</span>
+</div>
+""", unsafe_allow_html=True)
+
+    # ─── Section 3: Backtest Results ────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("### 📊 Section 3 — Backtest Results Tab")
+    st.markdown("""
+After running, **Backtest Results** shows every trade the strategy would have taken historically.
+Use this to understand the risk profile and verify the edge is real.
+""")
+    st.markdown(f"""
+<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;margin:8px 0;">
+<div style="{_BOX}">
+<b style="color:#58a6ff;">Key Metrics</b><br>
+<span style="color:#8892b0;font-size:13px;line-height:1.9;">
+📈 <b>Total Return %</b> — net profit over period<br>
+🎯 <b>Win Rate</b> — wins ÷ total trades<br>
+⚖️ <b>Profit Factor</b> — gross profit ÷ gross loss<br>
+📉 <b>Max Drawdown</b> — worst peak-to-trough loss<br>
+🔢 <b>Trade Count</b> — total qualifying signals taken
+</span>
+</div>
+<div style="{_BOX}">
+<b style="color:#58a6ff;">Trade Log Tab</b><br>
+<span style="color:#8892b0;font-size:13px;line-height:1.9;">
+Shows every individual trade: entry date, entry price, exit price, result (W/L), and R multiple.<br><br>
+Use it to spot if losses cluster at certain times or market conditions (e.g. all losses in flat months).
+</span>
+</div>
+<div style="{_BOX}">
+<b style="color:#58a6ff;">Good Result Checklist</b><br>
+<span style="color:#8892b0;font-size:13px;line-height:1.9;">
+✅ PF ≥ 1.5 with ≥ 20 trades<br>
+✅ Max drawdown &lt; 30%<br>
+✅ Consistent across date ranges<br>
+✅ Passes WFO Validation<br><br>
+❌ PF 10+ with 5 trades = lucky noise
+</span>
+</div>
+</div>
+""", unsafe_allow_html=True)
+
+    # ─── Section 4: ADX + EMA Filters ───────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("### 📡 Section 4 — ADX Filter + EMA Trend Filter")
+    st.markdown("""
+Both filters are **optional** and sit in the sidebar. They reduce signal count while improving quality — fewer but higher-probability setups.
+""")
+    st.markdown(f"""
+<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px;margin:8px 0;">
+<div style="{_BLUE}">
+<b style="color:#58a6ff;">ADX Filter — Is the market trending?</b><br>
+<span style="color:#ccd6f6;font-size:13px;line-height:1.8;">
+ADX measures <b>trend strength</b>, not direction.<br>
+ADX ≥ 25 = strong trend → take signals<br>
+ADX &lt; 25 = weak/ranging market → skip signals<br><br>
+<b>DI Gap:</b> Requires DI+ and DI− to be separated by a minimum — confirms direction is clear, not a coin-flip.<br><br>
+<b>HTF mode:</b> Check ADX on higher timeframe (4H ADX for 1H signals) for stronger confirmation.
+</span>
+</div>
+<div style="{_BLUE}">
+<b style="color:#58a6ff;">EMA Filter — Which direction?</b><br>
+<span style="color:#ccd6f6;font-size:13px;line-height:1.8;">
+EMA shows the <b>direction</b> of the trend.<br>
+Close &gt; EMA 200 = bullish bias → LONG signals only<br>
+Close &lt; EMA 200 = bearish bias → SHORT signals only<br><br>
+<b>HTF EMA:</b> 1H signal + check 4H EMA 200 = even stronger.
+Trade 1H candles only when 4H trend agrees.<br><br>
+<b>Weekly EMA 50</b> is the standard for daily chart signals.
+</span>
+</div>
+<div style="{_BLUE}">
+<b style="color:#58a6ff;">Combined = best quality signals</b><br>
+<span style="color:#ccd6f6;font-size:13px;line-height:1.8;">
+ADX says: <i>"Is it trending?"</i><br>
+EMA says: <i>"Which direction?"</i><br><br>
+Together: ADX ≥ 25 + close &gt; EMA 200 + momentum candle<br>
+= strong trend + right direction + institutional move<br>
+= <b style="color:#64ffda;">highest probability signals</b><br><br>
+Always test with/without filters and compare PF + WFO.
+</span>
+</div>
+</div>
+""", unsafe_allow_html=True)
+
+    # ─── Section 5: Market Regime Gate ──────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("### 🌡️ Section 5 — Market Regime Gate")
+    st.markdown("""
+The **Regime Gate** scores the current market environment from 0–100 and shows a colored banner (GREEN/YELLOW/RED).
+It does not block signals — it tells you whether conditions favor your strategy right now.
+""")
+    st.markdown(f"""
+<div style="{_BOX}">
+<table style="width:100%;border-collapse:collapse;font-size:13px;color:#ccd6f6;">
+<tr style="border-bottom:1px solid #21262d;">
+  <th style="text-align:left;padding:6px 10px;color:#58a6ff;">Component</th>
+  <th style="text-align:left;padding:6px 10px;color:#58a6ff;">What it measures</th>
+  <th style="text-align:left;padding:6px 10px;color:#58a6ff;">Score</th>
+</tr>
+<tr style="border-bottom:1px solid #21262d;">
+  <td style="padding:6px 10px;">ADX ≥ 25</td>
+  <td style="padding:6px 10px;">Trend strength (market is directional, not choppy)</td>
+  <td style="padding:6px 10px;">+25 pts</td>
+</tr>
+<tr style="border-bottom:1px solid #21262d;">
+  <td style="padding:6px 10px;">DI+ &gt; DI−</td>
+  <td style="padding:6px 10px;">Bulls outpacing bears (for long signals)</td>
+  <td style="padding:6px 10px;">+25 pts</td>
+</tr>
+<tr style="border-bottom:1px solid #21262d;">
+  <td style="padding:6px 10px;">Vol Rank &gt; 50%</td>
+  <td style="padding:6px 10px;">Volume above 20-day median (active participation)</td>
+  <td style="padding:6px 10px;">+25 pts</td>
+</tr>
+<tr>
+  <td style="padding:6px 10px;">Close &gt; EMA 50</td>
+  <td style="padding:6px 10px;">Price above medium-term trend line</td>
+  <td style="padding:6px 10px;">+25 pts</td>
+</tr>
+</table>
+</div>
+""", unsafe_allow_html=True)
+
+    st.markdown(f"""
+<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin:10px 0;">
+<div style="background:#0d2818;border:1px solid #238636;border-radius:8px;padding:12px;text-align:center;">
+<b style="color:#3fb950;font-size:18px;">GREEN</b><br>
+<span style="color:#ccd6f6;font-size:13px;">Score 75–100<br>All systems go.<br>Best conditions for signals.</span>
+</div>
+<div style="background:#2d2200;border:1px solid #d29922;border-radius:8px;padding:12px;text-align:center;">
+<b style="color:#d29922;font-size:18px;">YELLOW</b><br>
+<span style="color:#ccd6f6;font-size:13px;">Score 50–74<br>Moderate conditions.<br>Reduce size 50%.</span>
+</div>
+<div style="background:#2d0d0d;border:1px solid #da3633;border-radius:8px;padding:12px;text-align:center;">
+<b style="color:#da3633;font-size:18px;">RED</b><br>
+<span style="color:#ccd6f6;font-size:13px;">Score 0–49<br>Poor conditions.<br>Skip or sit out.</span>
+</div>
+</div>
+""", unsafe_allow_html=True)
+
+    # ─── Section 6: WFO Validation ───────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("### ✅ Section 6 — WFO Validation Tab")
+    st.markdown("""
+**Walk-Forward Optimisation (WFO)** is the most important test. It proves your strategy works on
+**data it has never seen before** — not just data it was optimized on.
+""")
+    st.markdown(f"""
+<div style="{_BOX}">
+<b style="color:#ccd6f6;">How WFO works:</b><br>
+<ol style="color:#8892b0;font-size:13px;line-height:1.9;margin:8px 0;padding-left:20px;">
+<li>Split historical data into N windows (default 5)</li>
+<li>For each window: optimize on first 70% (“in-sample”) → test on remaining 30% (“out-of-sample”)</li>
+<li>Report PF and win rate for each out-of-sample period</li>
+<li>Consistent results across windows → <b style="color:#3fb950;">PASS</b></li>
+<li>Wildly varying or mostly failing → <b style="color:#da3633;">FAIL</b> = overfit, do not trade live</li>
+</ol>
+</div>
+""", unsafe_allow_html=True)
+
+    st.markdown(f"""
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:10px 0;">
+<div style="{_GRN}">
+<b style="color:#3fb950;">PASS signs</b><br>
+<span style="color:#ccd6f6;font-size:13px;">
+✅ ≥ 60% of windows profitable<br>
+✅ Avg out-of-sample PF ≥ 1.2<br>
+✅ No single catastrophic window<br>
+✅ Consistent across timeframes
+</span>
+</div>
+<div style="{_RED}">
+<b style="color:#da3633;">FAIL warning signs</b><br>
+<span style="color:#ccd6f6;font-size:13px;">
+❌ &lt; 40% of windows profitable<br>
+❌ Great in-sample, terrible out-of-sample<br>
+❌ One window carries all profit<br>
+❌ PF drops from 3.0 to 0.8 out-of-sample
+</span>
+</div>
+</div>
+""", unsafe_allow_html=True)
+
+    st.markdown(f"""
+<div style="{_YLW}">
+<b>💡 If WFO fails:</b> the strategy is overfit. Fix it by reducing complexity — fewer Fib levels,
+wider SL ranges, or try a different ticker/timeframe. Do not trade an overfit strategy live.
+</div>
+""", unsafe_allow_html=True)
+
+    # ─── Section 7: ML Classifier ────────────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("### 🤖 Section 7 — ML Classifier Tab")
+    st.markdown("""
+The **ML Classifier** uses machine learning (Logistic Regression with TimeSeriesSplit) to predict
+whether a new momentum signal is likely to be a winner or loser before you take the trade.
+""")
+    st.markdown(f"""
+<div style="{_BOX}">
+<b style="color:#ccd6f6;">The 7 features the model learns from:</b><br>
+<table style="width:100%;border-collapse:collapse;font-size:13px;color:#ccd6f6;margin-top:8px;">
+<tr style="border-bottom:1px solid #21262d;">
+  <th style="text-align:left;padding:5px 8px;color:#58a6ff;">Feature</th>
+  <th style="text-align:left;padding:5px 8px;color:#58a6ff;">Why it predicts trade outcome</th>
+</tr>
+<tr style="border-bottom:1px solid #21262d;"><td style="padding:5px 8px;">Body %</td><td style="padding:5px 8px;">Stronger body = more conviction, higher follow-through probability</td></tr>
+<tr style="border-bottom:1px solid #21262d;"><td style="padding:5px 8px;">Volume Multiplier</td><td style="padding:5px 8px;">Higher volume = institutional participation = move more likely to continue</td></tr>
+<tr style="border-bottom:1px solid #21262d;"><td style="padding:5px 8px;">ATR (volatility)</td><td style="padding:5px 8px;">Market context — candle strength relative to current market activity</td></tr>
+<tr style="border-bottom:1px solid #21262d;"><td style="padding:5px 8px;">ADX</td><td style="padding:5px 8px;">Trend strength at signal time — signals in strong trends win more often</td></tr>
+<tr style="border-bottom:1px solid #21262d;"><td style="padding:5px 8px;">DI+ − DI−</td><td style="padding:5px 8px;">Directional gap — how clear the trend direction is</td></tr>
+<tr style="border-bottom:1px solid #21262d;"><td style="padding:5px 8px;">Volume Rank (20)</td><td style="padding:5px 8px;">Volume percentile over 20 periods — is today unusually active?</td></tr>
+<tr><td style="padding:5px 8px;">Candle Range</td><td style="padding:5px 8px;">Absolute size — larger candle = more energy behind the move</td></tr>
+</table>
+</div>
+""", unsafe_allow_html=True)
+
+    st.markdown(f"""
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:10px 0;">
+<div style="{_BLUE}">
+<b style="color:#58a6ff;">How to use the ML score</b><br>
+<span style="color:#ccd6f6;font-size:13px;line-height:1.8;">
+Score &gt; 0.65 → High-probability → full position<br>
+Score 0.50–0.65 → Moderate → half size or skip<br>
+Score &lt; 0.50 → Low probability → skip<br><br>
+ML score is a <b>second opinion</b>. Never override a WFO-validated
+setup purely based on ML score.
+</span>
+</div>
+<div style="{_BLUE}">
+<b style="color:#58a6ff;">No lookahead bias</b><br>
+<span style="color:#ccd6f6;font-size:13px;line-height:1.8;">
+Uses TimeSeriesSplit: trained on past, tested on future only.
+Cross-validation accuracy shown in the tab.<br><br>
+<b>Accuracy &gt; 60%</b> on test set = useful predictive signal.<br>
+Below 55% = near-random, don't rely on it.
+</span>
+</div>
+</div>
+""", unsafe_allow_html=True)
+
+    # ─── Section 8: Intelligence Tab ───────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("### 🧠 Section 8 — Intelligence Tab")
+    st.markdown("""
+The **Intelligence Tab** gives a deep analysis of any historical signal candle using three engines:
+a similarity engine, a regime check, and an AI assistant (Groq LLM — free, no API cost for basic use).
+""")
+    st.markdown(f"""
+<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;margin:8px 0;">
+<div style="{_BOX}">
+<b style="color:#ccd6f6;">Engine 1 — Similarity Search</b><br>
+<span style="color:#8892b0;font-size:13px;line-height:1.8;">
+Finds past candles with similar body%, vol, ADX, and size.
+Shows: how many similar candles hit TP vs SL, and average R multiple.<br><br>
+<b style="color:#64ffda;">Use it as:</b> Historical win rate for this specific type of candle.
+</span>
+</div>
+<div style="{_BOX}">
+<b style="color:#ccd6f6;">Engine 2 — Regime Score</b><br>
+<span style="color:#8892b0;font-size:13px;line-height:1.8;">
+Scores the market conditions at the time of that signal (same 0–100 regime scoring).<br><br>
+<b style="color:#64ffda;">Use it as:</b> Signals fired in GREEN regime historically outperform those fired in RED.
+</span>
+</div>
+<div style="{_BOX}">
+<b style="color:#ccd6f6;">Engine 3 — AI Analysis (Groq)</b><br>
+<span style="color:#8892b0;font-size:13px;line-height:1.8;">
+Sends candle data, ADX, EMA stack, vol delta, regime score, and best backtested params to Groq LLM.<br><br>
+Returns: quality score, risk notes, exact entry/SL/TP prices, hold time estimate.<br><br>
+<b style="color:#64ffda;">Use it as:</b> Expert synthesis of all data into one trade decision.
+</span>
+</div>
+</div>
+""", unsafe_allow_html=True)
+
+    st.markdown(f"""
+<div style="{_YLW}">
+<b>⚠️ Note:</b> Intelligence tab analyzes <b>historical signal candles</b> from past data.
+To analyze the <b>most recent live signal</b>, go to <b>Live Scanner → Quick Analyze button</b>.
+This sends the live candle directly to the AI engine.
+</div>
+""", unsafe_allow_html=True)
+
+    # ─── Section 9: Live Scanner ─────────────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("### 📡 Section 9 — Live Scanner Tab")
+    st.markdown("""
+The **Live Scanner** checks current candle data in real time and alerts you when a momentum signal
+is forming or has just completed. It runs automatically when you open the tab.
+""")
+    st.markdown(f"""
+<div style="{_BOX}">
+<b style="color:#ccd6f6;">Signal Card explained:</b><br>
+<span style="color:#8892b0;font-size:13px;line-height:1.9;">
+🟢 <b>Signal type</b> — LONG or SHORT<br>
+📅 <b>Date/Time</b> — when candle closed (WIB timezone for 1H/4H)<br>
+📐 <b>Body %</b> — how strong the candle body is<br>
+📊 <b>Vol ×</b> — volume multiplier vs 7-bar average<br>
+🎯 <b>Entry</b> — suggested entry price from best backtested params<br>
+🛑 <b>SL</b> — stop loss price<br>
+🟢 <b>TP1 / TP2 / TP3</b> — take profit targets (2R, 3R, or Partial)<br>
+🤖 <b>Quick Analyze</b> — sends this signal to AI for full Intelligence analysis
+</span>
+</div>
+""", unsafe_allow_html=True)
+
+    st.markdown(f"""
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:10px 0;">
+<div style="{_GRN}">
+<b style="color:#3fb950;">When to act</b><br>
+<span style="color:#ccd6f6;font-size:13px;line-height:1.8;">
+✅ Regime banner is GREEN<br>
+✅ ML score &gt; 0.60<br>
+✅ AI says HIGH quality<br>
+✅ Signal matches HTF EMA direction<br>
+✅ ADX ≥ 25 at signal time
+</span>
+</div>
+<div style="{_RED}">
+<b style="color:#da3633;">When to skip</b><br>
+<span style="color:#ccd6f6;font-size:13px;line-height:1.8;">
+❌ Regime banner is RED<br>
+❌ ML score &lt; 0.50<br>
+❌ AI says LOW quality or avoid<br>
+❌ Signal against HTF trend<br>
+❌ Major news / high uncertainty
+</span>
+</div>
+</div>
+""", unsafe_allow_html=True)
+
+    # ─── Section 10: Full Execution Workflow ─────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("### 🗺️ Section 10 — Full Execution Workflow")
+    st.markdown("The complete decision tree from initial setup to live trade:")
+    st.markdown(f"""
+<div style="{_BOX}">
+<ol style="color:#ccd6f6;font-size:13px;line-height:2.2;margin:0;padding-left:20px;">
+<li><b style="color:#58a6ff;">Choose ticker + timeframe</b> — Beginners: BTCUSDT + 1D. More advanced: ETH + 4H.</li>
+<li><b style="color:#58a6ff;">Run Strategy Finder</b> — Get Best Setup. Require PF ≥ 1.5 and ≥ 20 trades.</li>
+<li><b style="color:#58a6ff;">Test filters</b> — Enable ADX, re-run. If PF improves, keep it. Same for EMA. Re-run each change.</li>
+<li><b style="color:#58a6ff;">Run WFO Validation</b> — Must PASS. If FAIL: simplify params or change ticker/timeframe.</li>
+<li><b style="color:#58a6ff;">Check Regime Banner</b> — GREEN = full size. YELLOW = half size. RED = wait.</li>
+<li><b style="color:#58a6ff;">Open Live Scanner</b> — Wait for signal card. Note entry/SL/TP from card.</li>
+<li><b style="color:#58a6ff;">Quick Analyze</b> — Check AI quality score, regime score, similarity stats.</li>
+<li><b style="color:#58a6ff;">Check ML score</b> — ML Classifier tab. Score &gt; 0.60 = green light.</li>
+<li><b style="color:#58a6ff;">Enter trade</b> — Use exactly the entry/SL/TP from signal card. No emotional changes.</li>
+<li><b style="color:#58a6ff;">Manage trade</b> — Partial TP: 50% at TP1, trail the rest. 2R/3R: full exit at target.</li>
+<li><b style="color:#58a6ff;">Review monthly</b> — Check Trade Log. Identify patterns in wins and losses.</li>
+</ol>
+</div>
+""", unsafe_allow_html=True)
+
+    # ─── Section 11: Tips ───────────────────────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("### 💡 Section 11 — Tips to Maximize Profit")
+    st.markdown(f"""
+<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px;margin:8px 0;">
+<div style="{_BLUE}">
+<b style="color:#58a6ff;">More history = better stats</b><br>
+<span style="color:#ccd6f6;font-size:13px;">
+≥ 365 days for 1D. ≥ 180 days for 4H. ≥ 90 days for 1H.
+More data = more signals = more reliable PF and win rate numbers.
+</span>
+</div>
+<div style="{_BLUE}">
+<b style="color:#58a6ff;">Add filters gradually</b><br>
+<span style="color:#ccd6f6;font-size:13px;">
+Start with no filters. Note baseline PF. Add ADX — if PF improves, keep.
+Add EMA — check again. Only keep what improves PF AND passes WFO.
+</span>
+</div>
+<div style="{_BLUE}">
+<b style="color:#58a6ff;">Hold Time Analysis</b><br>
+<span style="color:#ccd6f6;font-size:13px;">
+Check Advanced Stats tab for optimal hold period.
+Exiting after 3–5 candles sometimes beats waiting for SL/TP,
+especially in choppy or reversing markets.
+</span>
+</div>
+<div style="{_BLUE}">
+<b style="color:#58a6ff;">Scale with regime</b><br>
+<span style="color:#ccd6f6;font-size:13px;">
+GREEN → 100% size. YELLOW → 50–75%. RED → skip or 25%.
+This is regime-adjusted position sizing — the same way professional funds allocate risk.
+</span>
+</div>
+<div style="{_BLUE}">
+<b style="color:#58a6ff;">Partial TP</b><br>
+<span style="color:#ccd6f6;font-size:13px;">
+Partial exit (50% at 2R, trail rest) often beats single full exits in trending markets.
+Locks in profit while letting winners run. Test both and use what WFO validates.
+</span>
+</div>
+<div style="{_BLUE}">
+<b style="color:#58a6ff;">Paper trade first</b><br>
+<span style="color:#ccd6f6;font-size:13px;">
+Before risking real money, paper trade 10–15 signals.
+Check that live execution matches backtest. The Transaction Cost setting (default 0.1%) simulates fees.
+</span>
+</div>
+</div>
+""", unsafe_allow_html=True)
+
+    # ─── Closing ─────────────────────────────────────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown(f"""
+<div style="{_BOX}">
+<h4 style="color:#da3633;margin-top:0;">❌ Common Mistakes to Avoid</h4>
+<ul style="color:#ccd6f6;font-size:13px;line-height:1.9;margin:0;padding-left:20px;">
+<li><b>Cherry-picking results</b> — use what the optimizer recommends, not what looks best to you</li>
+<li><b>Over-optimizing</b> — PF 99 with 5 trades is lucky noise, not a real edge</li>
+<li><b>Ignoring WFO</b> — a FAIL means overfit; do not trade it live no matter how good backtest looks</li>
+<li><b>Trading RED regime</b> — choppy, trendless markets erode your edge fast</li>
+<li><b>Moving the SL away from entry</b> — SL defines your max loss; it is non-negotiable</li>
+<li><b>Too little 1H history</b> — 1H needs 180+ days; 3 months gives too few clean signals</li>
+<li><b>Expecting 80% win rates</b> — 40% win rate with 3R is highly profitable; think in expectancy</li>
 </ul>
 </div>
 """, unsafe_allow_html=True)
@@ -2675,20 +4467,25 @@ Top 5 ranked by score.
                                   help="Uncheck to test Long only (~2× faster)")
         sweep_body = st.checkbox("Include multiple Body % thresholds", value=True, key="aa_body",
                                   help="Uncheck = 70% only (~4× faster)")
+        sweep_ema  = st.checkbox("Include EMA filter configs", value=False, key="aa_ema",
+                                  help="Tests EMA 50/100/200 on same TF + HTF variants. "
+                                       "Adds ~5 EMA configs to sweep. "
+                                       "Uncheck = No EMA filter only (faster)")
 
     # Estimate and display combo count
     _n_dirs  = 2 if sweep_dir  else 1
     _n_body  = 4 if sweep_body else 1
     _n_adx   = 7 if sweep_adx  else 1
     _n_hold  = 5 if sweep_hold else 1
+    _n_ema   = 6 if sweep_ema  else 1
     _n_inner = len(RETRACEMENTS) * len(SL_DISTANCES) * len(TP_MODES)  # 10×4×3 = 120
-    _est     = _n_dirs * _n_body * 4 * _n_adx * _n_hold * _n_inner
+    _est     = _n_dirs * _n_body * 4 * _n_adx * _n_hold * _n_ema * _n_inner
     _spd_label = "🐢 Full sweep" if _est > 50_000 else "🐇 Fast" if _est < 10_000 else "⚡ Medium"
     st.caption(f"{_spd_label} — estimated **{_est:,}** strategy runs "
                f"(≈ {max(1, _est // 8000)} min on average hardware)")
 
     _aa_days = _aa_period_opts[_aa_period_label]
-    aa_key   = f"aa_{ticker}_{_aa_period_label}_{_aa_tf}_{sweep_adx}{sweep_hold}{sweep_dir}{sweep_body}"
+    aa_key   = f"aa_{ticker}_{_aa_period_label}_{_aa_tf}_{sweep_adx}{sweep_hold}{sweep_dir}{sweep_body}{sweep_ema}"
 
     # Always show cached results if available — only re-run on button click
     _aa_has_results = "aa_results" in st.session_state
@@ -2744,11 +4541,29 @@ Top 5 ranked by score.
             {"bars": 7,  "time_exit": True, "label": "Max 7 candles"},
             {"bars": 10, "time_exit": True, "label": "Max 10 candles"},
         ]
+
+    # EMA filter configs for sweep
+    _aa_ema_configs = [{"ema_on": False, "ema_period": 200, "ema_tf_mode": "Same as signal timeframe",
+                        "ema_htf_period": 200, "ema_label": "No EMA filter"}]
+    if sweep_ema:
+        _aa_ema_configs += [
+            {"ema_on": True,  "ema_period": 200, "ema_tf_mode": "Same as signal timeframe",
+             "ema_htf_period": 200, "ema_label": "EMA 200 (same TF)"},
+            {"ema_on": True,  "ema_period": 100, "ema_tf_mode": "Same as signal timeframe",
+             "ema_htf_period": 100, "ema_label": "EMA 100 (same TF)"},
+            {"ema_on": True,  "ema_period": 50,  "ema_tf_mode": "Same as signal timeframe",
+             "ema_htf_period": 50,  "ema_label": "EMA 50 (same TF)"},
+            {"ema_on": True,  "ema_period": 200, "ema_tf_mode": "Higher timeframe",
+             "ema_htf_period": 200, "ema_label": "EMA 200 + HTF EMA 200"},
+            {"ema_on": True,  "ema_period": 200, "ema_tf_mode": "Higher timeframe",
+             "ema_htf_period": 50,  "ema_label": "EMA 200 + HTF EMA 50"},
+        ]
+
     _aa_inner = list(product(RETRACEMENTS, SL_DISTANCES, TP_MODES))
 
     outer_combos = list(product(
         _tf_list, _aa_directions, _aa_body_pcts,
-        _aa_vol_mults, _aa_adx_configs, _aa_hold_modes
+        _aa_vol_mults, _aa_adx_configs, _aa_hold_modes, _aa_ema_configs
     ))
     total_outer = len(outer_combos)
 
@@ -2757,10 +4572,12 @@ Top 5 ranked by score.
 
     prog    = st.progress(0.0, text="Starting sweep…")
     results = []
-    # Cache ADX per TF to avoid recomputing
+    # Cache ADX and EMA per TF to avoid recomputing
     _adx_cache: dict = {}
+    _ema_cache: dict = {}   # keyed by (tf, period)
+    _htf_df_cache: dict = {}  # keyed by htf tf string
 
-    for i, (tf, dirn, body_pct, vol_mult, adx_cfg, hold_cfg) in enumerate(outer_combos):
+    for i, (tf, dirn, body_pct, vol_mult, adx_cfg, hold_cfg, ema_cfg) in enumerate(outer_combos):
         df_aa = _tf_dfs.get(tf)
         if df_aa is None or df_aa.empty:
             prog.progress((i + 1) / total_outer)
@@ -2773,6 +4590,26 @@ Top 5 ranked by score.
         _dip_ser = _adx_df["di_plus"]
         _dim_ser = _adx_df["di_minus"]
 
+        # EMA series for this TF + period
+        _ema_key = (tf, ema_cfg["ema_period"])
+        if _ema_key not in _ema_cache:
+            _ema_cache[_ema_key] = calculate_ema(df_aa, ema_cfg["ema_period"])
+        _ema_signal_ser = _ema_cache[_ema_key] if ema_cfg["ema_on"] else None
+
+        # HTF EMA if needed
+        _ema_for_filter = _ema_signal_ser
+        if ema_cfg["ema_on"] and ema_cfg["ema_tf_mode"] == "Higher timeframe":
+            _htf_tf = _HTF_MAP.get(tf, tf)
+            if _htf_tf != tf:
+                if _htf_tf not in _htf_df_cache:
+                    _htf_df_cache[_htf_tf] = _binance_fetch(ticker, _htf_tf, _aa_days + 365)
+                _df_htf = _htf_df_cache[_htf_tf]
+                if not _df_htf.empty:
+                    _htf_ema_key = (_htf_tf, ema_cfg["ema_htf_period"])
+                    if _htf_ema_key not in _ema_cache:
+                        _ema_cache[_htf_ema_key] = calculate_ema(_df_htf, ema_cfg["ema_htf_period"])
+                    _ema_for_filter = _ema_cache[_htf_ema_key].reindex(df_aa.index, method="ffill")
+
         qual = detect_qualifying_candles(
             df_aa, body_pct, vol_mult,
             adx_filter      = adx_cfg["on"],
@@ -2782,7 +4619,18 @@ Top 5 ranked by score.
             di_minus_series = _dim_ser if adx_cfg["on"] else None,
             di_gap_min      = adx_cfg["gap"],
             direction       = dirn,
+            ema_filter      = ema_cfg["ema_on"],
+            ema_series      = _ema_for_filter,
         )
+
+        # Apply same-TF EMA check when HTF EMA is the primary filter
+        if (ema_cfg["ema_on"] and ema_cfg["ema_tf_mode"] == "Higher timeframe"
+                and _ema_signal_ser is not None and not qual.empty):
+            _st_aligned = _ema_signal_ser.reindex(qual.index, method="ffill")
+            if dirn == "long":
+                qual = qual[qual["close"] > _st_aligned]
+            else:
+                qual = qual[qual["close"] < _st_aligned]
 
         if len(qual) < 5:
             prog.progress((i + 1) / total_outer,
@@ -2819,6 +4667,7 @@ Top 5 ranked by score.
                 "body_pct":      int(body_pct * 100),
                 "vol_mult":      vol_mult,
                 "adx_label":     adx_cfg["label"],
+                "ema_label":     ema_cfg["ema_label"],
                 "hold_label":    hold_cfg["label"],
                 "retracement":   RETRACE_LABELS[ret],
                 "sl_dist":       SL_LABELS[sl_d],
@@ -2834,7 +4683,7 @@ Top 5 ranked by score.
 
         prog.progress((i + 1) / total_outer,
                       text=f"{i+1}/{total_outer} — {tf} {dirn.upper()} "
-                           f"body≥{int(body_pct*100)}% vol≥{vol_mult}× {adx_cfg['label']}")
+                           f"body≥{int(body_pct*100)}% vol≥{vol_mult}× {adx_cfg['label']} | {ema_cfg['ema_label']}")
 
     prog.empty()
 
@@ -2896,6 +4745,7 @@ def _render_aa_results(results_df: pd.DataFrame, ticker: str,
                 st.markdown(f"- Body % min: **{row['body_pct']}%**")
                 st.markdown(f"- Vol Multiplier min: **{row['vol_mult']}×**")
                 st.markdown(f"- ADX / DI: **{row['adx_label']}**")
+                st.markdown(f"- EMA Filter: **{row.get('ema_label', 'No EMA filter')}**")
                 st.markdown(f"- Hold Mode: **{row['hold_label']}**")
                 st.markdown(f"- Entry Retrace: **{row['retracement']}**")
                 st.markdown(f"- Stop Loss: **{row['sl_dist']} {sl_side} entry**")
@@ -2968,9 +4818,497 @@ def _render_aa_results(results_df: pd.DataFrame, ticker: str,
     )
 
 
+# ─── Intelligence / WFO / ML Tab Renderers ────────────────────────────────────
+
+def render_intelligence_tab(df, qualifying, all_trades, direction,
+                             ticker, timeframe, regime_data, best_params=None):
+    """Tab 10 — Candle Intelligence: similarity engine + AI analysis per bar."""
+    import math
+
+    adx_df = st.session_state.get("_intel_adx_df")
+    if adx_df is None:
+        with st.spinner("Computing ADX for intelligence tab…"):
+            adx_df = calculate_adx(df)
+        st.session_state["_intel_adx_df"] = adx_df
+
+    # ── Build last-20-candles table ───────────────────────────────────────────
+    n_rows   = min(20, len(df))
+    view_df  = df.iloc[-n_rows:].copy()
+    # For intraday timeframes use exact timestamps; for daily normalize to date
+    if timeframe in ("1H", "4H"):
+        qual_idx = set(qualifying.index) if not qualifying.empty else set()
+    else:
+        qual_idx = set(qualifying.index.normalize()) if not qualifying.empty else set()
+
+    ml_model = st.session_state.get("ml_model_data")
+
+    rows = []
+    for i, (ts, bar) in enumerate(view_df.iterrows()):
+        bar_i    = len(df) - n_rows + i
+        if timeframe in ("1H", "4H"):
+            ts_wib   = pd.Timestamp(ts) + pd.Timedelta(hours=7)
+            date_str = ts_wib.strftime("%m-%d %H:%M")
+        else:
+            date_str = str(ts)[:10]
+        is_long  = bar.get("body", 0) > 0
+        dir_sym  = "▲" if is_long else "▼"
+
+        body_pct = float(bar.get("body_pct", 0) or 0)
+        vol_m    = float(bar.get("vol_mult",  0) or 0)
+        atr_r    = float(bar.get("atr_ratio", 1) or 1)
+
+        adx_val  = 0.0
+        try:
+            adx_val = float(adx_df["adx"].iloc[bar_i])
+        except Exception:
+            pass
+
+        ema5  = float(bar.get("ema5",  bar.get("close", 0)) or 0)
+        ema15 = float(bar.get("ema15", bar.get("close", 0)) or 0)
+        ema21 = float(bar.get("ema21", bar.get("close", 0)) or 0)
+        if direction == "long":
+            ema_ok = ema5 > ema15 > ema21
+            ema_p  = (ema5 > ema15) or (ema15 > ema21)
+        else:
+            ema_ok = ema5 < ema15 < ema21
+            ema_p  = (ema5 < ema15) or (ema15 < ema21)
+        ema_sym = "OK" if ema_ok else ("~" if ema_p else "X")
+
+        di_plus  = float(adx_df["di_plus"].iloc[bar_i])  if "di_plus"  in adx_df.columns else 0
+        di_minus = float(adx_df["di_minus"].iloc[bar_i]) if "di_minus" in adx_df.columns else 0
+        di_gap   = round((di_plus - di_minus) if direction == "long" else (di_minus - di_plus), 1)
+
+        reg = calculate_regime_score(df, bar_i, direction, adx_df,
+                                      htf_ema_series=None,
+                                      timeframe=timeframe, ticker=ticker)
+        reg_score = reg.get("score", 0)
+        reg_v     = reg.get("verdict", "RED")[0]   # G/Y/R
+
+        if timeframe in ("1H", "4H"):
+            is_signal = ts in qual_idx
+        else:
+            is_signal = ts.normalize() in qual_idx if hasattr(ts, "normalize") else False
+        sig_sym   = "SIGNAL" if is_signal else ""
+
+        ml_pct = ""
+        if ml_model and "model" in ml_model:
+            sc = score_candle_ml(bar, ml_model, direction)
+            if sc.get("available"):
+                ml_pct = f"{sc['probability']*100:.0f}"
+
+        rows.append({
+            "#":       n_rows - i,
+            "Date":    date_str,
+            "Dir":     dir_sym,
+            "Body%":   f"{abs(body_pct)*100:.1f}",
+            "Vol x":   f"{vol_m:.2f}",
+            "ATR":     f"{atr_r:.2f}",
+            "ADX":     f"{adx_val:.1f}",
+            "EMA":     ema_sym,
+            "DI Gap":  f"{di_gap:+.1f}",
+            "ML%":     ml_pct,
+            "Regime":  f"{reg_v}{reg_score}",
+            "Signal":  sig_sym,
+            "_bar_i":  bar_i,
+            "_ts":     ts,
+        })
+
+    display_cols = ["#", "Date", "Dir", "Body%", "Vol x", "ATR", "ADX",
+                    "EMA", "DI Gap", "ML%", "Regime", "Signal"]
+    table_df = pd.DataFrame(rows)
+
+    def _style_row(row):
+        sig = row.get("Signal", "")
+        if sig == "SIGNAL":
+            return ["background-color:#0d2818;color:#3fb950"] * len(display_cols)
+        reg_str = str(row.get("Regime", ""))
+        if reg_str.startswith("G"):
+            return ["background-color:#0d1f14;color:#ccd6f6"] * len(display_cols)
+        if reg_str.startswith("Y"):
+            return ["background-color:#1f1a00;color:#ccd6f6"] * len(display_cols)
+        return ["color:#8b949e"] * len(display_cols)
+
+    col_left, col_right = st.columns([3, 2])
+
+    with col_left:
+        st.markdown("#### Last 20 Candles")
+        st.caption("Click a row to analyze. Green = signal candle, yellow = GREEN regime.")
+
+        styled = (table_df[display_cols]
+                  .style.apply(_style_row, axis=1))
+
+        sel = st.dataframe(
+            styled,
+            use_container_width=True,
+            hide_index=True,
+            on_select="rerun",
+            selection_mode="single-row",
+            key="intel_candle_sel",
+        )
+
+        sel_rows = sel.selection.get("rows", []) if hasattr(sel, "selection") else []
+        if sel_rows:
+            st.session_state["_intel_sel_row"] = sel_rows[0]
+
+    with col_right:
+        sel_idx = st.session_state.get("_intel_sel_row")
+
+        if sel_idx is None or sel_idx >= len(rows):
+            st.info("Click a candle row to analyze")
+        else:
+            row_meta  = rows[sel_idx]
+            bar_i_sel = row_meta["_bar_i"]
+            candle    = df.iloc[bar_i_sel]
+
+            # Enrich candle with ADX/DI values (computed separately from adx_df)
+            candle_dict = candle.to_dict()
+            candle_dict["_date_str"] = row_meta["Date"]
+            try:
+                candle_dict["adx_value"] = float(adx_df["adx"].iloc[bar_i_sel])
+                candle_dict["di_plus"]   = float(adx_df["di_plus"].iloc[bar_i_sel])
+                candle_dict["di_minus"]  = float(adx_df["di_minus"].iloc[bar_i_sel])
+            except Exception:
+                pass
+            candle = candle_dict
+
+            st.markdown(f"#### Analysis — {row_meta['Date']}")
+
+            # ── Similarity ────────────────────────────────────────────────────
+            hq = qualifying.copy() if not qualifying.empty else pd.DataFrame()
+            if not hq.empty:
+                if "body_pct_abs" not in hq.columns:
+                    hq["body_pct_abs"] = hq["body_pct"].abs()
+                if "adx_value" not in hq.columns:
+                    hq["adx_value"] = 25.0
+
+                target_dict = {
+                    "body_pct_abs": abs(float(candle.get("body_pct", 0.7) or 0.7)),
+                    "vol_mult":     float(candle.get("vol_mult",  1.5) or 1.5),
+                    "atr_ratio":    float(candle.get("atr_ratio", 1.0) or 1.0),
+                    "adx_value":    float(candle.get("adx_value", 20.0) or 20.0),
+                }
+
+                matched, meta = find_similar_candles(
+                    target_dict, hq, direction,
+                    regime_zone=None, session=None,
+                    min_matches=10, ticker=ticker,
+                )
+
+                # Flatten all_trades to a single list
+                if isinstance(all_trades, dict):
+                    flat_trades = [t for tl in all_trades.values() for t in tl]
+                else:
+                    flat_trades = list(all_trades)
+
+                # Build trades DataFrame for aggregate_outcomes
+                if flat_trades:
+                    trades_df = pd.DataFrame(flat_trades)
+                    if "entry_date" in trades_df.columns:
+                        trades_df.index = pd.to_datetime(trades_df["entry_date"])
+                    if "r_mult" in trades_df.columns and "r_multiple" not in trades_df.columns:
+                        trades_df["r_multiple"] = trades_df["r_mult"]
+                    if "exit_type" not in trades_df.columns:
+                        trades_df["exit_type"] = "TP"
+                else:
+                    trades_df = pd.DataFrame()
+
+                outcomes = aggregate_outcomes(matched, trades_df) if not matched.empty and not trades_df.empty else {"n": 0, "confidence": "INSUFFICIENT"}
+
+                ml_result = score_candle_ml(candle, ml_model, direction) if ml_model else {"probability": 0.5, "available": False}
+                ml_prob   = ml_result.get("probability", 0.5)
+
+                anchor = generate_probability_anchor(
+                    outcomes,
+                    target_buckets=meta.get("target_buckets", {}),
+                    regime_zone=regime_data.get("verdict") if regime_data else None,
+                    session=None,
+                    ml_score=ml_prob,
+                    ml_meta={},
+                )
+
+                # Quality badge
+                quality = meta.get("quality_pct", 0)
+                q_color = "#3fb950" if quality >= 50 else ("#e3b341" if quality >= 20 else "#f85149")
+                st.markdown(
+                    f'<div style="background:#161b22;border:1px solid #30363d;'
+                    f'border-radius:6px;padding:10px 14px;margin-bottom:8px;">'
+                    f'<span style="color:#8b949e;font-size:11px;">MATCH QUALITY</span> '
+                    f'<span style="color:{q_color};font-weight:700;">{quality}%</span> '
+                    f'<span style="color:#8b949e;font-size:11px;">({meta.get("n",0)} matches'
+                    f'{", relaxed: " + meta["relaxed_dim"] if meta.get("relaxed_dim") else ""})</span>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
+                # Anchor text
+                st.markdown(
+                    f'<div style="background:#0d1117;border:1px solid #21262d;'
+                    f'border-radius:6px;padding:12px 14px;'
+                    f'font-family:monospace;font-size:12px;color:#ccd6f6;'
+                    f'white-space:pre-wrap;">{anchor}</div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.warning("Run Analysis first to enable similarity matching.")
+                outcomes = {"n": 0, "confidence": "INSUFFICIENT"}
+                ml_prob  = 0.5
+                anchor   = ""
+
+            st.markdown("---")
+
+            # ── AI / Rule-based verdict ───────────────────────────────────────
+            _ai_provider  = st.session_state.get("ai_provider", "Groq (Free)")
+            _use_groq     = "Groq" in _ai_provider
+            _has_groq_key = bool(st.session_state.get("groq_api_key", ""))
+            _has_ant_key  = bool(st.session_state.get("anthropic_api_key", ""))
+            _has_any_key  = (_has_groq_key if _use_groq else _has_ant_key)
+
+            if _has_any_key:
+                _provider_label = f"Groq / Llama 3.3 70B (free)" if _use_groq else "Anthropic / Claude 3.5 Sonnet"
+                st.markdown(
+                    f'<div style="font-size:11px;color:#58a6ff;margin-bottom:4px;">'
+                    f'AI provider: <b>{_provider_label}</b></div>',
+                    unsafe_allow_html=True)
+                if st.button("Analyze this candle", key="ai_analyze_btn",
+                             type="primary", use_container_width=True):
+                    # Clear previous result so stale data isn't shown
+                    st.session_state.pop("_intel_ai_result", None)
+                    with st.spinner(f"Calling {_provider_label}…"):
+                        result = analyze_candle_ai(
+                            candle,
+                            regime_data,
+                            anchor,
+                            ml_prob,
+                            strategy_params=best_params,
+                            wfo_results=st.session_state.get("wfo_results"),
+                            direction=direction,
+                            ticker=ticker,
+                            timeframe=timeframe,
+                            risk_context={},
+                        )
+                    st.session_state["_intel_ai_result"] = result
+
+                ai_result = st.session_state.get("_intel_ai_result")
+                if ai_result:
+                    vrd = ai_result.get("verdict", "WAIT")
+                    src = ai_result.get("source", "")
+                    err = ai_result.get("error", "")
+                    v_colors = {"TRADE": "#3fb950", "WAIT": "#e3b341", "NO TRADE": "#f85149"}
+                    v_col = v_colors.get(vrd, "#8b949e")
+                    if err:
+                        # Show error detail so user can diagnose
+                        st.error(f"AI call failed — using rule-based fallback\n\n`{err}`")
+                    st.markdown(
+                        f'<div style="background:#0d1117;border:1px solid {v_col};'
+                        f'border-radius:6px;padding:12px 14px;margin-top:8px;">'
+                        f'<div style="color:{v_col};font-weight:700;font-size:14px;'
+                        f'margin-bottom:8px;">{vrd}'
+                        f'<span style="color:#8b949e;font-size:10px;margin-left:8px;">'
+                        f'via {src if src else "fallback"}</span></div>'
+                        f'<div style="color:#ccd6f6;font-size:12px;white-space:pre-wrap;">'
+                        f'{ai_result.get("full_text","")}</div></div>',
+                        unsafe_allow_html=True,
+                    )
+            else:
+                # No key — show rule-based and prompt to add key
+                rb = rule_based_fallback(regime_data, outcomes, ml_prob)
+                vrd = rb.get("verdict", "WAIT")
+                v_colors = {"TRADE": "#3fb950", "WAIT": "#e3b341", "NO TRADE": "#f85149"}
+                v_col = v_colors.get(vrd, "#8b949e")
+                st.info("Add a free Groq API key in the sidebar (🤖 AI Analysis) to enable AI analysis. "
+                        "Rule-based verdict shown below.")
+                st.markdown(
+                    f'<div style="background:#0d1117;border:1px solid {v_col};'
+                    f'border-radius:6px;padding:12px 14px;margin-top:8px;">'
+                    f'<div style="color:{v_col};font-weight:700;font-size:14px;'
+                    f'margin-bottom:8px;">{vrd} <span style="color:#8b949e;font-size:10px;">'
+                    f'(rule-based)</span></div>'
+                    f'<div style="color:#ccd6f6;font-size:12px;white-space:pre-wrap;">'
+                    f'{rb.get("full_text","")}</div></div>',
+                    unsafe_allow_html=True,
+                )
+
+
+def render_wfo_tab(df, qualifying_func, ticker, timeframe, direction):
+    """Tab 11 — Walk-Forward Optimisation Validation."""
+    st.markdown("### 📈 Walk-Forward Validation")
+    st.markdown(
+        '<div class="info-box">'
+        '<h4>What is Walk-Forward Validation?</h4>'
+        '<p>Walk-Forward Optimisation (WFO) tests whether your parameters actually generalise '
+        'to unseen data. It repeatedly optimises on an In-Sample (IS) window, then measures '
+        'performance on the Out-of-Sample (OOS) window that immediately follows — simulating '
+        'real-world deployment. A PASS verdict means your strategy is not curve-fitted: '
+        'the same logic that worked historically continues to work on data the optimiser never saw.</p>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    if st.button("Run WFO Validation", type="primary", key="wfo_run_btn",
+                 use_container_width=True):
+        with st.spinner("Running Walk-Forward Optimisation — this may take a few minutes…"):
+            result = run_wfo_pipeline(
+                df, qualifying_func, adx_df=None,
+                timeframe=timeframe, direction=direction,
+            )
+        st.session_state["wfo_results"] = result
+        st.rerun()
+
+    wfo = st.session_state.get("wfo_results")
+    if not wfo:
+        st.info("Click **Run WFO Validation** to test parameter robustness.")
+        return
+
+    summary = wfo.get("summary", {})
+    verdict = summary.get("verdict", "FAIL")
+    v_color = "#3fb950" if verdict == "PASS" else "#f85149"
+
+    st.markdown(
+        f'<div style="background:#0d1117;border:2px solid {v_color};border-radius:8px;'
+        f'padding:16px 20px;margin:12px 0;text-align:center;">'
+        f'<span style="color:{v_color};font-size:28px;font-weight:800;">{verdict}</span>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric("Avg OOS PF",     f"{summary.get('avg_oos_pf', 0):.2f}")
+    with c2:
+        st.metric("% Profitable",   f"{summary.get('pct_profitable_cycles', 0):.0f}%")
+    with c3:
+        st.metric("OOS/IS Ratio",   f"{summary.get('oos_is_ratio_avg', 0):.2f}")
+    with c4:
+        st.metric("Cycles",         str(summary.get("n_cycles", 0)))
+
+    cycles = wfo.get("cycles", [])
+    if cycles:
+        cyc_df = pd.DataFrame(cycles).drop(columns=["best_params"], errors="ignore")
+        st.dataframe(cyc_df, use_container_width=True, hide_index=True)
+
+        # Bar chart — OOS PF per cycle
+        x_vals  = [f"C{c['cycle']}" for c in cycles]
+        y_vals  = [c["oos_pf"] for c in cycles]
+        colors  = ["#3fb950" if v > 1.0 else "#f85149" for v in y_vals]
+
+        fig = go.Figure()
+        fig.add_trace(go.Bar(x=x_vals, y=y_vals, marker_color=colors,
+                             name="OOS PF", showlegend=False))
+        fig.add_hline(y=1.0, line_dash="dash", line_color="#e3b341",
+                      annotation_text="PF = 1.0", annotation_position="right")
+        _dark(fig, title="Out-of-Sample Profit Factor per Cycle",
+              height=280, yaxis_title="PF")
+        st.plotly_chart(fig, use_container_width=True)
+
+    bp = wfo.get("best_params")
+    if bp:
+        st.markdown("**Best Validated Parameters:**")
+        bp_cols = st.columns(5)
+        labels  = ["Body %", "Vol ×", "Retracement", "SL dist", "TP mode"]
+        vals    = [str(bp.get("body_pct","—")), str(bp.get("vol_mult","—")),
+                   str(bp.get("retracement","—")), str(bp.get("sl_dist","—")),
+                   str(bp.get("tp_mode","—"))]
+        for col, lbl, val in zip(bp_cols, labels, vals):
+            col.metric(lbl, val)
+
+    vt = wfo.get("validated_at")
+    if vt:
+        st.caption(f"Validated at: {str(vt)[:16]}")
+
+
+def render_ml_tab(qualifying, all_trades, direction, ticker, timeframe, adx_df):
+    """Tab 12 — ML Signal Classifier training and inspection."""
+    st.markdown("### 🤖 ML Signal Classifier")
+
+    validated_params = None
+    wfo = st.session_state.get("wfo_results")
+    if wfo and wfo.get("best_params"):
+        bp = wfo["best_params"]
+        validated_params = (
+            bp.get("retracement"),
+            bp.get("sl_dist"),
+            bp.get("tp_mode"),
+        )
+
+    if st.button("Train / Retrain Model", type="primary", key="ml_train_btn",
+                 use_container_width=True):
+        with st.spinner("Training classifier…"):
+            result = train_signal_classifier(
+                qualifying, all_trades, direction, validated_params
+            )
+        if "error" in result:
+            st.error(result["error"])
+        else:
+            st.session_state["ml_model_data"] = result
+            st.session_state["ml_meta"] = {
+                "cv_accuracy":      result["cv_accuracy"],
+                "holdout_accuracy": result["holdout_accuracy"],
+                "n_samples":        result["n_samples"],
+                "trained_at":       result.get("trained_at"),
+            }
+            st.rerun()
+
+    model_data = st.session_state.get("ml_model_data")
+    if not model_data:
+        st.info("Click **Train / Retrain Model** to build the classifier.")
+        return
+
+    # ── Status ────────────────────────────────────────────────────────────────
+    ho_acc = model_data.get("holdout_accuracy", 0)
+    cv_acc = model_data.get("cv_accuracy",      0)
+    if ho_acc >= 0.55:
+        health_label = "HEALTHY"
+        h_color      = "#3fb950"
+    elif ho_acc >= 0.50:
+        health_label = "MARGINAL"
+        h_color      = "#e3b341"
+    else:
+        health_label = "UNRELIABLE — retrain needed"
+        h_color      = "#f85149"
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Samples",        str(model_data.get("n_samples", 0)))
+    c2.metric("CV Accuracy",    f"{cv_acc*100:.1f}%")
+    c3.metric("Holdout Acc.",   f"{ho_acc*100:.1f}%")
+    c4.metric("Class Balance",  model_data.get("class_balance", "—"))
+
+    st.markdown(
+        f'<div style="background:#0d1117;border:1px solid {h_color};'
+        f'border-radius:6px;padding:10px 16px;margin:8px 0;">'
+        f'<span style="color:{h_color};font-weight:700;">Model health: {health_label}</span>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    # ── Feature importance chart ───────────────────────────────────────────────
+    fi = model_data.get("feature_importance", {})
+    if fi:
+        feats  = list(fi.keys())
+        coeffs = [fi[f] for f in feats]
+        colors = ["#3fb950" if c > 0 else "#f85149" for c in coeffs]
+
+        fig = go.Figure(go.Bar(
+            x=coeffs, y=feats, orientation="h",
+            marker_color=colors, showlegend=False,
+        ))
+        _dark(fig, title="Feature Importance (Logistic Regression Coefficients)",
+              height=280, xaxis_title="Coefficient", yaxis_title="")
+        st.plotly_chart(fig, use_container_width=True)
+
+    trained_at = model_data.get("trained_at")
+    if trained_at:
+        st.caption(f"Trained: {str(trained_at)[:16]}")
+
+
 # ─── Main App ──────────────────────────────────────────────────────────────────
 
 def main():
+    # ── Default AI provider: Groq (free) — pre-fill on first load ────────────
+    if "ai_provider" not in st.session_state:
+        st.session_state["ai_provider"] = "Groq (Free)"
+    if "groq_api_key" not in st.session_state:
+        st.session_state["groq_api_key"] = ""
+
     with st.sidebar:
         st.markdown("## Momentum Candle")
         st.markdown("---")
@@ -3065,6 +5403,64 @@ def main():
                 )
 
         st.markdown("---")
+        st.markdown("**EMA Trend Filter** *(optional)*")
+        ema_filter = st.toggle(
+            "Enable EMA Filter", value=False, key="ema_toggle",
+            help="Only take LONG signals when price is above EMA. "
+                 "Only SHORT signals when price is below EMA. "
+                 "Trades WITH the macro trend — reduces signals but improves quality.")
+
+        # Defaults for when filter is off
+        ema_period      = 200
+        ema_tf_mode     = "Same as signal timeframe"
+        ema_htf_period  = 200
+
+        if ema_filter:
+            st.markdown("**Same-Timeframe EMA**")
+            ema_period = st.select_slider(
+                "EMA period (signal timeframe)",
+                options=[50, 100, 200],
+                value=200,
+                key="ema_period",
+                help="EMA 200 = ~10 months on daily. "
+                     "EMA 100 = ~5 months. EMA 50 = ~2.5 months.")
+
+            st.markdown("**Higher Timeframe EMA**")
+            _htf_label_map = {"1H": "4H", "4H": "Daily", "1D": "Weekly"}
+            _htf_name      = _htf_label_map.get(timeframe, "HTF")
+            _htf_default   = 50 if timeframe == "1D" else 200  # Weekly → EMA 50
+
+            use_htf_ema = st.toggle(
+                f"Also require {_htf_name} EMA alignment",
+                value=False,
+                key="ema_htf_toggle",
+                help=f"Checks EMA on {_htf_name} chart.\n"
+                     f"1H → 4H EMA | 4H → Daily EMA | Daily → Weekly EMA.\n"
+                     f"Both EMAs must agree with direction for a signal to trigger.")
+
+            if use_htf_ema:
+                ema_htf_period = st.select_slider(
+                    f"EMA period ({_htf_name} chart)",
+                    options=[50, 100, 200],
+                    value=_htf_default,
+                    key="ema_htf_period",
+                    help="Weekly chart: EMA 50 is the institutional standard.\n"
+                         "Daily chart: EMA 200 is most widely watched.\n"
+                         "4H chart: EMA 200 covers ~33 days of 4H history.")
+                ema_tf_mode = "Higher timeframe"
+            else:
+                ema_tf_mode     = "Same as signal timeframe"
+                ema_htf_period  = ema_period
+
+            # Show what the filter will do
+            _op       = "above" if direction == "long" else "below"
+            _htf_str  = (f" + {_htf_name} EMA {ema_htf_period}"
+                         if ema_tf_mode == "Higher timeframe" else "")
+            st.caption(
+                f"Signal requires: close {_op} {timeframe} EMA {ema_period}"
+                f"{_htf_str}")
+
+        st.markdown("---")
         st.markdown("**Stop Loss Management**")
         sl_mode    = st.radio("SL Method",
                               ["Fixed","Breakeven","Trailing ATR","Breakeven+Trail"],
@@ -3129,6 +5525,68 @@ def main():
         else:
             use_session = False
 
+        # ── WFO / ML status badges ────────────────────────────────────────────
+        _wfo_s = st.session_state.get("wfo_results")
+        _ml_s  = st.session_state.get("ml_model_data")
+        if _wfo_s or _ml_s:
+            _badge_parts = []
+            if _wfo_s:
+                _wv  = _wfo_s.get("summary", {}).get("verdict", "?")
+                _wdt = str(_wfo_s.get("validated_at", ""))[:10]
+                _wc  = "#3fb950" if _wv == "PASS" else "#f85149"
+                _badge_parts.append(
+                    f'<span style="color:{_wc};font-size:11px;">WFO: {_wv} ({_wdt})</span>')
+            if _ml_s:
+                _mh  = _ml_s.get("holdout_accuracy", 0)
+                _mn  = _ml_s.get("n_samples", 0)
+                _mc  = "#3fb950" if _mh >= 0.55 else ("#e3b341" if _mh >= 0.50 else "#f85149")
+                _badge_parts.append(
+                    f'<span style="color:{_mc};font-size:11px;">ML: {_mh*100:.0f}% acc / {_mn} samples</span>')
+            st.markdown(" &nbsp;|&nbsp; ".join(_badge_parts), unsafe_allow_html=True)
+
+        st.markdown("---")
+        # ── AI Provider + Key (for AI candle analysis) ───────────────────────
+        with st.expander("🤖 AI Analysis (optional)", expanded=False):
+            st.markdown(
+                '<div style="background:#0d1f2d;border:1px solid #1f6feb;border-radius:6px;'
+                'padding:8px 10px;font-size:12px;color:#ccd6f6;margin-bottom:8px;">'
+                '<b style="color:#58a6ff;">Groq is FREE</b> — sign up at '
+                '<b>console.groq.com</b>, no credit card needed.<br>'
+                'Anthropic requires paid credits at console.anthropic.com.</div>',
+                unsafe_allow_html=True)
+
+            _ai_provider = st.selectbox(
+                "AI Provider",
+                ["Groq (Free)", "Anthropic (Claude)"],
+                key="ai_provider",
+                help="Groq is free with Llama 3.3 70B. Anthropic requires paid credits.",
+            )
+
+            if "Groq" in _ai_provider:
+                _groq_key = st.text_input(
+                    "Groq API Key",
+                    type="password",
+                    key="groq_api_key",
+                    placeholder="gsk_...",
+                    help="Get free key at console.groq.com → API Keys",
+                )
+                if _groq_key:
+                    st.caption("✅ Groq key set — free AI analysis ready (Llama 3.3 70B)")
+                else:
+                    st.caption("Paste Groq key above. Free at console.groq.com")
+            else:
+                _ant_key = st.text_input(
+                    "Anthropic API Key",
+                    type="password",
+                    key="anthropic_api_key",
+                    placeholder="sk-ant-...",
+                    help="Get key at console.anthropic.com. Requires paid credits.",
+                )
+                if _ant_key:
+                    st.caption("✅ Anthropic key set (Claude 3.5 Sonnet)")
+                else:
+                    st.caption("Paste Anthropic key above")
+
         st.markdown("---")
         run_btn = st.button("Run Analysis", use_container_width=True, type="primary")
         st.caption("Data: Binance (data-api.binance.vision) | Risk model: 2% fixed")
@@ -3144,11 +5602,12 @@ def main():
 
     # Show stale warning if settings changed since last run
     _sess_key = "-".join(sorted(allowed_sessions)) if use_session else "all"
+    _ema_key = f"ema{ema_filter}_{ema_period}_{ema_tf_mode}_{ema_htf_period}" if ema_filter else "ema_off"
     run_key = (f"{ticker}_{timeframe}_{history_label}_{min_body_pct:.2f}_"
                f"{min_vol_mult}_{sl_mode}_{trail_mult}_{transaction_cost}_"
                f"{use_time_exit}_{max_hold_bars}_"
                f"adx{adx_filter}_{adx_threshold}_{adx_tf_mode}_gap{di_gap_min}_{direction}_"
-               f"sess{_sess_key}")
+               f"sess{_sess_key}_{_ema_key}")
     _last_key   = st.session_state.get("run_key")
     _has_results = "opt_results" in st.session_state
 
@@ -3218,13 +5677,60 @@ def main():
             else:
                 adx_for_filter = adx_series_signal
 
+        # ── EMA computation ──────────────────────────────────────────────────
+        ema_series_signal = None
+        ema_series_htf    = None
+
+        if ema_filter:
+            # Same-TF EMA — computed from signal timeframe data (shift(1) inside calculate_ema)
+            ema_series_signal = calculate_ema(df, ema_period)
+
+            # HTF EMA — only when "Higher timeframe" mode is selected
+            # Use _HTF_MAP (not _HIGHER_TF): 1D → 1W, not 1D → 1D
+            if ema_tf_mode == "Higher timeframe":
+                _ema_htf_tf = _HTF_MAP.get(timeframe, "1D")
+                if _ema_htf_tf != timeframe:
+                    with st.spinner(f"Fetching {_ema_htf_tf} data for EMA filter..."):
+                        _df_ema_htf = _binance_fetch(ticker, _ema_htf_tf, history_days + 365)
+                    if not _df_ema_htf.empty:
+                        # Compute HTF EMA and forward-fill to signal TF index
+                        _ema_htf_raw      = calculate_ema(_df_ema_htf, ema_htf_period)
+                        ema_series_htf    = _ema_htf_raw.reindex(df.index, method="ffill")
+                else:
+                    ema_series_htf = ema_series_signal
+
+        # Combine: if both TF EMAs are active, price must satisfy BOTH
+        # Use the more restrictive (HTF) when available, otherwise same-TF
+        if ema_filter:
+            if ema_series_htf is not None and ema_tf_mode == "Higher timeframe":
+                # Both EMAs must be satisfied — use HTF (more restrictive)
+                # The same-TF check is also applied inside detect_qualifying_candles
+                ema_for_filter     = ema_series_htf
+                ema_same_tf_check  = ema_series_signal
+            else:
+                ema_for_filter     = ema_series_signal
+                ema_same_tf_check  = None
+        else:
+            ema_for_filter     = None
+            ema_same_tf_check  = None
+
         qualifying = detect_qualifying_candles(
             df, min_body_pct, min_vol_mult,
             adx_filter=adx_filter, adx_threshold=adx_threshold,
             adx_series=adx_for_filter,
             di_plus_series=di_plus_signal, di_minus_series=di_minus_signal,
             di_gap_min=di_gap_min, direction=direction,
+            ema_filter=ema_filter,
+            ema_series=ema_for_filter,
         )
+
+        # If both same-TF and HTF EMA are active, apply same-TF filter too
+        if ema_filter and ema_same_tf_check is not None and not qualifying.empty:
+            _ema_st_aligned = ema_same_tf_check.reindex(qualifying.index, method="ffill")
+            if direction == "long":
+                qualifying = qualifying[qualifying["close"] > _ema_st_aligned]
+            else:
+                qualifying = qualifying[qualifying["close"] < _ema_st_aligned]
 
         # ── Session filter (4H / 1H only) ────────────────────────────────────
         if use_session and timeframe in ("4H", "1H") and allowed_sessions:
@@ -3257,7 +5763,8 @@ def main():
                     "adx_df_signal","adx_series_higher","_adx_cache_key",
                     "_res_fig","_res_fig_key","_t4_fig_key",
                     "_mae_key","_mae_data","_mae_fig","_mae_fig_key",
-                    "_adv_stats_key","hold_parent_run_key"):
+                    "_adv_stats_key","hold_parent_run_key",
+                    "ema_series_signal","ema_series_htf","_ema_htf_df"):
             st.session_state.pop(_ck, None)
         st.session_state.update({
             "opt_results":    opt_df,
@@ -3279,9 +5786,10 @@ def main():
             "adx_filter":     adx_filter,
             "di_gap_min":     di_gap_min,
             "adx_threshold":  adx_threshold,
-            "adx_tf_mode":    adx_tf_mode,
             "use_session":    use_session,
             "allowed_sessions": allowed_sessions,
+            "ema_filter":     ema_filter,
+            "ema_tf_mode":    ema_tf_mode,
         })
 
     # ── Read from session_state (works for both fresh run and cached) ──────────
@@ -3308,6 +5816,10 @@ def main():
     di_gap_min    = st.session_state.get("di_gap_min",    di_gap_min)
     adx_threshold = st.session_state.get("adx_threshold", adx_threshold)
     adx_tf_mode   = st.session_state.get("adx_tf_mode",   adx_tf_mode)
+    ema_filter     = st.session_state.get("ema_filter",     False)
+    ema_period     = st.session_state.get("ema_period",     200)   # widget key — auto-tracked
+    ema_tf_mode    = st.session_state.get("ema_tf_mode",    "Same as signal timeframe")
+    ema_htf_period = st.session_state.get("ema_htf_period", 200)   # widget key — auto-tracked
     # Session values from last run
     _run_use_session     = st.session_state.get("use_session", False)
     _run_allowed_sessions = st.session_state.get("allowed_sessions", [])
@@ -3327,6 +5839,21 @@ def main():
     st.title(f"{st.session_state.get('ticker', ticker)} ({_timeframe}) — Momentum Candle Strategy [{_dir_emoji}]")
     st.caption(f"Data: {start_date} to {df.index[-1].date()} "
                f"({years:.1f} years) | {len(df)} bars | {len(qualifying)} qualifying triggers")
+
+    # ── Regime Banner ────────────────────────────────────────────────────────
+    _regime_cache_key = f"regime_{df.index[-1]}_{_timeframe}_{_direction}"
+    if st.session_state.get("_regime_cache_key") != _regime_cache_key:
+        _adx_df_for_regime = calculate_adx(df)
+        _last_bar_i        = len(df) - 1
+        _regime_result     = calculate_regime_score(
+            df, _last_bar_i, _direction, _adx_df_for_regime,
+            htf_ema_series=None, timeframe=_timeframe, ticker=ticker,
+        )
+        st.session_state["_regime_result"]    = _regime_result
+        st.session_state["_regime_cache_key"] = _regime_cache_key
+        st.session_state["_intel_adx_df"]     = _adx_df_for_regime
+    _regime_result = st.session_state.get("_regime_result", {})
+    render_regime_banner(_regime_result)
 
     if opt_df.empty:
         st.warning("No parameter combination produced >=3 trades. Try different criteria.")
@@ -3392,28 +5919,45 @@ def main():
         '📖 New here? The <b>Strategy Guide</b> tab explains how everything works.</div>',
         unsafe_allow_html=True)
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
-        "📖 Strategy Guide",
-        "Strategy Finder",
-        "Backtest Results",
-        "Trade Log",
-        "Candle Statistics",
-        "Portfolio Simulator",
-        "Live Scanner",
-        "🤖 Auto Analyzer",
-        "📊 Advanced Stats",
+    # ── Tab variable names describe content, not position ────────────────────
+    # Order: Learn → Build → Validate → Train → Analyze → Live → Auto
+    (t_guide,       # 1. 📖 How the strategy works
+     t_finder,      # 2. 🔍 Optimize parameters
+     t_backtest,    # 3. 📊 Performance metrics & equity curve
+     t_tradelog,    # 4. 📋 Every individual trade
+     t_wfo,         # 5. ✅ Walk-Forward robustness test
+     t_advstats,    # 6. 📈 Deep statistics & risk metrics
+     t_candlestats, # 7. 🕯️ Candle pattern distribution & MAE
+     t_ml,          # 8. 🤖 ML classifier — train BEFORE Intelligence
+     t_intel,       # 9. 🧠 Per-candle similarity + AI verdict
+     t_scanner,     # 10. 📡 Real-time signal scanner
+     t_portfolio,   # 11. 💼 Portfolio & position sizing simulator
+     t_autofinder,  # 12. ⚡ Auto Finder — last (heavy, runs on demand)
+    ) = st.tabs([
+        "📖 Guide",
+        "🔍 Strategy Finder",
+        "📊 Backtest Results",
+        "📋 Trade Log",
+        "✅ WFO Validation",
+        "📈 Advanced Stats",
+        "🕯️ Candle Stats",
+        "🤖 ML Classifier",
+        "🧠 Intelligence",
+        "📡 Live Scanner",
+        "💼 Portfolio",
+        "⚡ Auto Finder",
     ])
 
     # ═══════════════════════════════════════════════════════════════════════
-    # TAB 1 -- Strategy Guide
+    # TAB 1 — 📖 Guide
     # ═══════════════════════════════════════════════════════════════════════
-    with tab1:
+    with t_guide:
         render_strategy_guide()
 
     # ═══════════════════════════════════════════════════════════════════════
-    # TAB 2 -- Strategy Finder (was tab1)
+    # TAB 2 — 🔍 Strategy Finder
     # ═══════════════════════════════════════════════════════════════════════
-    with tab2:
+    with t_finder:
         col_l, col_r = st.columns([1, 1])
         with col_l:
             adx_badge  = ""
@@ -3432,6 +5976,14 @@ def main():
                 f'🕐 Session filter: {", ".join(_sess_active_l)} (WIB)</div>'
                 if _sess_active and _sess_active_l and _timeframe in ("4H", "1H") else ""
             )
+            ema_badge = ""
+            if ema_filter:
+                _htf_lbl  = _HTF_LABEL.get(_timeframe, "HTF")
+                _ema_desc = f"{_timeframe} EMA {ema_period}"
+                if ema_tf_mode == "Higher timeframe":
+                    _ema_desc += f" + {_htf_lbl} EMA {ema_htf_period}"
+                ema_badge = (f'<div style="color:#64ffda;font-size:13px;margin-top:4px;">'
+                             f'📈 EMA filter ON — {_ema_desc}</div>')
             st.markdown(f"""<div style="font-size:36px;font-weight:800;color:{dir_color};margin-bottom:4px;">
 {len(qualifying)} qualifying candles
 </div>
@@ -3440,7 +5992,7 @@ found in {years:.1f} years of {ticker} data
 &nbsp;|&nbsp; {len(qualifying)/max(years,0.1):.1f} per year average
 </div>
 <div style="color:{dir_color};font-size:13px;margin-top:4px;">{dir_badge}</div>
-{adx_badge}{sess_badge}""", unsafe_allow_html=True)
+{adx_badge}{sess_badge}{ema_badge}""", unsafe_allow_html=True)
 
         with col_r:
             best_label = RETRACE_LABELS[best["retracement"]]
@@ -3464,6 +6016,16 @@ found in {years:.1f} years of {ticker} data
                 _sess_row = (f'<div class="best-row"><span class="best-key">Session Filter</span>'
                              f'<span class="best-val" style="color:#7c83fd;">'
                              f'🕐 {", ".join(_sa)} (WIB)</span></div>')
+            _ema_row = ""
+            if ema_filter:
+                _htf_lbl   = _HTF_LABEL.get(_timeframe, "HTF")
+                _ema_same  = f"{_timeframe} EMA {ema_period}"
+                _ema_htf   = (f" + {_htf_lbl} EMA {ema_htf_period}"
+                               if ema_tf_mode == "Higher timeframe" else "")
+                _ema_row   = (f'<div class="best-row">'
+                              f'<span class="best-key">EMA Trend Filter</span>'
+                              f'<span class="best-val" style="color:#64ffda;">'
+                              f'✅ {_ema_same}{_ema_htf}</span></div>')
             st.markdown(f"""<div class="best-box">
 <h3>Best Setup Found</h3>
 {dir_row}
@@ -3471,7 +6033,7 @@ found in {years:.1f} years of {ticker} data
 <div class="best-row"><span class="best-key">Stop Loss</span><span class="best-val">{best_sl} {sl_label}</span></div>
 <div class="best-row"><span class="best-key">Take Profit Mode</span><span class="best-val">{best['tp_mode']}</span></div>
 <div class="best-row"><span class="best-key">SL Management</span><span class="best-val">{_sl_mode}</span></div>
-{adx_row}{_sess_row}
+{adx_row}{_sess_row}{_ema_row}
 <div class="best-row"><span class="best-key">Expected Win Rate ★</span><span class="best-val">{best['win_rate']:.1f}%</span></div>
 <div class="best-row"><span class="best-key">Profit Factor</span><span class="best-val">{pf_disp}</span></div>
 <div class="best-row"><span class="best-key">Edge Score</span><span class="best-val">{best['sharpe']:.2f}</span></div>
@@ -3514,9 +6076,14 @@ found in {years:.1f} years of {ticker} data
         )
 
     # ═══════════════════════════════════════════════════════════════════════
-    # TAB 2 -- Backtest Results
+    # TAB 3 — 📊 Backtest Results
     # ═══════════════════════════════════════════════════════════════════════
-    with tab3:
+    with t_backtest:
+        st.markdown('<div style="background:#0d1f2d;border:1px solid #1f6feb;border-radius:8px;padding:10px 16px;margin-bottom:14px;font-size:13px;color:#ccd6f6;">'
+            '<b style="color:#58a6ff;">📊 Backtest Results</b> — Did the strategy actually make money historically? '
+            'This tab shows the equity curve, win rate, profit factor, and monthly heatmap for the best parameter set found by Strategy Finder. '
+            'A rising equity curve + profit factor above 1.0 = genuine edge. '
+            '<b>Read this before going live.</b></div>', unsafe_allow_html=True)
         st.markdown("### Performance Metrics (Best Setup)")
         render_metrics_grid(best_m, cols=5)
         st.markdown("---")
@@ -3530,9 +6097,13 @@ found in {years:.1f} years of {ticker} data
         st.plotly_chart(st.session_state["_heatmap_fig"], use_container_width=True, config={"displayModeBar":False})
 
     # ═══════════════════════════════════════════════════════════════════════
-    # TAB 3 -- Trade Log
+    # TAB 4 — 📋 Trade Log
     # ═══════════════════════════════════════════════════════════════════════
-    with tab4:
+    with t_tradelog:
+        st.markdown('<div style="background:#0d1f2d;border:1px solid #1f6feb;border-radius:8px;padding:10px 16px;margin-bottom:14px;font-size:13px;color:#ccd6f6;">'
+            '<b style="color:#58a6ff;">📋 Trade Log</b> — Every individual trade the strategy would have taken historically. '
+            'Use this to understand WHEN trades win vs lose — are losses clustered in certain months? '
+            'After a drawdown? Filter and study the patterns to understand your edge\'s weaknesses.</div>', unsafe_allow_html=True)
         st.markdown("### All Historical Trades (Best Setup)")
         st.markdown("""<div class="info-box" style="padding:12px 16px;margin-bottom:12px;">
 <span style="color:#58a6ff;font-weight:600;">📌 Candle count convention:</span>
@@ -3646,9 +6217,14 @@ TP / SL always takes priority if hit earlier.
                                f"{ticker}_trades.csv", "text/csv")
 
     # ═══════════════════════════════════════════════════════════════════════
-    # TAB 4 -- Candle Statistics
+    # TAB 8 — 🕯️ Candle Stats  (placed in code after Trade Log; renders as tab 8)
     # ═══════════════════════════════════════════════════════════════════════
-    with tab5:
+    with t_candlestats:
+        st.markdown('<div style="background:#0d1f2d;border:1px solid #1f6feb;border-radius:8px;padding:10px 16px;margin-bottom:14px;font-size:13px;color:#ccd6f6;">'
+            '<b style="color:#58a6ff;">🕯️ Candle Stats</b> — Deep analysis of the signal candles themselves. '
+            'Tells you: what time of day do signals cluster? What body sizes perform best? '
+            'What does price typically do BEFORE the signal closes (MAE = worst drawdown before TP/SL)? '
+            'Use this to refine your entry timing and stop placement.</div>', unsafe_allow_html=True)
         # ── Period selector ─────────────────────────────────────────────────
         st.markdown("#### 📅 Analysis Period")
         _period_opts = {
@@ -3782,15 +6358,26 @@ TP / SL always takes priority if hit earlier.
                         config={"displayModeBar": False})
 
     # ═══════════════════════════════════════════════════════════════════════
-    # TAB 5 -- Portfolio Simulator
+    # TAB 12 — 💼 Portfolio  (placed in code here; renders as tab 12)
     # ═══════════════════════════════════════════════════════════════════════
-    with tab6:
+    with t_portfolio:
+        st.markdown('<div style="background:#0d1f2d;border:1px solid #1f6feb;border-radius:8px;padding:10px 16px;margin-bottom:14px;font-size:13px;color:#ccd6f6;">'
+            '<b style="color:#58a6ff;">💼 Portfolio Simulator</b> — How would your account grow if you traded this strategy with real money? '
+            'Set your starting capital and risk % per trade. The simulator compounds your results trade-by-trade. '
+            'Shows max drawdown in dollars, peak equity, and realistic growth curve. '
+            '<b>Never risk more than 1-2% per trade.</b></div>', unsafe_allow_html=True)
         render_portfolio_simulator(best_trades, df, ticker)
 
     # ═══════════════════════════════════════════════════════════════════════
-    # TAB 6 -- Live Scanner
+    # TAB 11 — 📡 Live Scanner  (placed in code here; renders as tab 11)
     # ═══════════════════════════════════════════════════════════════════════
-    with tab7:
+    with t_scanner:
+        st.markdown('<div style="background:#0d1f2d;border:1px solid #1f6feb;border-radius:8px;padding:10px 16px;margin-bottom:14px;font-size:13px;color:#ccd6f6;">'
+            '<b style="color:#58a6ff;">📡 Live Scanner</b> — Real-time signal detection using the SAME rules as your backtest. '
+            'Scans the last 20 candles for qualifying signals right now. '
+            'When a SIGNAL appears, it shows you the exact entry price, stop loss, and take profit levels based on your best backtested parameters. '
+            '<b>This is where you find trades to execute today.</b> '
+            'Click "🧠 Analyze this signal" on any signal card to get AI analysis instantly.</div>', unsafe_allow_html=True)
         render_live_scanner(
             ticker, timeframe, min_body_pct, min_vol_mult,
             best["retracement"], best["sl_dist"], best["tp_mode"], best_wr,
@@ -3798,18 +6385,34 @@ TP / SL always takes priority if hit earlier.
             adx_filter_on=adx_filter,
             adx_di_gap_min=di_gap_min,
             adx_threshold=adx_threshold,
+            ema_filter=ema_filter,
+            ema_period=ema_period,
+            ema_tf_mode=ema_tf_mode,
+            ema_htf_period=ema_htf_period,
         )
 
     # ═══════════════════════════════════════════════════════════════════════
-    # TAB 7 -- Auto Analyzer
+    # TAB 5 — ⚡ Auto Finder  (placed in code here; renders as tab 5)
     # ═══════════════════════════════════════════════════════════════════════
-    with tab8:
+    with t_autofinder:
+        st.markdown('<div style="background:#0d1f2d;border:1px solid #1f6feb;border-radius:8px;padding:10px 16px;margin-bottom:14px;font-size:13px;color:#ccd6f6;">'
+            '<b style="color:#58a6ff;">⚡ Auto Finder</b> — Automatically tests ALL timeframes (1H, 4H, Daily) and BOTH directions (Long + Short) '
+            'to find the single best strategy for this ticker across everything. '
+            '<b>Warning: this is slow (1-3 minutes)</b> — it runs dozens of full backtests. '
+            'Use it when you first analyze a new coin to discover which timeframe and direction has the strongest edge. '
+            'The results table ranks every combination — click any row to instantly apply those settings.</div>', unsafe_allow_html=True)
         render_auto_analyzer(ticker, df_full, tc, timeframe)
 
     # ═══════════════════════════════════════════════════════════════════════
-    # TAB 9 -- Advanced Statistics
+    # TAB 7 — 📈 Advanced Stats  (placed in code here; renders as tab 7)
     # ═══════════════════════════════════════════════════════════════════════
-    with tab9:
+    with t_advstats:
+        st.markdown('<div style="background:#0d1f2d;border:1px solid #1f6feb;border-radius:8px;padding:10px 16px;margin-bottom:14px;font-size:13px;color:#ccd6f6;">'
+            '<b style="color:#58a6ff;">📈 Advanced Stats</b> — Goes deeper than win rate and profit factor. '
+            'Shows your <b>streak risk</b> (how many losses in a row to expect), <b>risk of ruin</b> (probability of blowing up at your position size), '
+            '<b>volatility regime performance</b> (does the strategy work better in trending or ranging markets?), '
+            'and <b>Kelly Criterion</b> (the mathematically optimal position size). '
+            'Read this to size positions safely and understand the strategy\'s worst-case behaviour.</div>', unsafe_allow_html=True)
         st.markdown("### 📊 Advanced Statistics — Best Setup")
         st.caption(
             "Deep-dive analysis on trade timing, streak patterns, volatility regimes, "
@@ -3822,6 +6425,56 @@ TP / SL always takes priority if hit earlier.
         render_advanced_stats(best_trades,
                               st.session_state.get("ticker", ticker),
                               st.session_state.get("timeframe", timeframe))
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # TAB 9 — 🧠 Intelligence
+    # ═══════════════════════════════════════════════════════════════════════
+    with t_intel:
+        st.markdown('<div style="background:#0d1f2d;border:1px solid #1f6feb;border-radius:8px;padding:10px 16px;margin-bottom:14px;font-size:13px;color:#ccd6f6;">'
+            '<b style="color:#58a6ff;">🧠 Intelligence</b> — Analyzes each specific candle using 3 engines working together: '
+            '<b>Similarity</b> (finds historically similar candles and reports what happened next), '
+            '<b>ML Model</b> (machine learning score from the trained classifier), and '
+            '<b>AI Verdict</b> (Groq/Llama gives a structured TRADE / WAIT / NO TRADE decision). '
+            'Click any row in the candle table → see the full analysis on the right. '
+            '<b>Train the ML Classifier tab first</b> to get ML scores here.</div>', unsafe_allow_html=True)
+        _best_row = opt_df.iloc[0] if not opt_df.empty else None
+        _best_params = {
+            "retracement": float(_best_row["retracement"]) if _best_row is not None else 0.0,
+            "sl_dist":     float(_best_row["sl_dist"])     if _best_row is not None else 0.01,
+            "tp_mode":     str(_best_row["tp_mode"])       if _best_row is not None else "2R",
+            "win_rate":    float(_best_row["win_rate"])    if _best_row is not None else 0.0,
+            "pf":          float(_best_row.get("pf", 0))   if _best_row is not None else 0.0,
+        }
+        render_intelligence_tab(
+            df, qualifying, all_trades, _direction,
+            ticker, _timeframe, _regime_result,
+            best_params=_best_params,
+        )
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # TAB 6 — ✅ WFO Validation
+    # ═══════════════════════════════════════════════════════════════════════
+    with t_wfo:
+        st.markdown('<div style="background:#0d1f2d;border:1px solid #1f6feb;border-radius:8px;padding:10px 16px;margin-bottom:14px;font-size:13px;color:#ccd6f6;">'
+            '<b style="color:#58a6ff;">✅ WFO Validation</b> — Proves your strategy isn\'t just "fit to past data." '
+            'Walk-Forward Optimisation repeatedly optimises on old data, then tests on NEW data the optimizer never saw. '
+            '<b>PASS</b> = the edge is real and generalises. <b>FAIL</b> = the parameters are curve-fitted and will likely fail live. '
+            'Always run WFO before going live. A backtest without WFO is just an illusion of profit.</div>', unsafe_allow_html=True)
+        render_wfo_tab(df, detect_qualifying_candles, ticker, _timeframe, _direction)
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # TAB 10 — 🤖 ML Classifier
+    # ═══════════════════════════════════════════════════════════════════════
+    with t_ml:
+        st.markdown('<div style="background:#0d1f2d;border:1px solid #1f6feb;border-radius:8px;padding:10px 16px;margin-bottom:14px;font-size:13px;color:#ccd6f6;">'
+            '<b style="color:#58a6ff;">🤖 ML Classifier</b> — Trains a machine learning model on YOUR historical signal candles. '
+            'It learns which candle characteristics (body size, volume, ADX, EMA alignment, DI gap) predict winners vs losers. '
+            '<b>Step 1: Click "Train Model" below.</b> Step 2: Go to Intelligence tab — every candle will now show an ML probability score. '
+            'The model uses 5-fold cross-validation to prevent overfitting. Accuracy above 55% = useful signal.</div>', unsafe_allow_html=True)
+        _ml_adx = st.session_state.get("_intel_adx_df")
+        if _ml_adx is None:
+            _ml_adx = calculate_adx(df)
+        render_ml_tab(qualifying, all_trades, _direction, ticker, _timeframe, _ml_adx)
 
 
 if __name__ == "__main__":
