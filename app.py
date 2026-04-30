@@ -14,6 +14,309 @@ import requests
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
+# ─── quantflow_combos: top-5 backtest-validated trade-plan combos ──────────────
+# Built from oos_audit_v3a/v3c/v3d (Apr 2026) — 134 coins, 107K filled trades,
+# 4.5-year audit window. The 5 combos (C6A-N/A, C5B-A/N, C1A-A) are pre-baked
+# (body × vol × ADX × regime) filter sets with their full audit metrics. The
+# scanner offers per-combo checkboxes, marks matching signal cards with combo
+# panels showing rollup PF / mean R / recent-period verification, and injects
+# the same audit context into the AI verdict prompt so Grok/Claude can decide
+# trade-or-no-trade with full historical evidence.
+try:
+    import quantflow_combos as _qfcombos
+    _QFCOMBOS_OK = True
+except Exception as _e_qf:
+    _QFCOMBOS_OK = False
+    _qfcombos = None
+
+# ============================================================================
+# QUANTFLOW LEVEL SYSTEM — bundled in app.py for deploy robustness (May 2026)
+# ============================================================================
+# History: This used to live in quantflow_combos.py with a capability check in
+# app.py that fired "out of date" warnings if the modules drifted. The check
+# kept producing false positives (Streamlit Cloud .pyc cache staleness, partial
+# deploys, mixed file versions). The fix: bundle the entire level system here
+# so app.py is self-sufficient. quantflow_combos.py only needs to expose
+# `COMBOS` (list of dicts) and `COMBOS_BY_NAME` (dict) — those have been stable
+# since v3 and aren't going to change shape.
+#
+# This means: no version mismatch is possible. Whatever quantflow_combos.py is
+# deployed (even a stale cached one), as long as it has the COMBOS data, the
+# STRICT/RELAXED/LOOSE confidence-level system here in app.py works.
+#
+# Design notes (mirrored from the original spec):
+#   STRICT  → audit-validated, full sizing, expected PF = stated rollup PF
+#   RELAXED → small boundary widening (body ±0.03, vol ±0.15-0.50, ADX ±2)
+#             → 0.75× sizing, ~92% of stated PF
+#   LOOSE   → wider widening (body ±0.05, vol ±0.30-1.00, ADX ±3)
+#             → 0.50× sizing, ~80% of stated PF
+#
+# Hard caps (NEVER crossed regardless of level) protect known dead zones from
+# the audit:
+#   - body 0.60-0.70 trend dead zone (Finding 4) — never enter
+#   - body < 0.78 for countertrend (Finding 5) — never enter
+#   - ADX > 50 universally weak (Finding 2) — hard cap
+#   - vol < 1.20 — no momentum signal at all
+#   - ADX < 25 — no trend at all
+# ============================================================================
+
+_QF_LEVELS = ("STRICT", "RELAXED", "LOOSE")  # ordered strictest first
+
+_QF_LEVEL_SETTINGS = {
+    "STRICT": {
+        "body_pad": 0.00, "vol_pad_min": 0.00, "vol_pad_max": 0.00,
+        "adx_pad": 0,    "size_factor": 1.00, "pf_haircut": 1.00,
+    },
+    "RELAXED": {
+        "body_pad": 0.03, "vol_pad_min": 0.15, "vol_pad_max": 0.50,
+        "adx_pad": 2,    "size_factor": 0.75, "pf_haircut": 0.92,
+    },
+    "LOOSE": {
+        "body_pad": 0.05, "vol_pad_min": 0.30, "vol_pad_max": 1.00,
+        "adx_pad": 3,    "size_factor": 0.50, "pf_haircut": 0.80,
+    },
+}
+
+# Hard floors / caps — cannot be crossed regardless of level
+_QF_BODY_DEAD_ZONE_MIN = 0.60
+_QF_BODY_DEAD_ZONE_MAX = 0.70
+_QF_BODY_FLOOR_TREND   = 0.40
+_QF_BODY_FLOOR_CT      = 0.78
+_QF_BODY_CEIL          = 1.01   # 1.01 (not 1.00) preserves CT4/CT6 strict
+                                # band convention where body_max=1.01 includes
+                                # body=1.00 in the half-open interval [min, max)
+_QF_VOL_FLOOR          = 1.20
+_QF_ADX_FLOOR          = 25.0
+_QF_ADX_CEIL           = 50.0
+
+
+def _qf_widen_criteria(combo: dict, level: str) -> dict:
+    """
+    Return a copy of `combo["criteria"]` with bounds widened per the level,
+    respecting all audit-known dead zones and hard caps.
+
+    Body widening is asymmetric per combo type:
+      - trend with body_max <= 0.60 (e.g. C1A 0.5-0.6): widen DOWN only.
+      - trend with body_min >= 0.70 (e.g. C6A 0.7-0.8): widen UP only.
+      - countertrend (body 0.80-1.00): widens up to 1.00, down to 0.78.
+    Volume widens symmetrically with floor 1.20.
+    ADX widens symmetrically (trend only) with floor 25 / ceil 50.
+    """
+    crit = dict(combo["criteria"])
+    if level == "STRICT":
+        return crit
+
+    s = _QF_LEVEL_SETTINGS[level]
+    combo_type = combo.get("combo_type", "trend_following")
+    body_min_o = float(crit["body_min"])
+    body_max_o = float(crit["body_max"])
+    vol_min_o  = float(crit["vol_min"])
+    vol_max_o  = float(crit["vol_max"])
+
+    # Body widening — asymmetric for trend, symmetric for CT
+    if combo_type == "trend_following":
+        if body_max_o <= _QF_BODY_DEAD_ZONE_MIN + 1e-9:
+            crit["body_min"] = max(_QF_BODY_FLOOR_TREND, body_min_o - s["body_pad"])
+            crit["body_max"] = min(body_max_o, _QF_BODY_DEAD_ZONE_MIN)
+        elif body_min_o >= _QF_BODY_DEAD_ZONE_MAX - 1e-9:
+            crit["body_min"] = max(body_min_o, _QF_BODY_DEAD_ZONE_MAX)
+            crit["body_max"] = min(_QF_BODY_CEIL, body_max_o + s["body_pad"])
+        else:
+            # Combo straddles dead zone — shouldn't happen with current set
+            crit["body_min"] = max(_QF_BODY_FLOOR_TREND, body_min_o - s["body_pad"])
+            crit["body_max"] = min(_QF_BODY_CEIL, body_max_o + s["body_pad"])
+    else:
+        crit["body_min"] = max(_QF_BODY_FLOOR_CT, body_min_o - s["body_pad"])
+        crit["body_max"] = min(_QF_BODY_CEIL,    body_max_o + s["body_pad"])
+
+    # Volume widening — symmetric, with floor
+    crit["vol_min"] = max(_QF_VOL_FLOOR, vol_min_o - s["vol_pad_min"])
+    crit["vol_max"] = vol_max_o + s["vol_pad_max"]
+
+    # ADX widening — TREND ONLY (countertrend leaves its 0-999 range alone)
+    if combo_type == "trend_following":
+        crit["adx_min"] = max(_QF_ADX_FLOOR, float(crit["adx_min"]) - s["adx_pad"])
+        crit["adx_max"] = min(_QF_ADX_CEIL,  float(crit["adx_max"]) + s["adx_pad"])
+
+    return crit
+
+
+def _qf_is_regime_aligned(direction: str, btc_regime: str) -> bool:
+    """Helper: trade direction aligned with BTC regime?"""
+    if btc_regime == "BULL":
+        return direction == "long"
+    if btc_regime == "BEAR":
+        return direction == "short"
+    return False  # CHOP / UNKNOWN: aligned combos can't classify
+
+
+def _qf_signal_matches_at_level(sig: dict, combo: dict, btc_regime: str,
+                                  level: str) -> bool:
+    """Per-level matcher: does sig match combo's (level-widened) criteria?"""
+    crit = _qf_widen_criteria(combo, level)
+    combo_type = combo.get("combo_type", "trend_following")
+
+    tf_norm = (sig.get("timeframe", "") or "").lower()
+    if tf_norm not in combo["tf_eligible"]:
+        return False
+
+    sig_dir = sig.get("direction", "")
+    if combo_type == "countertrend":
+        if sig_dir != crit.get("signal_direction_required", ""):
+            return False
+    else:
+        if sig_dir not in crit["directions"]:
+            return False
+
+    try:
+        body_abs = abs(float(sig.get("body_pct", 0)))
+        vol_mult = float(sig.get("vol_mult", 0))
+        adx      = float(sig.get("adx", 0))
+    except (TypeError, ValueError):
+        return False
+    if not (crit["body_min"] <= body_abs   < crit["body_max"]):  return False
+    if not (crit["vol_min"]  <= vol_mult   < crit["vol_max"]):   return False
+    if not (crit["adx_min"]  <= adx        < crit["adx_max"]):   return False
+
+    if crit["regime_mode"] == "A":
+        if btc_regime is None: return False
+        if not _qf_is_regime_aligned(sig["direction"], btc_regime): return False
+    return True
+
+
+def _qf_classify_signal_level(sig: dict, combo: dict, btc_regime: str = None,
+                                allowed_levels: tuple = ("STRICT",)):
+    """Walk levels strictest-first → first match in allowed_levels, or None."""
+    for lvl in _QF_LEVELS:
+        if lvl not in allowed_levels:
+            continue
+        if _qf_signal_matches_at_level(sig, combo, btc_regime, lvl):
+            return lvl
+    return None
+
+
+def _qf_get_matching_combos(sig: dict, enabled_combos: list,
+                              btc_regime: str = None,
+                              allowed_levels: tuple = ("STRICT",)) -> list:
+    """
+    Local replacement for _qfcombos.get_matching_combos with full level support.
+    Reads COMBOS data from quantflow_combos.py but does ALL classification here.
+    """
+    if not _QFCOMBOS_OK or _qfcombos is None:
+        return []
+    matches = []
+    for combo in _qfcombos.COMBOS:
+        if combo["name"] not in enabled_combos:
+            continue
+        lvl = _qf_classify_signal_level(sig, combo, btc_regime, allowed_levels)
+        if lvl is None:
+            continue
+        mc = dict(combo)   # shallow copy, don't mutate the source
+        mc["_matched_level"] = lvl
+        mc["_size_factor"]   = _QF_LEVEL_SETTINGS[lvl]["size_factor"]
+        mc["_pf_haircut"]    = _QF_LEVEL_SETTINGS[lvl]["pf_haircut"]
+        matches.append(mc)
+    _level_rank = {"STRICT": 0, "RELAXED": 1, "LOOSE": 2}
+    matches.sort(key=lambda c: (c["tier"],
+                                _level_rank.get(c.get("_matched_level"), 9)))
+    return matches
+
+
+def _qf_level_badge_html(level: str) -> str:
+    """Confidence-level badge HTML — green/yellow/orange by level."""
+    if level == "STRICT":
+        bg, fg = "#1a4731", "#34d399"
+        title = ("Audit-validated criteria — full sizing, expected PF "
+                 "matches the combo's stated rollup PF")
+    elif level == "RELAXED":
+        bg, fg = "#3f3a16", "#fbbf24"
+        title = ("Slightly widened criteria — sizing 75% of stated, "
+                 "expected PF ~92% of stated rollup PF")
+    elif level == "LOOSE":
+        bg, fg = "#3f1d1d", "#fb923c"
+        title = ("Wider criteria — sizing 50% of stated, expected PF "
+                 "~80% of stated rollup PF. Use sparingly, paper-trade first.")
+    else:
+        bg, fg = "#22272e", "#ccd6f6"
+        title  = ""
+    return (f'<span title="{title}" style="display:inline-block;'
+            f'background:{bg};color:{fg};padding:2px 8px;border-radius:10px;'
+            f'font-size:11px;font-weight:700;letter-spacing:0.5px;">{level}</span>')
+
+
+def _qf_effective_size_pct(sizing: str, size_factor: float) -> float:
+    """Effective % risk after applying level size_factor to base sizing."""
+    base_pct = {"LARGE": 0.75, "FULL": 0.50,
+                "HALF": 0.25, "SMALL": 0.15}.get(sizing, 0.50)
+    return base_pct * float(size_factor)
+
+
+def _qf_render_level_summary_html(matches: list) -> str:
+    """
+    Small banner shown ABOVE the combo panel for non-STRICT matches.
+    Belt-and-suspenders: if the deployed quantflow_combos.py.render_combo_panel_html
+    is an old version that doesn't display level badges, this banner ensures
+    the user still sees the match level + effective sizing/PF haircut.
+    Returns "" for STRICT matches (no banner needed; default state).
+    """
+    if not matches:
+        return ""
+    primary = matches[0]
+    level = primary.get("_matched_level", "STRICT")
+    if level == "STRICT":
+        return ""
+    size_factor = float(primary.get("_size_factor", 1.0))
+    pf_haircut  = float(primary.get("_pf_haircut", 1.0))
+    sizing      = primary.get("primary", {}).get("sizing", "FULL")
+    eff_pct     = _qf_effective_size_pct(sizing, size_factor)
+    rollup_pf   = float(primary.get("rollup", {}).get("pf", 0.0))
+    expected_pf = rollup_pf * pf_haircut
+    badge       = _qf_level_badge_html(level)
+    tone_color  = "#fbbf24" if level == "RELAXED" else "#fb923c"
+    return (
+        f'<div style="margin:8px 0 4px 0;padding:8px 12px;'
+        f'background:rgba(251,146,60,0.08);'
+        f'border-left:3px solid {tone_color};border-radius:4px;'
+        f'font-size:12px;color:#ccd6f6;">'
+        f'<b style="color:{tone_color};">⚙ Match level:</b> {badge} · '
+        f'effective risk <b>{eff_pct:.2f}%</b> '
+        f'(sizing {sizing} × {size_factor:.2f}) · '
+        f'expected PF <b>~{expected_pf:.2f}</b> '
+        f'(audit {rollup_pf:.2f} × {pf_haircut:.2f})'
+        f'</div>'
+    )
+
+
+def _qf_format_ai_level_appendix(matches: list) -> str:
+    """
+    Return a LEVEL section to append to the AI prompt block when matches
+    contain non-STRICT levels. Used as a fallback when the imported
+    build_ai_prompt_block doesn't include level info (old version deployed).
+    Empty string if all matches are STRICT (no append needed).
+    """
+    if not matches:
+        return ""
+    non_strict = [m for m in matches
+                  if m.get("_matched_level") and m["_matched_level"] != "STRICT"]
+    if not non_strict:
+        return ""
+    lines = ["", "=== CONFIDENCE LEVEL CONTEXT ==="]
+    for m in non_strict:
+        lvl = m["_matched_level"]
+        sf  = float(m.get("_size_factor", 1.0))
+        h   = float(m.get("_pf_haircut", 1.0))
+        rollup_pf = float(m.get("rollup", {}).get("pf", 0))
+        exp_pf = rollup_pf * h
+        lines.append(
+            f"  {m['name']} matched at LEVEL: {lvl} — signal is OUTSIDE the "
+            f"strict audit band but inside safe regions. Recommended sizing "
+            f"is {sf:.2f}× of stated; expected PF after haircut ≈ {exp_pf:.2f} "
+            f"(audit {rollup_pf:.2f} × {h:.2f}). Treat with appropriate "
+            f"caution and prefer STRICT matches if multiple are available."
+        )
+    lines.append("=== END CONFIDENCE LEVEL CONTEXT ===")
+    return "\n".join(lines)
+
 # ─── sklearn (optional — falls back to heuristic if missing) ──────────────────
 try:
     from sklearn.linear_model    import LogisticRegression
@@ -1294,6 +1597,45 @@ _SCORE_WEIGHTS = {
 }
 
 
+@st.cache_data(show_spinner=False, ttl=600)
+def _scanner_btc_regime_for_combos() -> str:
+    """
+    Compute the current BTC regime tag (BULL / BEAR / CHOP) for QuantFlow combo
+    classification. MUST match exactly the regime definition used by the audit
+    (oos_audit_v3a/v3c/v3d) so combo *-A alignment classification stays
+    consistent between backtest and live scanner.
+
+    Audit definition:
+      Compute EMA50 of BTC daily close.
+      BULL  if BTC close > EMA50 × 1.02
+      BEAR  if BTC close < EMA50 × 0.98
+      CHOP  otherwise (within ±2% band)
+
+    Cached 10 minutes — daily-close based so doesn't need to be fresh per scan.
+    Returns "UNKNOWN" if BTC fetch fails (combo *-A variants will then return
+    no matches; user can switch to *-N variants which don't depend on regime).
+    """
+    try:
+        df = _binance_klines("BTCUSDT", "1d", days=200)
+        if df is None or df.empty or len(df) < 60:
+            return "UNKNOWN"
+        close = df["close"]
+        # ewm with .shift(1) to keep parity with audit features (lookahead-safe).
+        # Note: the audit's compute_btc_regime_series did NOT shift here because
+        # it tagged trades by their signal_dt which is at-or-before close. For
+        # the LIVE classifier we want "what's the current regime as of the
+        # latest CLOSED candle" so we use the most recent close vs ema50 of
+        # closes up to and including that bar. No shift needed in this path.
+        ema50 = close.ewm(span=50, adjust=False, min_periods=50).mean()
+        c, e = float(close.iloc[-1]), float(ema50.iloc[-1])
+        if not (c > 0 and e > 0): return "UNKNOWN"
+        if c > e * 1.02: return "BULL"
+        if c < e * 0.98: return "BEAR"
+        return "CHOP"
+    except Exception:
+        return "UNKNOWN"
+
+
 @st.cache_data(show_spinner=False, ttl=300)
 def _scanner_get_universe(min_volume_usdt: float) -> list:
     """
@@ -1407,7 +1749,7 @@ def _compute_enhanced_trade_plan(
     Compute a multi-zone trade plan that is:
     - ATR-adaptive (SL scales with coin volatility, not fixed %)
     - Structure-anchored (SL placed outside candle high/low, not flat %)
-    - Entry-tiered (3 zones: aggressive at close, standard on retrace, sniper at 61.8% fib)
+    - Entry-tiered (4 zones: aggressive at close, standard at 38.2%, golden fibo at 61.8%, sniper at 78.6%)
     - Multi-TP with partial-exit management guidance
 
     Returns a dict with entry zones, SL, TP1/TP2/TP3, R:R per zone, and
@@ -1439,24 +1781,30 @@ def _compute_enhanced_trade_plan(
         struct_sl = max(struct_sl, close_px * 1.008)
         sl_dist   = max(0.008, min(0.06, (struct_sl - close_px) / close_px))
 
-    # ── Entry zones ───────────────────────────────────────────────────────────
+    # ── Entry zones (4 zones — Apr 25 added Golden Fibo + moved Sniper to 0.786) ─
     # Aggressive  = enter right at candle close (fills immediately, worst R:R)
     # Standard    = wait for 38.2% retrace into the candle body
-    # Sniper      = wait for 61.8% Fib retrace (best R:R, lower fill probability)
+    # Golden Fibo = wait for 61.8% Fib retrace (the "golden ratio" — balanced R:R + fill)
+    # Sniper      = wait for 78.6% Fib retrace (deepest pullback, best R:R, lowest fill)
     fib_382 = body_size * 0.382
     fib_618 = body_size * 0.618
+    fib_786 = body_size * 0.786
 
     if direction == "long":
         agg_entry      = round(close_px, 8)
         standard_entry = round(close_px - fib_382, 8)
-        sniper_entry   = round(close_px - fib_618, 8)
-        # Clamp sniper entry so it never goes below candle open (that's a full reversal)
-        sniper_entry   = max(sniper_entry, round(open_px * 1.002, 8))
+        golden_entry   = round(close_px - fib_618, 8)
+        sniper_entry   = round(close_px - fib_786, 8)
+        # Clamp golden + sniper entries so they never go below candle open (that's a full reversal)
+        golden_entry   = max(golden_entry, round(open_px * 1.002, 8))
+        sniper_entry   = max(sniper_entry, round(open_px * 1.001, 8))
     else:
         agg_entry      = round(close_px, 8)
         standard_entry = round(close_px + fib_382, 8)
-        sniper_entry   = round(close_px + fib_618, 8)
-        sniper_entry   = min(sniper_entry, round(open_px * 0.998, 8))
+        golden_entry   = round(close_px + fib_618, 8)
+        sniper_entry   = round(close_px + fib_786, 8)
+        golden_entry   = min(golden_entry, round(open_px * 0.998, 8))
+        sniper_entry   = min(sniper_entry, round(open_px * 0.999, 8))
 
     # ── Zone validity check ───────────────────────────────────────────────────
     # For SHORT: entry must be BELOW struct_sl  (SL is above entry; short logic).
@@ -1467,11 +1815,13 @@ def _compute_enhanced_trade_plan(
     # would be past your own invalidation level, making the risk calculation and
     # every TP derived from it nonsensical (TP1 literally equals the SL price).
     #
-    # Detection:
-    #   SHORT std invalid  → standard_entry  >= struct_sl
-    #   SHORT sniper invalid → sniper_entry  >= struct_sl
-    #   LONG  std invalid  → standard_entry  <= struct_sl
-    #   LONG  sniper invalid → sniper_entry  <= struct_sl
+    # Detection (LONG flips comparison sign):
+    #   SHORT std/golden/sniper invalid  → entry  >= struct_sl
+    #   LONG  std/golden/sniper invalid  → entry  <= struct_sl
+    #
+    # Note: Sniper at 0.786 retrace will fail validity MORE OFTEN than the old
+    # 0.618 sniper — that is by design, the user explicitly wants a deeper-
+    # retrace zone even knowing the trade-off.
     #
     # Resolution: mark zone invalid and clamp entry to just inside the SL
     # (0.05% buffer) so _tps() produces a tiny-but-finite R rather than TP=SL.
@@ -1480,27 +1830,34 @@ def _compute_enhanced_trade_plan(
 
     if direction == "short":
         std_valid    = standard_entry < struct_sl
+        golden_valid = golden_entry   < struct_sl
         sniper_valid = sniper_entry   < struct_sl
         if not std_valid:
             standard_entry = round(struct_sl - _eps, 8)
+        if not golden_valid:
+            golden_entry   = round(struct_sl - _eps, 8)
         if not sniper_valid:
             sniper_entry   = round(struct_sl - _eps, 8)
     else:  # long
         std_valid    = standard_entry > struct_sl
+        golden_valid = golden_entry   > struct_sl
         sniper_valid = sniper_entry   > struct_sl
         if not std_valid:
             standard_entry = round(struct_sl + _eps, 8)
+        if not golden_valid:
+            golden_entry   = round(struct_sl + _eps, 8)
         if not sniper_valid:
             sniper_entry   = round(struct_sl + _eps, 8)
 
     # ── SL per entry zone ─────────────────────────────────────────────────────
     # All zones share the same structural SL (candle low/high ± 0.5×ATR).
-    # Only the entry price varies — Standard/Sniper entries are closer to the
-    # structural SL, so their dollar risk is smaller → genuinely better R:R.
+    # Only the entry price varies — Standard/Golden/Sniper entries are closer to
+    # the structural SL, so their dollar risk is smaller → genuinely better R:R.
     # (Previously sl_dist% was re-applied per entry, pushing the Standard/Sniper
     # SL *below* the structural anchor and making risk inconsistent.)
     sl_agg      = round(struct_sl, 8)
     sl_standard = round(struct_sl, 8)
+    sl_golden   = round(struct_sl, 8)
     sl_sniper   = round(struct_sl, 8)
 
     # ── Take-profit levels (1R / 2R / 3R) per entry ──────────────────────────
@@ -1519,9 +1876,10 @@ def _compute_enhanced_trade_plan(
                 round(entry - 3.0 * risk, 8),
             )
 
-    tp1_agg, tp2_agg, tp3_agg           = _tps(agg_entry,      sl_agg)
-    tp1_std, tp2_std, tp3_std           = _tps(standard_entry, sl_standard)
-    tp1_sniper, tp2_sniper, tp3_sniper  = _tps(sniper_entry,   sl_sniper)
+    tp1_agg, tp2_agg, tp3_agg              = _tps(agg_entry,      sl_agg)
+    tp1_std, tp2_std, tp3_std              = _tps(standard_entry, sl_standard)
+    tp1_golden, tp2_golden, tp3_golden     = _tps(golden_entry,   sl_golden)
+    tp1_sniper, tp2_sniper, tp3_sniper     = _tps(sniper_entry,   sl_sniper)
 
     # ── R:R to TP2 (headline metric) ─────────────────────────────────────────
     def _rr2(entry, sl):
@@ -1544,7 +1902,13 @@ def _compute_enhanced_trade_plan(
         "std_tp1":     tp1_std,
         "std_tp2":     tp2_std,
         "std_tp3":     tp3_std,
-        # Sniper zone (61.8% retrace)
+        # Golden Fibo zone (61.8% retrace — Apr 25 added; was the old "Sniper" position)
+        "golden_entry": golden_entry,
+        "golden_sl":    sl_golden,
+        "golden_tp1":   tp1_golden,
+        "golden_tp2":   tp2_golden,
+        "golden_tp3":   tp3_golden,
+        # Sniper zone (78.6% retrace — Apr 25 deepened from 61.8% to make room for Golden Fibo)
         "sniper_entry": sniper_entry,
         "sniper_sl":    sl_sniper,
         "sniper_tp1":   tp1_sniper,
@@ -1556,6 +1920,7 @@ def _compute_enhanced_trade_plan(
         "sl_method":    sl_method,
         "struct_sl":    round(struct_sl, 8),
         "std_valid":    std_valid,
+        "golden_valid": golden_valid,
         "sniper_valid": sniper_valid,
     }
 
@@ -1899,7 +2264,7 @@ def _compute_candidate_prices(cand: dict, sig: dict) -> dict:
 
     Returns dict:
       {
-        "zone": "Aggressive" | "Standard" | "Sniper",
+        "zone": "Aggressive" | "Standard" | "Golden Fibo" | "Sniper",
         "sl_label": "Fixed SL" | "ATR SL",
         "mgmt": "Simple" | "Partial" | "Trailing",
         "tp_mult": float,
@@ -1924,11 +2289,13 @@ def _compute_candidate_prices(cand: dict, sig: dict) -> dict:
     etp       = sig.get("_trade_plan", {}) or {}
     FIXED_SL_PCT = 0.015
 
-    # Zone → trade plan field map (matches UI)
+    # Zone → trade plan field map (matches UI). Apr 25: Golden Fibo added @0.618,
+    # Sniper now at 0.786 (was at 0.618).
     _zone_etp_map = {
-        "Aggressive": ("agg_entry",    "agg_sl",    "agg_tp1",    "agg_tp2",    "agg_tp3"),
-        "Standard":   ("std_entry",    "std_sl",    "std_tp1",    "std_tp2",    "std_tp3"),
-        "Sniper":     ("sniper_entry", "sniper_sl", "sniper_tp1", "sniper_tp2", "sniper_tp3"),
+        "Aggressive":  ("agg_entry",    "agg_sl",    "agg_tp1",    "agg_tp2",    "agg_tp3"),
+        "Standard":    ("std_entry",    "std_sl",    "std_tp1",    "std_tp2",    "std_tp3"),
+        "Golden Fibo": ("golden_entry", "golden_sl", "golden_tp1", "golden_tp2", "golden_tp3"),
+        "Sniper":      ("sniper_entry", "sniper_sl", "sniper_tp1", "sniper_tp2", "sniper_tp3"),
     }
     keys = _zone_etp_map.get(zone, ())
     entry  = float(etp.get(keys[0], 0) or 0) if keys else 0.0
@@ -2115,7 +2482,7 @@ def _scanner_ai_verdict(sig: dict, ml_a: dict = None, ml_b: dict = None,
             f"EVw={cand.get('ev_weighted',0):+.2f}R PF={_pfs} n={cand.get('n',0)}",
             f"  Newest bucket: WR={nb.get('wr',0):.1f}% EV={nb.get('ev',0):+.2f}R n={nb.get('n',0)}",
         ]
-        # Fill-rate diagnostic — flags selection bias on Standard/Sniper zones.
+        # Fill-rate diagnostic — flags selection bias on Standard/Golden/Sniper zones.
         # On trending coins, many signals never retrace enough to enter; those
         # are silently dropped, so the remaining sample is biased toward setups
         # that both pulled back AND continued (survivor bias).
@@ -2126,7 +2493,7 @@ def _scanner_ai_verdict(sig: dict, ml_a: dict = None, ml_b: dict = None,
         if _nq > 0:
             _fill_warn = ""
             _zone = mc.get("zone", "?")
-            if _zone in ("Standard", "Sniper") and _fr < 40 and _nq >= 20:
+            if _zone in ("Standard", "Golden Fibo", "Sniper") and _fr < 40 and _nq >= 20:
                 _fill_warn = (
                     " ⚠ LOW fill rate on retrace-zone entries — sample skewed toward "
                     "setups that pulled back AND continued (survivor bias). Treat PF with caution."
@@ -2181,7 +2548,7 @@ def _scanner_ai_verdict(sig: dict, ml_a: dict = None, ml_b: dict = None,
 
     if bt and bt.get("error") is None:
         zone_lines = []
-        for zn in ("Aggressive", "Standard", "Sniper"):
+        for zn in ("Aggressive", "Standard", "Golden Fibo", "Sniper"):
             zd = zone_best.get(zn, {})
             if zd and not zd.get("insufficient") and zd.get("n", 0) >= 4:
                 zone_lines.append(
@@ -2200,9 +2567,10 @@ def _scanner_ai_verdict(sig: dict, ml_a: dict = None, ml_b: dict = None,
 
         # Price levels for best zone — route by SL method (Fixed vs ATR)
         _zone_etp_keys = {
-            "Aggressive": ("agg_entry", "agg_sl", "agg_tp1", "agg_tp2", "agg_tp3"),
-            "Standard":   ("std_entry", "std_sl", "std_tp1", "std_tp2", "std_tp3"),
-            "Sniper":     ("sniper_entry","sniper_sl","sniper_tp1","sniper_tp2","sniper_tp3"),
+            "Aggressive":  ("agg_entry", "agg_sl", "agg_tp1", "agg_tp2", "agg_tp3"),
+            "Standard":    ("std_entry", "std_sl", "std_tp1", "std_tp2", "std_tp3"),
+            "Golden Fibo": ("golden_entry","golden_sl","golden_tp1","golden_tp2","golden_tp3"),
+            "Sniper":      ("sniper_entry","sniper_sl","sniper_tp1","sniper_tp2","sniper_tp3"),
         }
         _bzone         = best.get("zone", "Aggressive")
         _bsl_label_p   = best.get("sl_label", "Fixed SL")
@@ -2243,12 +2611,13 @@ def _scanner_ai_verdict(sig: dict, ml_a: dict = None, ml_b: dict = None,
     else:
         bt_section = "Backtest: not computed"
 
-    # ── Also provide all 3 zone entry prices for reference ─────────────────
+    # ── Also provide all 4 zone entry prices for reference ─────────────────
     price_ref = (
         f"Signal candle close: {_fmt(sig.get('close', 0))}\n"
         f"Aggressive entry: {_fmt(_etp.get('agg_entry',0))} | SL: {_fmt(_etp.get('agg_sl',0))} | TP2: {_fmt(_etp.get('agg_tp2',0))}\n"
-        f"Standard entry:   {_fmt(_etp.get('std_entry',0))} | SL: {_fmt(_etp.get('std_sl',0))} | TP2: {_fmt(_etp.get('std_tp2',0))}\n"
-        f"Sniper entry:     {_fmt(_etp.get('sniper_entry',0))} | SL: {_fmt(_etp.get('sniper_sl',0))} | TP2: {_fmt(_etp.get('sniper_tp2',0))}\n"
+        f"Standard entry:    {_fmt(_etp.get('std_entry',0))} | SL: {_fmt(_etp.get('std_sl',0))} | TP2: {_fmt(_etp.get('std_tp2',0))}\n"
+        f"Golden Fibo entry: {_fmt(_etp.get('golden_entry',0))} | SL: {_fmt(_etp.get('golden_sl',0))} | TP2: {_fmt(_etp.get('golden_tp2',0))}\n"
+        f"Sniper entry:      {_fmt(_etp.get('sniper_entry',0))} | SL: {_fmt(_etp.get('sniper_sl',0))} | TP2: {_fmt(_etp.get('sniper_tp2',0))}\n"
         f"ATR SL distance: {_etp.get('sl_dist_pct',1.5):.1f}% (ATR={_etp.get('atr_pct',0):.1f}%)"
     )
 
@@ -2437,7 +2806,80 @@ def _scanner_ai_verdict(sig: dict, ml_a: dict = None, ml_b: dict = None,
     else:
         wfo_section = "WFO: not run yet (Step 1 required)"
 
+    # ── QuantFlow Combo audit context (NEW) ────────────────────────────────────
+    # Builds a text block summarizing every backtest-validated combo that
+    # this signal matches, with full audit metrics (rollup PF, mean R, recent
+    # verification, slice-specific stats for THIS signal's tf+direction).
+    # If the signal didn't go through the scanner combo-tagging path (e.g.
+    # Manual tab usage, or no combos ticked), `_qf_matches` is missing/empty
+    # and we still classify on-the-fly so the AI gets context regardless.
+    # Empty string when no combos match — in that case the prompt gets a
+    # neutral "no validated combo matches" note for honesty.
+    _qf_audit_section = ""
+    if _QFCOMBOS_OK:
+        _qf_matches_for_ai = sig.get("_qf_matches")
+        # Pull the user-selected confidence level scope from the sig (set by
+        # the scanner UI before this verdict is called). If absent, default to
+        # STRICT-only so the AI fallback classification matches the legacy
+        # behavior — only audit-validated matches are used unless the user
+        # explicitly opted in to RELAXED/LOOSE in the scanner.
+        _qf_allowed_levels = sig.get("_qf_allowed_levels") or ("STRICT",)
+        if _qf_matches_for_ai is None:
+            # Signal not pre-tagged — classify against ALL combos on the fly
+            # using cached BTC regime. This makes the audit context appear
+            # whether or not the user explicitly ticked a combo checkbox.
+            try:
+                _qf_btc_regime = (sig.get("_qf_btc_regime")
+                                   or _scanner_btc_regime_for_combos())
+                _all_combo_names = [c["name"] for c in _qfcombos.COMBOS]
+                # Use the LOCAL level-aware classifier — does not depend on
+                # quantflow_combos.py's API surface.
+                _qf_matches_for_ai = _qf_get_matching_combos(
+                    sig, _all_combo_names, btc_regime=_qf_btc_regime,
+                    allowed_levels=_qf_allowed_levels,
+                )
+            except Exception:
+                _qf_matches_for_ai = []
+        if _qf_matches_for_ai:
+            # Build the audit section. Try the imported function first; if it
+            # raises (old/incompatible signature) or omits level info (older
+            # version), fall back to a local appendix that surfaces the level
+            # context to the AI.
+            try:
+                _qf_audit_section = _qfcombos.build_ai_prompt_block(
+                    _qf_matches_for_ai, sig
+                )
+            except Exception:
+                _qf_audit_section = ""
+            # Append level context if the imported block doesn't already
+            # mention it (old version detection by string match).
+            if "LEVEL:" not in (_qf_audit_section or "") and "Match level" not in (_qf_audit_section or ""):
+                _qf_audit_section = (_qf_audit_section or "") + _qf_format_ai_level_appendix(_qf_matches_for_ai)
+        else:
+            # No combo match. Build a context-aware fallback that names the
+            # CURRENT allowed levels, so the AI knows whether STRICT-only was
+            # already loose or strict mode was being attempted.
+            _level_scope_text = ", ".join(_qf_allowed_levels) or "STRICT"
+            _n_combos = len(_qfcombos.COMBOS)
+            _qf_audit_section = (
+                "=== QUANTFLOW BACKTEST CONTEXT ===\n"
+                f"This signal does NOT match any of the {_n_combos} "
+                f"backtest-validated combos (Tier 1/2 trend-following + "
+                f"Tier 3 countertrend) at the current confidence-level scope "
+                f"[{_level_scope_text}]. The signal may still be valid based "
+                f"on the per-coin backtest metrics below, but it lacks the "
+                f"universe-level historical edge confirmation that the validated "
+                f"combos provide. Apply extra skepticism — the audit window "
+                f"2021-11-08 → 2026-04-21 (4.5 yrs · 134 coins · 107,682 "
+                f"trades) found these specific profiles to be the most "
+                f"reliable; a non-matching signal is outside that proven "
+                f"envelope.\n"
+                "=== END QUANTFLOW BACKTEST CONTEXT ==="
+            )
+
     prompt = f"""You are a SKEPTICAL trading analyst. Evaluate TWO candidate trading methods for the same signal. For EACH candidate output TRADE / WAIT / NO TRADE independently. Then pick the WINNER if both are TRADE. Cite specific numbers. No markdown.
+
+{_qf_audit_section}
 
 === SIGNAL (shared between both candidates) ===
 Symbol: {sig['symbol']} | Timeframe: {sig['timeframe']} | Direction: {direction}
@@ -2481,7 +2923,7 @@ Market Regime: {sig['regime']} ({sig['regime_score']}/100) | Session: {_session}
 - If that candidate's all-time WR < 40% with n >= 8: NO TRADE
 - If WFO verdict is FAIL: WAIT minimum, note overfit risk
 - If that candidate's ML < 45%: lean WAIT
-- If signal age > 2 candles and candidate zone requires retrace (Standard/Sniper): WAIT
+- If signal age > 2 candles and candidate zone requires retrace (Standard/Golden Fibo/Sniper): WAIT
 - Newest-bucket stats dominate when they contradict all-time stats — markets drift
 - Low sample (n<5) in newest bucket: treat newest-bucket stats as directional only
 - Pulse composite <= -10 (STRONGLY BEARISH on-chain) contradicting a LONG signal: WAIT — capital is leaving
@@ -2685,7 +3127,7 @@ WHY: [1-2 sentences explaining which is stronger and why. If NONE, explain why n
 def _scanner_quick_backtest(sig: dict) -> dict:
     """
     Enhanced multi-method backtest that tests and compares:
-      Entry Zones  : Aggressive (0%), Standard (38.2%), Sniper (61.8%)
+      Entry Zones  : Aggressive (0%), Standard (38.2%), Golden Fibo (61.8%), Sniper (78.6%)
       SL Methods   : Fixed 1.5% vs ATR-adaptive (from signal _trade_plan)
       Management   : Simple (hold to 2R), Partial (50%@1R->BE->2R), Trailing
       Expiry Logic : Retrace entries expire if not filled within 3 bars
@@ -2757,9 +3199,10 @@ def _scanner_quick_backtest(sig: dict) -> dict:
     FIXED_SL   = 0.015
 
     ENTRY_ZONES = {
-        "Aggressive": {"retrace": 0.000, "expiry_bars": 0},
-        "Standard":   {"retrace": 0.382, "expiry_bars": 3},
-        "Sniper":     {"retrace": 0.618, "expiry_bars": 3},
+        "Aggressive":  {"retrace": 0.000, "expiry_bars": 0},
+        "Standard":    {"retrace": 0.382, "expiry_bars": 3},
+        "Golden Fibo": {"retrace": 0.618, "expiry_bars": 3},
+        "Sniper":      {"retrace": 0.786, "expiry_bars": 3},
     }
     MGMT_MODES = ["Simple", "Partial", "Partial-NoBE", "Trailing"]
     TP_MULTS   = [2.0, 2.5, 3.0]   # test 2R / 2.5R / 3R targets per combo
@@ -2815,12 +3258,12 @@ def _scanner_quick_backtest(sig: dict) -> dict:
                 trades_raw = []
                 # Selection-bias counters: n_qualifying = signals that passed
                 # body/vol filters AND direction. n_filled = trades that
-                # actually entered (for Standard/Sniper zones, many signals
-                # never retrace to the entry zone within expiry_bars and are
-                # silently dropped by the EXPIRED path — those would look
-                # like "missed opportunity" in live trading but are hidden
-                # from backtest stats). fill_rate = n_filled / n_qualifying
-                # exposes this bias.
+                # actually entered (for Standard/Golden Fibo/Sniper zones,
+                # many signals never retrace to the entry zone within
+                # expiry_bars and are silently dropped by the EXPIRED path —
+                # those would look like "missed opportunity" in live trading
+                # but are hidden from backtest stats). fill_rate =
+                # n_filled / n_qualifying exposes this bias.
                 _n_qualifying = 0
                 _n_filled     = 0
                 _n_expired    = 0
@@ -2999,9 +3442,9 @@ def _scanner_quick_backtest(sig: dict) -> dict:
                         # we can compute fill_rate and flag selection bias.
                         _n_expired += 1
 
-                # Fill-rate diagnostic — for Standard/Sniper zones with expiry,
-                # many signals never retrace enough to enter. Silent drop hides
-                # a selection effect that inflates PF on trending coins.
+                # Fill-rate diagnostic — for Standard/Golden Fibo/Sniper zones
+                # with expiry, many signals never retrace enough to enter. Silent
+                # drop hides a selection effect that inflates PF on trending coins.
                 _fill_rate = (
                     round(_n_filled / _n_qualifying * 100, 1)
                     if _n_qualifying > 0 else 0.0
@@ -3079,6 +3522,8 @@ def _scanner_quick_backtest(sig: dict) -> dict:
     _invalid_zones  = set()
     if not _etp_for_filter.get("std_valid",    True):
         _invalid_zones.add("Standard")
+    if not _etp_for_filter.get("golden_valid", True):
+        _invalid_zones.add("Golden Fibo")
     if not _etp_for_filter.get("sniper_valid", True):
         _invalid_zones.add("Sniper")
 
@@ -3108,7 +3553,7 @@ def _scanner_quick_backtest(sig: dict) -> dict:
     # This ensures the card stats and EXECUTE THIS always describe comparable configs.
     # If nothing passes the floor, fall back to best available and flag it.
     zone_best = {}
-    for zn in ("Aggressive", "Standard", "Sniper"):
+    for zn in ("Aggressive", "Standard", "Golden Fibo", "Sniper"):
         if zn in _invalid_zones:
             zone_best[zn] = {"structurally_invalid": True, "zone": zn}
             continue
@@ -3215,6 +3660,360 @@ def _scanner_quick_backtest(sig: dict) -> dict:
     }
 
 
+def _scanner_countertrend_quick_backtest(sig: dict, combo: dict) -> dict:
+    """
+    Per-coin countertrend backtest — mirrors _scanner_quick_backtest's return shape
+    so all downstream rendering (zone cards, WFO, expanders) works unchanged.
+
+    Logic:
+      1. Validate combo is countertrend (raises ValueError otherwise).
+      2. Fetch same deep historical candles as _scanner_quick_backtest.
+      3. Find trigger bars matching the combo's criteria:
+           - signal_direction_required (the candle direction the combo watches)
+           - body/vol bands from combo["criteria"] (fraction 0-1, same as df body_pct)
+      4. For each trigger bar simulate the OPPOSITE trade per combo["primary"]:
+           - entry_retrace: negative → wick AGAINST the trade direction from close
+               LONG trade (fading bear): entry = close + body_abs * entry_ret  [entry_ret < 0 → below close]
+               SHORT trade (fading bull): entry = close - body_abs * entry_ret  [entry_ret < 0 → above close]
+           - sl_method: "wick_anchor" | "atr_1.5x" | "fixed_1.5pct"
+           - tp_R: take-profit in R multiples
+      5. Return dict compatible with _scanner_quick_backtest output.
+
+    Extra top-level keys for the acceptance test: n, wr, mean_r, pf, sample_trades.
+
+    Raises:
+        ValueError: if combo["combo_type"] != "countertrend".
+    """
+    if combo.get("combo_type") != "countertrend":
+        raise ValueError(
+            f"_scanner_countertrend_quick_backtest requires combo_type='countertrend', "
+            f"got '{combo.get('combo_type')}' for combo '{combo.get('name', '?')}'"
+        )
+
+    symbol    = sig["symbol"]
+    timeframe = sig["timeframe"]
+
+    # ── Combo primary plan ─────────────────────────────────────────────────────
+    crit       = combo["criteria"]
+    plan       = combo["primary"]
+    signal_dir = crit["signal_direction_required"]   # scanner direction of trigger candle
+    trade_dir  = plan["direction"]                    # actual CT trade direction (opposite)
+    entry_ret  = float(plan["entry_retrace"])         # negative → wick against trade direction
+    sl_method  = plan["sl_method"]                    # "wick_anchor" | "atr_1.5x" | "fixed_1.5pct"
+    tp_R       = float(plan["tp_R"])
+    # Criteria body/vol are fractions (0-1) — directly comparable with df["body_pct"]
+    body_min   = float(crit["body_min"])
+    body_max   = float(crit["body_max"])
+    vol_min    = float(crit["vol_min"])
+    vol_max    = float(crit["vol_max"])
+
+    FIXED_SL  = 0.015      # matches trend-following fixed SL constant
+    ATR_MULT  = 1.5        # atr_1.5x sl method multiplier
+    MAX_HOLD  = 20         # max bars to hold after entry fill
+
+    # ── Fetch historical candles ───────────────────────────────────────────────
+    interval   = _BINANCE_INTERVAL.get(timeframe, "1d")
+    deep_limit = _deep_limit_for(timeframe)
+    df = _scanner_fetch_candles(symbol, interval, limit=deep_limit)
+
+    _empty_meta = {
+        "bars_requested": deep_limit,
+        "bars_used": len(df) if not df.empty else 0,
+        "filter_min_body": body_min, "filter_min_vol": vol_min,
+        "bucket_count": 1, "bucket_weights": [1.0], "bucket_labels": ["All"],
+        "filter_ratio": None, "regime_weighted": False,
+        "current_regime_score": 50.0,
+        "ct_combo": combo["name"], "ct_trade_dir": trade_dir,
+    }
+    if df.empty or len(df) < 30:
+        _empty_entry = {
+            "zone": "Aggressive", "sl_label": sl_method, "mgmt": "Simple",
+            "tp_mult": tp_R, "n": 0, "win_rate": 0, "ev": 0, "pf": 0,
+            "ev_weighted": 0, "wr_weighted": 0, "avg_r": 0, "avg_bars": 0,
+            "insufficient": True, "buckets": [],
+            "newest_bucket": {"n": 0, "wr": 0, "ev": 0},
+            "n_qualifying": 0, "n_filled": 0, "n_expired": 0, "fill_rate": 0.0,
+        }
+        return {
+            "n": 0, "wr": 0.0, "mean_r": 0.0, "pf": 0.0, "sample_trades": [],
+            "error": "Not enough data",
+            "win_2r": 0, "win_3r": 0, "ev_2r": 0.0, "ev_3r": 0.0, "avg_bars": 0,
+            "per_method": {}, "zone_best": {}, "best_key": None, "best": _empty_entry,
+            "meta": _empty_meta,
+            "candidate_newest": None, "candidate_weighted": None,
+        }
+
+    n_df = len(df)
+    _method_key = f"CT {combo['name']} / {sl_method} / Simple / TP{tp_R:.1f}R"
+
+    # ── Simulate single-method CT trades ──────────────────────────────────────
+    # Unlike trend-following's 72-method grid, CT combos specify one validated
+    # primary plan. We simulate exactly that plan.
+    trades_raw    = []
+    _n_qualifying = 0
+    _n_filled     = 0
+    _n_expired    = 0
+
+    for i in range(14, n_df - 2):
+        bar      = df.iloc[i]
+        body_pct = float(bar.get("body_pct", 0) or 0)   # fraction 0-1 from df
+        vol_mult = float(bar.get("vol_mult",  0) or 0)
+        is_bull  = body_pct > 0
+
+        # signal_dir filter: "short" → scanner flagged a BEAR candle; "long" → BULL
+        if signal_dir == "short" and is_bull:      continue
+        if signal_dir == "long"  and not is_bull:  continue
+
+        # Body band (fraction, matches df body_pct units and combo criteria units)
+        body_abs_frac = abs(body_pct)
+        if not (body_min <= body_abs_frac < body_max):  continue
+
+        # Vol band
+        if not (vol_min <= vol_mult < vol_max):  continue
+
+        _n_qualifying += 1
+
+        close_v  = float(bar["close"])
+        open_v   = float(bar.get("open", close_v))
+        body_abs = abs(close_v - open_v)     # candle body in price units
+        atr14    = float(bar.get("atr14", close_v * 0.02) or close_v * 0.02)
+        bar_low  = float(bar.get("low",  close_v))
+        bar_high = float(bar.get("high", close_v))
+        if close_v <= 0:
+            continue
+
+        # ── Entry target ──────────────────────────────────────────────────────
+        # entry_ret is negative → wick AGAINST the signal candle's direction.
+        # "Signal candle direction" is the SCANNER's candle (bear for CT1-4, bull for CT5-7).
+        # LONG  (fading bear): bounce UP from close → entry = close - entry_ret * body_abs
+        #   entry_ret < 0 → -entry_ret > 0 → entry ABOVE close (wait for bounce up).
+        # SHORT (fading bull): pullback DOWN from close → entry = close + entry_ret * body_abs
+        #   entry_ret < 0 → adds a negative → entry BELOW close (wait for pullback down).
+        # entry_ret == 0 → immediate fill at close (both directions).
+        if trade_dir == "long":
+            # -entry_ret is positive when entry_ret<0 → entry above close (bounce up)
+            entry_target = round(close_v - body_abs * entry_ret, 8)
+            entry_target = min(entry_target, close_v * 1.15)    # sanity cap: max 15% above close
+        else:
+            # entry_ret is negative → close + negative → entry below close (pullback down)
+            entry_target = round(close_v + body_abs * entry_ret, 8)
+            entry_target = max(entry_target, close_v * 0.85)    # sanity floor: max 15% below close
+
+        # ── Stop loss ─────────────────────────────────────────────────────────
+        if sl_method == "wick_anchor":
+            if trade_dir == "long":
+                # SL just below the bear candle's wick low
+                sl_px = round(bar_low * (1 - 0.001), 8)
+            else:
+                # SL just above the bull candle's wick high
+                sl_px = round(bar_high * (1 + 0.001), 8)
+        elif sl_method == "atr_1.5x":
+            if trade_dir == "long":
+                sl_px = round(entry_target - ATR_MULT * atr14, 8)
+                sl_px = max(sl_px, entry_target * (1 - 0.06))   # clamp: max 6% SL
+            else:
+                sl_px = round(entry_target + ATR_MULT * atr14, 8)
+                sl_px = min(sl_px, entry_target * (1 + 0.06))
+        else:
+            # fixed_1.5pct — matches FIXED_SL constant above
+            if trade_dir == "long":
+                sl_px = round(entry_target * (1 - FIXED_SL), 8)
+            else:
+                sl_px = round(entry_target * (1 + FIXED_SL), 8)
+
+        risk_amt = abs(entry_target - sl_px)
+        # Skip degenerate SL (>15% risk, or zero, or directionally inverted)
+        if risk_amt <= 0 or risk_amt / entry_target > 0.15:
+            continue
+        if trade_dir == "long"  and entry_target <= sl_px:  continue
+        if trade_dir == "short" and entry_target >= sl_px:  continue
+
+        if trade_dir == "long":
+            tp_px = round(entry_target + tp_R * risk_amt, 8)
+        else:
+            tp_px = round(entry_target - tp_R * risk_amt, 8)
+
+        # ── Fill logic ────────────────────────────────────────────────────────
+        # entry_ret == 0 → immediate fill at trigger bar close.
+        # entry_ret != 0 → wait up to EXPIRY_BARS for the wick to touch entry.
+        immediate    = (abs(entry_ret) < 1e-9)
+        entry_filled = immediate
+        entry_fill_bar = i if immediate else None
+        EXPIRY_BARS  = 0 if immediate else 3    # mirrors Standard zone expiry
+        result       = "OPEN"
+        bars_held    = 0
+        r_mult       = 0.0
+        j            = i    # ensure j is defined for label_end_bar after inner loop
+
+        for j in range(i + 1, min(i + 1 + MAX_HOLD + EXPIRY_BARS + 1, n_df)):
+            fb = df.iloc[j]
+            hi = float(fb["high"])
+            lo = float(fb["low"])
+
+            if not entry_filled:
+                # LONG: entry is ABOVE close (bounce up) → filled when hi touches it
+                # SHORT: entry is BELOW close (pullback down) → filled when lo touches it
+                fill_cond = (hi >= entry_target if trade_dir == "long"
+                             else lo <= entry_target)
+                if fill_cond:
+                    entry_filled   = True
+                    entry_fill_bar = j
+                else:
+                    if EXPIRY_BARS > 0 and (j - i) >= EXPIRY_BARS:
+                        result = "EXPIRED"; break
+                    continue
+
+            bars_held = j - entry_fill_bar
+
+            if bars_held >= MAX_HOLD:
+                ep     = float(fb.get("close", entry_target))
+                r_mult = ((ep - entry_target) / risk_amt if trade_dir == "long"
+                          else (entry_target - ep) / risk_amt) - 0.002
+                result = "WIN" if r_mult > 0 else "LOSS"; break
+
+            # SL hit
+            sl_hit = (lo <= sl_px if trade_dir == "long" else hi >= sl_px)
+            if sl_hit:
+                r_mult = ((sl_px - entry_target) / risk_amt if trade_dir == "long"
+                          else (entry_target - sl_px) / risk_amt) - 0.002
+                result = "WIN" if r_mult > 0 else "LOSS"; break
+
+            # TP hit
+            tp_hit = (hi >= tp_px if trade_dir == "long" else lo <= tp_px)
+            if tp_hit:
+                r_mult = tp_R - 0.002
+                result = "WIN"; break
+
+        if result in ("WIN", "LOSS"):
+            _n_filled += 1
+            trades_raw.append({
+                "result":        result,
+                "r_mult":        r_mult,
+                "bars_held":     bars_held,
+                "bar_index":     i,
+                "label_end_bar": j,
+                "direction":     trade_dir,    # CT trade direction (opposite of signal)
+                "outcome_class": _classify_outcome(r_mult),
+            })
+        elif result == "EXPIRED":
+            _n_expired += 1
+
+    # ── Aggregate stats ────────────────────────────────────────────────────────
+    _fill_rate = (
+        round(_n_filled / _n_qualifying * 100, 1) if _n_qualifying > 0 else 0.0
+    )
+
+    _insufficient_entry = {
+        "zone": "Aggressive", "sl_label": sl_method, "mgmt": "Simple",
+        "tp_mult": tp_R, "n": len(trades_raw), "win_rate": 0, "ev": 0,
+        "pf": 0, "ev_weighted": 0, "wr_weighted": 0, "avg_r": 0, "avg_bars": 0,
+        "insufficient": True, "buckets": [],
+        "newest_bucket": {"n": 0, "wr": 0, "ev": 0},
+        "n_qualifying": _n_qualifying, "n_filled": _n_filled,
+        "n_expired": _n_expired, "fill_rate": _fill_rate,
+    }
+
+    if len(trades_raw) < 3:
+        return {
+            "n": len(trades_raw), "wr": 0.0, "mean_r": 0.0, "pf": 0.0,
+            "sample_trades": trades_raw,
+            "error": f"Insufficient CT triggers (< 3 trades; {_n_qualifying} qualifying bars found)",
+            "win_2r": 0, "win_3r": 0, "ev_2r": 0.0, "ev_3r": 0.0, "avg_bars": 0,
+            "per_method": {_method_key: _insufficient_entry},
+            "zone_best": {"Aggressive": _insufficient_entry},
+            "best_key": None, "best": _insufficient_entry,
+            "meta": {**_empty_meta, "bars_used": n_df,
+                     "bars_coverage": (
+                         f"{df.index[0].strftime('%Y-%m-%d')} → "
+                         f"{df.index[-1].strftime('%Y-%m-%d')}")},
+            "candidate_newest": None, "candidate_weighted": None,
+        }
+
+    rs     = [t["r_mult"] for t in trades_raw]
+    wins   = [r for r in rs if r > 0]
+    losses = [r for r in rs if r <= 0]
+    wr     = len(wins) / len(rs)
+    avg_r  = float(np.mean(rs))
+    avg_b  = float(np.mean([t["bars_held"] for t in trades_raw]))
+    gp     = sum(wins)
+    gl     = abs(sum(losses))
+    if gl > 0:
+        pf_val = round(gp / gl, 3)
+    elif gp > 0:
+        pf_val = 9.99    # sentinel: all wins, no losses
+    else:
+        pf_val = 0.0
+
+    # Time-decay bucket stats (same helper as _scanner_quick_backtest)
+    _decay_buckets  = _compute_decay_buckets(n_df)
+    _current_regime = float(sig.get("regime_score", 50) or 50)
+    bucket_rows, ev_weighted, wr_weighted = _bucket_stats_for_trades(
+        trades_raw, n_df, _decay_buckets,
+        current_regime_score=_current_regime,
+    )
+    _newest = bucket_rows[-1] if bucket_rows else {"n": 0, "wr": 0, "ev": 0}
+
+    _method_entry = {
+        "zone": "Aggressive", "sl_label": sl_method, "mgmt": "Simple",
+        "tp_mult": tp_R,
+        "n": len(trades_raw), "win_rate": round(wr * 100, 1),
+        "ev": round(avg_r, 3), "pf": pf_val,
+        "ev_weighted": ev_weighted, "wr_weighted": wr_weighted,
+        "avg_r": round(avg_r, 3), "avg_bars": round(avg_b, 1),
+        "insufficient": False,
+        "buckets": bucket_rows,
+        "newest_bucket": {"n": _newest.get("n", 0),
+                          "wr": _newest.get("wr", 0),
+                          "ev": _newest.get("ev", 0)},
+        "n_qualifying": _n_qualifying, "n_filled": _n_filled,
+        "n_expired": _n_expired, "fill_rate": _fill_rate,
+    }
+
+    _meta = {
+        "bars_requested": deep_limit, "bars_used": n_df,
+        "bars_coverage": (
+            f"{df.index[0].strftime('%Y-%m-%d')} → "
+            f"{df.index[-1].strftime('%Y-%m-%d')}"
+        ),
+        "bucket_count":   _decay_buckets["count"],
+        "bucket_weights": _decay_buckets["weights"],
+        "bucket_labels":  _decay_buckets["labels"],
+        "filter_ratio":   None,          # no ratchet — CT uses exact combo bands
+        "filter_min_body": body_min,     # consumed by _scanner_mini_wfo
+        "filter_min_vol":  vol_min,
+        "regime_weighted": True,
+        "current_regime_score": _current_regime,
+        "ct_combo":    combo["name"],    # flags this result as countertrend
+        "ct_trade_dir": trade_dir,
+    }
+
+    _zone_entry = {**_method_entry, "key": _method_key,
+                   "below_wr_floor": wr < 0.35}
+
+    return {
+        # ── Acceptance-test shortcut keys ──────────────────────────────────
+        "n":             len(trades_raw),
+        "wr":            round(wr * 100, 1),
+        "mean_r":        round(avg_r, 3),
+        "pf":            pf_val,
+        "sample_trades": trades_raw,
+        # ── _scanner_quick_backtest-compatible shape ─────────────────────
+        "win_2r":   round(wr * 100, 1),
+        "win_3r":   round(wr * 100, 1),
+        "ev_2r":    round(avg_r, 3),
+        "ev_3r":    round(avg_r, 3),
+        "avg_bars": round(avg_b, 1),
+        "error":    None,
+        "per_method":  {_method_key: _method_entry},
+        "zone_best":   {"Aggressive": _zone_entry},
+        "best_key":    _method_key,
+        "best":        _method_entry,
+        "meta":        _meta,
+        "candidate_newest":   None,
+        "candidate_weighted": None,
+    }
+
+
 def _scanner_mini_wfo(sig: dict, bt_results: dict) -> dict:
     """
     Mini Walk-Forward Validation for the scanner.
@@ -3252,9 +4051,10 @@ def _scanner_mini_wfo(sig: dict, bt_results: dict) -> dict:
     MAX_HOLD    = 20
 
     _ZONE_CFG = {
-        "Aggressive": {"retrace": 0.000, "expiry_bars": 0},
-        "Standard":   {"retrace": 0.382, "expiry_bars": 3},
-        "Sniper":     {"retrace": 0.618, "expiry_bars": 3},
+        "Aggressive":  {"retrace": 0.000, "expiry_bars": 0},
+        "Standard":    {"retrace": 0.382, "expiry_bars": 3},
+        "Golden Fibo": {"retrace": 0.618, "expiry_bars": 3},
+        "Sniper":      {"retrace": 0.786, "expiry_bars": 3},
     }
     ret_frac = _ZONE_CFG.get(zone_name, {}).get("retrace", 0.0)
     expiry   = _ZONE_CFG.get(zone_name, {}).get("expiry_bars", 0)
@@ -3860,9 +4660,10 @@ def _scanner_train_ml(sig: dict, method_cfg: dict) -> dict:
     MAX_HOLD   = 20
 
     _ZONE_CFG = {
-        "Aggressive": {"retrace": 0.000, "expiry_bars": 0},
-        "Standard":   {"retrace": 0.382, "expiry_bars": 3},
-        "Sniper":     {"retrace": 0.618, "expiry_bars": 3},
+        "Aggressive":  {"retrace": 0.000, "expiry_bars": 0},
+        "Standard":    {"retrace": 0.382, "expiry_bars": 3},
+        "Golden Fibo": {"retrace": 0.618, "expiry_bars": 3},
+        "Sniper":      {"retrace": 0.786, "expiry_bars": 3},
     }
     ret_frac = _ZONE_CFG.get(zone_name, {}).get("retrace",     0.0)
     expiry   = _ZONE_CFG.get(zone_name, {}).get("expiry_bars", 0)
@@ -4711,6 +5512,274 @@ def render_auto_analyzer(ticker: str, df_full_1d: pd.DataFrame, tc: float,
     # Map labels back to bar_offset integers
     _allowed_offsets = {off for lbl, off in _age_options if lbl in sel_age_labels}
 
+    # ── QuantFlow Combo Filter (post-scan tagging by backtest-validated combos) ──
+    # The 5 combos are pre-registered (body × vol × ADX × regime) filter sets
+    # that each have been validated by oos_audit_v3a/v3c/v3d on 134 coins,
+    # 107,682 filled trades, 4.5-year window. Ticking a combo:
+    #  - Filters the scanner results to ONLY signals that match its criteria
+    #    (and respects the combo's eligible timeframe — e.g. C1A-A is
+    #    1D-dominant so a 4H signal won't match it even if body/vol/adx do).
+    #  - Each matching signal card shows a panel with the combo's rollup PF,
+    #    mean R per trade, recommended trade plan, and recent-period
+    #    verification — so the user (and the AI verdict) can decide trade /
+    #    no-trade with full historical evidence.
+    #  - When a signal matches multiple combos, the card is rendered ONCE
+    #    under the highest-PF combo with overlap notes for the others.
+    # If user ticks none, scanner behaves like before (no combo filter applied).
+    enabled_combos: list[str] = []
+    # Confidence-level scope for combo classification. Defaults to STRICT-only
+    # (the legacy behavior — only audit-validated matches). User can opt into
+    # RELAXED (small boundary widening, ~92% of audit PF) or LOOSE (more
+    # widening, ~80% of audit PF) when STRICT yields no setups. The chosen
+    # scope is threaded down to get_matching_combos AND attached to each sig
+    # so _scanner_ai_verdict reuses the same scope on its fallback classification.
+    _allowed_levels: tuple = ("STRICT",)
+    if _QFCOMBOS_OK:
+        with st.expander(
+            f"🎯 QuantFlow Combo Filter — backtest-validated setups "
+            f"({len(_qfcombos.COMBOS)} combos: Tier 1/2 trend + Tier 3 countertrend)",
+            expanded=False,
+        ):
+            # ── Confidence-level radio (Apr 29, 2026) ──────────────────────
+            # The level system is bundled in app.py (_qf_get_matching_combos)
+            # so this radio is always available regardless of which version of
+            # quantflow_combos.py is deployed.
+            st.markdown(
+                f'<div style="background:#0d1f2d;border:1px solid #58a6ff;'
+                f'border-radius:6px;padding:8px 12px;font-size:11px;color:#ccd6f6;'
+                f'margin-bottom:10px;line-height:1.6;">'
+                f'<b style="color:#58a6ff;">{len(_qfcombos.COMBOS)} backtest-validated combos.</b> '
+                f'Each is a (body × volume × ADX × regime) filter set with full '
+                f'audit metrics. Ticking a combo restricts scanner output to '
+                f'signals matching its criteria, and shows historical PF / mean R '
+                f'/ recent verification on each card.<br>'
+                f'<span style="color:#8892b0;">Audit window: '
+                f'{_qfcombos.AUDIT_DATA_START} → {_qfcombos.AUDIT_DATA_END} '
+                f'({_qfcombos.AUDIT_TIMESPAN_YEARS:.1f} yrs · '
+                f'{_qfcombos.AUDIT_TOTAL_COINS} coins · '
+                f'{_qfcombos.AUDIT_TOTAL_FILLED_TRADES:,} filled trades · '
+                f'{_qfcombos.AUDIT_VERSION})</span>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+            _level_choice = st.radio(
+                "Confidence level",
+                options=[
+                    "STRICT only (audit-validated, full sizing)",
+                    "STRICT + RELAXED (small boundary widening, 75% sizing)",
+                    "STRICT + RELAXED + LOOSE (more setups, 50% sizing)",
+                ],
+                index=0,
+                horizontal=False,
+                key="mscanner_level_scope",
+                help=(
+                    "STRICT = audit-validated criteria, full sizing, expected PF "
+                    "matches the combo's stated rollup PF.\n"
+                    "RELAXED = signal one-pad outside the strict band but inside "
+                    "safe regions (no 0.60-0.70 dead zone for trend, no ADX > 50, "
+                    "no CT body < 0.78). Sized at 0.75× and expected to deliver "
+                    "~92% of strict PF.\n"
+                    "LOOSE = wider widening (sized 0.50×, ~80% PF). Use sparingly "
+                    "and paper-trade first.\n\n"
+                    "Hard caps: body 0.60-0.70 dead zone, ADX > 50 cap, "
+                    "CT body 0.78 floor — enforced at ALL levels."
+                ),
+            )
+            if _level_choice.startswith("STRICT only"):
+                _allowed_levels = ("STRICT",)
+            elif _level_choice.startswith("STRICT + RELAXED ("):
+                _allowed_levels = ("STRICT", "RELAXED")
+            else:
+                _allowed_levels = ("STRICT", "RELAXED", "LOOSE")
+
+            cb_cols = st.columns(1)
+
+            # Group combos: Tier 1 = ranks 1-5 (PF ≥ 1.30), Tier 2 = ranks 6-10
+            # (PF 1.14-1.23). Tier 1 is the primary set — strongest evidence,
+            # most stable in recent data. Tier 2 is the fallback — weaker edge
+            # AND most have weakened in 2025 recent verification (only C1A-N
+            # held up). Use Tier 2 for opportunistic coverage when no Tier 1
+            # signal is available. They render with separate headers and
+            # distinct visual styling so users don't conflate them.
+            #
+            # Tier 3 (countertrend) added Apr 28: 7 combos that detect
+            # strong-momentum candles and recommend the OPPOSITE trade
+            # (fade the exhaustion). Different combo_type, different fields
+            # (entry_retrace + sl_method instead of entry_zone), but same
+            # checkbox UX. Most STRENGTHENED in recent period — opposite to
+            # Tier 1/2 which mostly weakened.
+            _tier1_combos = [c for c in _qfcombos.COMBOS if c["tier"] <= 5]
+            _tier2_combos = [c for c in _qfcombos.COMBOS
+                             if 6 <= c["tier"] <= 10
+                             and c.get("combo_type", "trend_following") == "trend_following"]
+            _tier3_combos = [c for c in _qfcombos.COMBOS
+                             if c.get("combo_type") == "countertrend"]
+
+            # ── Per-tier "Select all" / "Clear" buttons (Apr 29, 2026) ─────
+            # Sets/clears all checkboxes in one tier with a single click.
+            # Mechanism: button click sets st.session_state[f"mscanner_combo_{name}"]
+            # for each combo in the tier, then triggers a rerun so the
+            # checkboxes (rendered AFTER these buttons in script order) pick
+            # up the new state. Without st.rerun() the change would only take
+            # effect after the next user interaction.
+            def _bulk_select_tier(tier_combos, value: bool):
+                for c in tier_combos:
+                    st.session_state[f"mscanner_combo_{c['name']}"] = value
+                st.rerun()
+
+            def _render_tier_select_buttons(tier_combos, tier_label: str):
+                """Two compact buttons: select-all / clear, per tier."""
+                bcol1, bcol2, _spacer = st.columns([1, 1, 4])
+                with bcol1:
+                    if st.button(f"✓ All {tier_label}",
+                                 key=f"mscanner_select_all_{tier_label}",
+                                 use_container_width=True,
+                                 help=f"Tick every combo in this tier"):
+                        _bulk_select_tier(tier_combos, True)
+                with bcol2:
+                    if st.button(f"✗ Clear {tier_label}",
+                                 key=f"mscanner_clear_all_{tier_label}",
+                                 use_container_width=True,
+                                 help=f"Untick every combo in this tier"):
+                        _bulk_select_tier(tier_combos, False)
+
+            def _render_combo_row(combo):
+                pf = combo["rollup"]["pf"]
+                mr = combo["rollup"]["mean_r"]
+                pp = combo["primary"]
+                crit = combo["criteria"]
+                is_ct = (combo.get("combo_type") == "countertrend")
+                # Criteria string differs by type (no ADX filter for countertrend)
+                if is_ct:
+                    setup_dir = "BULL" if pp["direction"] == "short" else "BEAR"
+                    criteria_str = (
+                        f"strong {setup_dir} candle: "
+                        f"body {crit['body_min']:.2f}-{crit['body_max']:.2f} · "
+                        f"vol {crit['vol_min']:.0f}-{crit['vol_max']:.0f}× · "
+                        f"ADX not filtered"
+                    )
+                else:
+                    criteria_str = (
+                        f"body {crit['body_min']:.1f}-{crit['body_max']:.1f} · "
+                        f"vol {crit['vol_min']:.1f}-{crit['vol_max']:.1f}× · "
+                        f"ADX {int(crit['adx_min'])}-{int(crit['adx_max'])} · "
+                        f"regime {'aligned' if crit['regime_mode']=='A' else 'no filter'}"
+                    )
+                # Recent-period verdict tag (visual cue: ✓ stable, ⚠ weaker, 🔥 stronger)
+                rc_verdict = combo.get("recent_check", {}).get("verdict", "")
+                vu = rc_verdict.upper()
+                if "STRONGER" in vu or "MUCH STRONGER" in vu:
+                    rec_tag = "🔥 recent stronger"
+                elif "STABLE" in vu or "STRONG" in vu:
+                    rec_tag = "✓ recent stable"
+                elif "WEAKER" in vu:
+                    rec_tag = "⚠ recent weaker"
+                elif "FLIPPED POSITIVE" in vu or "TURNED POSITIVE" in vu:
+                    rec_tag = "🔥 turned positive"
+                else:
+                    rec_tag = ""
+                tag_str = f" · {rec_tag}" if rec_tag else ""
+                # Plan string differs by type
+                if is_ct:
+                    setup_dir = "BULL" if pp["direction"] == "short" else "BEAR"
+                    plan_str = (f"FADE strong {setup_dir} → {pp['tf'].upper()} "
+                                f"{pp['direction']}, retrace {pp['entry_retrace']:+.2f}, "
+                                f"{pp['sl_method']}, TP{pp['tp_R']}R")
+                else:
+                    plan_str = (f"{pp['tf'].upper()} {pp['direction']} "
+                                f"{pp['entry_zone']} TP{pp['tp_R']}R")
+                checked = st.checkbox(
+                    f"**{combo['name']}** (Tier {combo['tier']}) — {criteria_str}\n\n"
+                    f"&nbsp;&nbsp;PF {pf:.2f} · mean R {mr:+.3f}{tag_str} · "
+                    f"best plan: {plan_str} "
+                    f"(mean {pp['mean_r']:+.3f}, n={pp['n']})",
+                    key=f"mscanner_combo_{combo['name']}",
+                    value=False,
+                    help=combo["label_short"],
+                )
+                if checked:
+                    enabled_combos.append(combo["name"])
+
+            # Tier 1 header
+            st.markdown(
+                '<div style="margin-top:8px;padding:6px 10px;background:#0d2818;'
+                'border-left:3px solid #3fb950;border-radius:4px;'
+                'font-size:11px;color:#3fb950;font-weight:700;letter-spacing:0.6px;">'
+                '🥇 TIER 1 — TOP 5 TREND-FOLLOWING (PF ≥ 1.30, primary deployment)'
+                '</div>',
+                unsafe_allow_html=True,
+            )
+            _render_tier_select_buttons(_tier1_combos, "Tier 1")
+            for combo in _tier1_combos:
+                _render_combo_row(combo)
+
+            # Tier 2 header — separated visually so users know these are weaker
+            st.markdown(
+                '<div style="margin-top:14px;padding:6px 10px;background:#3a2e0d;'
+                'border-left:3px solid #e3b341;border-radius:4px;'
+                'font-size:11px;color:#e3b341;font-weight:700;letter-spacing:0.6px;">'
+                '🥈 TIER 2 — TREND-FOLLOWING RANK 6-10 (PF 1.14-1.23). Most '
+                'weakened in recent period — only C1A-N held up. Opportunistic only.'
+                '</div>',
+                unsafe_allow_html=True,
+            )
+            _render_tier_select_buttons(_tier2_combos, "Tier 2")
+            for combo in _tier2_combos:
+                _render_combo_row(combo)
+
+            # Tier 3 header — countertrend, distinct color (orange)
+            if _tier3_combos:
+                st.markdown(
+                    '<div style="margin-top:14px;padding:6px 10px;background:#3a1d0d;'
+                    'border-left:3px solid #fb8500;border-radius:4px;'
+                    'font-size:11px;color:#fb8500;font-weight:700;letter-spacing:0.6px;">'
+                    '🔄 TIER 3 — COUNTERTREND / MEAN-REVERSION (7 combos, v3f audit). '
+                    'Detect strong-momentum exhaustion candles, then trade the '
+                    'OPPOSITE direction. Most STRENGTHENED in recent data — '
+                    'opposite of Tier 1/2 trend-following decay. ⚠️ Trade direction '
+                    'is OPPOSITE the scanner direction by design.'
+                    '</div>',
+                    unsafe_allow_html=True,
+                )
+                _render_tier_select_buttons(_tier3_combos, "Tier 3")
+                for combo in _tier3_combos:
+                    _render_combo_row(combo)
+
+            if enabled_combos:
+                _t1_active = [c for c in enabled_combos
+                              if _qfcombos.COMBOS_BY_NAME[c]["tier"] <= 5]
+                _t2_active = [c for c in enabled_combos
+                              if 6 <= _qfcombos.COMBOS_BY_NAME[c]["tier"] <= 10
+                              and _qfcombos.COMBOS_BY_NAME[c].get("combo_type",
+                                  "trend_following") == "trend_following"]
+                _t3_active = [c for c in enabled_combos
+                              if _qfcombos.COMBOS_BY_NAME[c].get("combo_type") == "countertrend"]
+                _t1_str = (f"Tier 1 ({len(_t1_active)}): {', '.join(_t1_active)}"
+                           if _t1_active else "Tier 1: none")
+                _t2_str = (f"Tier 2 ({len(_t2_active)}): {', '.join(_t2_active)}"
+                           if _t2_active else "Tier 2: none")
+                _t3_str = (f"Tier 3 ({len(_t3_active)}): {', '.join(_t3_active)}"
+                           if _t3_active else "Tier 3: none")
+                # Level scope summary — short label so it fits on the same line
+                _level_summary = (
+                    "STRICT only" if _allowed_levels == ("STRICT",)
+                    else "STRICT + RELAXED" if _allowed_levels == ("STRICT", "RELAXED")
+                    else "STRICT + RELAXED + LOOSE"
+                )
+                st.caption(
+                    f"✅ {len(enabled_combos)} combo(s) active · level scope: "
+                    f"**{_level_summary}**. "
+                    f"{_t1_str} · {_t2_str} · {_t3_str}. "
+                    f"Only matching signals will appear; others are hidden."
+                )
+            else:
+                st.caption(
+                    "No combos ticked — scanner shows all signals normally. "
+                    "Tick one or more above (or use the 'All Tier N' buttons) "
+                    "to filter to backtest-validated setups."
+                )
+
     if not scan_tfs:
         st.warning("Select at least one timeframe.")
         return
@@ -4719,7 +5788,13 @@ def render_auto_analyzer(ticker: str, df_full_1d: pd.DataFrame, tc: float,
         return
 
     # ── Scan button ────────────────────────────────────────────────────────────
-    scan_key = f"mscanner_{min_vol_usdt}_{max_coins}_{'_'.join(sorted(scan_tfs))}_{'_'.join(sorted(scan_dirs))}_{min_body_pct}_{min_vol_mult}"
+    # Note: enabled_combos is included in scan_key so toggling combo checkboxes
+    # marks results stale (user prompted to rescan to apply). This is conservative
+    # — combo filtering is applied post-scan, but BTC regime fetched at scan time
+    # affects -A combo classification, so a fresh scan is the safest behavior.
+    scan_key = (f"mscanner_{min_vol_usdt}_{max_coins}_{'_'.join(sorted(scan_tfs))}"
+                f"_{'_'.join(sorted(scan_dirs))}_{min_body_pct}_{min_vol_mult}"
+                f"_combos:{'_'.join(sorted(enabled_combos)) if enabled_combos else 'none'}")
     _prev_key     = st.session_state.get("mscanner_key", "")
     _has_results  = "mscanner_results" in st.session_state
 
@@ -4839,6 +5914,126 @@ def render_auto_analyzer(ticker: str, df_full_1d: pd.DataFrame, tc: float,
         )
         return
 
+    # ── Apply QuantFlow Combo filter (post-age-filter) ──────────────────────
+    # If user ticked one or more combo checkboxes, restrict scanner output to
+    # signals matching at least one of those combos. Each kept signal gets a
+    # `_qf_matches` field (list of matching combo dicts, sorted by tier asc =
+    # PF desc) used downstream by the card renderer + AI prompt builder.
+    # If no combos ticked, every signal gets `_qf_matches = []` (no panel,
+    # no AI context — scanner behaves like before).
+    # BTC regime is fetched ALWAYS (not just when combos are ticked) so we
+    # can display it in the scanner banner and individual cards regardless
+    # of whether combo filtering is active. Cached 10 min so cost is trivial.
+    _btc_regime_for_combos = (_scanner_btc_regime_for_combos()
+                              if _QFCOMBOS_OK else "UNKNOWN")
+    _n_before_combo_filter = len(all_signals_deduped)
+    if _QFCOMBOS_OK:
+        _filtered_with_matches = []
+        for s in all_signals_deduped:
+            # Use the LOCAL level-aware classifier (_qf_get_matching_combos),
+            # which is bundled at the top of this file and uses _qfcombos.COMBOS
+            # purely as a data source. This means: regardless of what version
+            # of quantflow_combos.py is deployed, the level system here works.
+            if enabled_combos:
+                matches = _qf_get_matching_combos(
+                    s, enabled_combos,
+                    btc_regime=_btc_regime_for_combos,
+                    allowed_levels=_allowed_levels,
+                )
+            else:
+                matches = []
+            s["_qf_matches"]   = matches
+            s["_qf_btc_regime"] = _btc_regime_for_combos
+            # Attach the level scope to the sig so _scanner_ai_verdict's
+            # fallback classification reuses the SAME scope (otherwise the AI
+            # would see a different match-set than the scanner card does).
+            s["_qf_allowed_levels"] = _allowed_levels
+            if enabled_combos:
+                if matches:
+                    _filtered_with_matches.append(s)
+            else:
+                _filtered_with_matches.append(s)
+        all_signals_deduped = _filtered_with_matches
+
+        if enabled_combos and not all_signals_deduped:
+            # Diagnose why nothing matched. Common causes:
+            # 1) scanner min_vol_mult is too low — combos require vol >= 1.5
+            #    but user-set min was 1.0, so vol-1.0-to-1.5 noise floods scan
+            # 2) scanner min_body_pct is too low — same effect
+            # 3) BTC regime UNKNOWN and only -A combos ticked
+            # 4) ADX > 50 universal exclusion in combos
+            # 5) Strict-mode setup just isn't there today (boundary noise) —
+            #    suggest enabling RELAXED or LOOSE if user is on STRICT only.
+            # We surface these as actionable hints.
+            _hints = []
+            if min_vol_mult < 1.5:
+                _hints.append(
+                    f"⚠️ Scanner Min volume × is {min_vol_mult:.1f}× but every "
+                    f"combo requires ≥1.5×. Most of your {_n_before_combo_filter} "
+                    f"signals may have vol_mult between 1.0-1.5 → can never "
+                    f"match. Raise Min volume × to 1.5."
+                )
+            if min_body_pct * 100 < 50:
+                _hints.append(
+                    f"⚠️ Scanner Min body % is {min_body_pct*100:.0f}% but every "
+                    f"combo requires ≥50%. Raise Min body % to 50."
+                )
+            if (_btc_regime_for_combos == "UNKNOWN"
+                and any(c.endswith("-A") for c in enabled_combos)):
+                _hints.append(
+                    f"⚠️ BTC regime fetch failed (UNKNOWN). Aligned combos "
+                    f"(-A) cannot classify without it. Try -N variants only "
+                    f"or check Binance API connectivity."
+                )
+            # Loose-mode remediation — only suggest if user is on STRICT only.
+            # When already on RELAXED/LOOSE, more widening won't help (hard
+            # caps still bind). Phrase carefully so user understands the
+            # tradeoff: more setups but lower confidence, sized down.
+            if _allowed_levels == ("STRICT",):
+                _hints.append(
+                    "💡 Currently on <b>STRICT only</b>. If you've been seeing "
+                    "zero setups for multiple days, switch the Confidence level "
+                    "(top of the combo filter expander) to <b>STRICT + RELAXED</b> "
+                    "(small boundary widening, sized 0.75×) or <b>+ LOOSE</b> "
+                    "(more widening, sized 0.50×). Hard caps (body 0.60-0.70 "
+                    "dead zone, ADX > 50, CT body 0.78 floor) stay enforced "
+                    "at every level."
+                )
+            elif _allowed_levels == ("STRICT", "RELAXED"):
+                _hints.append(
+                    "💡 Currently on <b>STRICT + RELAXED</b>. To pull in more "
+                    "boundary signals, switch to <b>STRICT + RELAXED + LOOSE</b> "
+                    "(sized 0.50×). If even LOOSE yields nothing, the dead-zone "
+                    "caps are likely binding — there genuinely is no audit-safe "
+                    "setup right now."
+                )
+            else:
+                _hints.append(
+                    "ℹ️ All confidence levels (STRICT + RELAXED + LOOSE) are "
+                    "active. The hard caps (body 0.60-0.70 dead zone, ADX > 50, "
+                    "CT body 0.78 floor) are likely binding — there genuinely "
+                    "is no audit-safe setup matching the ticked combos right now."
+                )
+            _hints.append(
+                "Note: combos require ADX 30-50 (combos with ADX 50-60 were "
+                "audit losers and excluded). High-ADX signals won't match."
+            )
+            hints_html = "<br>".join(_hints)
+            _level_summary = (
+                "STRICT only" if _allowed_levels == ("STRICT",)
+                else "STRICT + RELAXED" if _allowed_levels == ("STRICT", "RELAXED")
+                else "STRICT + RELAXED + LOOSE"
+            )
+            st.warning(
+                f"No signals match the active combo filter "
+                f"({len(enabled_combos)} combo(s) at level scope **{_level_summary}**: "
+                f"{', '.join(enabled_combos)}). "
+                f"Scan + age filter produced {_n_before_combo_filter} signals; "
+                f"none satisfied any of the ticked combos' criteria.\n\n"
+                f"{hints_html}"
+            )
+            return
+
     # Summary banner
     regime_counts = {}
     for s in all_signals_deduped:
@@ -4860,13 +6055,45 @@ def render_auto_analyzer(ticker: str, df_full_1d: pd.DataFrame, tc: float,
             f"</span>"
         )
 
+    # BTC macro regime suffix — shown ALWAYS regardless of combo state.
+    # This is critical context: a momentum scan during BTC BEAR regime needs
+    # extra scrutiny because long signals fight the macro tide. Color-coded:
+    # green for BULL, red for BEAR, yellow for CHOP, gray for UNKNOWN.
+    _btc_regime_color = {
+        "BULL":    "#3fb950",    # green
+        "BEAR":    "#f85149",    # red
+        "CHOP":    "#e3b341",    # yellow
+        "UNKNOWN": "#8892b0",    # gray
+    }.get(_btc_regime_for_combos, "#8892b0")
+    _btc_regime_emoji = {
+        "BULL":    "🟢",
+        "BEAR":    "🔴",
+        "CHOP":    "🟡",
+        "UNKNOWN": "⚪",
+    }.get(_btc_regime_for_combos, "⚪")
+    _btc_regime_html = (
+        f" &nbsp;|&nbsp; <span style='color:{_btc_regime_color};font-weight:700;'>"
+        f"{_btc_regime_emoji} BTC: {_btc_regime_for_combos}"
+        f"</span>"
+    )
+
+    # Combo-filter suffix for banner (shown when user ticked any combo)
+    _combo_filter_suffix = ""
+    if _QFCOMBOS_OK and enabled_combos:
+        _combo_filter_suffix = (
+            f" &nbsp;|&nbsp; <span style='color:#58a6ff;font-weight:700;'>"
+            f"🎯 Combos: {', '.join(enabled_combos)}"
+            f"</span>"
+        )
+
     st.markdown(
         f'<div style="background:#0d2818;border:1px solid #238636;border-radius:8px;'
         f'padding:10px 16px;margin:8px 0;font-size:13px;">'
         f'✅ <b style="color:#3fb950;">Scan complete</b> — {scanned_at} &nbsp;|&nbsp; '
         f'{total_found} total signals found &nbsp;|&nbsp; '
         f'Showing {len(all_signals_deduped)} &nbsp;|&nbsp; {regime_summary}'
-        f'{_age_filter_suffix}</div>',
+        f'{_btc_regime_html}'
+        f'{_age_filter_suffix}{_combo_filter_suffix}</div>',
         unsafe_allow_html=True,
     )
 
@@ -4951,13 +6178,77 @@ def render_auto_analyzer(ticker: str, df_full_1d: pd.DataFrame, tc: float,
             with col_l:
                 # Coin header
                 coin_base = sig["symbol"].replace("USDT", "")
+                # BTC regime badge (small, after candle date) — gives macro
+                # context inline. The combo panel shows it more prominently
+                # but this is for cards without combo matches too.
+                _card_btc_regime = sig.get("_qf_btc_regime", "UNKNOWN")
+                _btc_card_color = {
+                    "BULL": "#3fb950", "BEAR": "#f85149",
+                    "CHOP": "#e3b341", "UNKNOWN": "#8892b0",
+                }.get(_card_btc_regime, "#8892b0")
+                _btc_card_emoji = {
+                    "BULL": "🟢", "BEAR": "🔴",
+                    "CHOP": "🟡", "UNKNOWN": "⚪",
+                }.get(_card_btc_regime, "⚪")
+                # For SHORT signals during BULL, or LONG signals during BEAR,
+                # add a "fights regime" warning to the badge so user immediately
+                # sees the macro mismatch even before reading any combo data.
+                _card_dir = sig.get("direction", "")
+                _fights_regime = (
+                    (_card_dir == "long"  and _card_btc_regime == "BEAR") or
+                    (_card_dir == "short" and _card_btc_regime == "BULL")
+                )
+                _btc_warn_str = (" ⚠️ fights macro" if _fights_regime else "")
                 st.markdown(
                     f'<div style="font-size:20px;font-weight:800;color:{dir_color};">'
                     f'{dir_icon} {coin_base}/USDT &nbsp;'
                     f'<span style="font-size:13px;color:#8892b0;font-weight:400;">'
-                    f'{sig["timeframe"]} | Candle: {sig.get("candle_date","")}</span></div>',
+                    f'{sig["timeframe"]} | Candle: {sig.get("candle_date","")}'
+                    f'</span>'
+                    f' &nbsp;<span style="font-size:11px;color:{_btc_card_color};'
+                    f'font-weight:700;background:#161b22;padding:2px 8px;'
+                    f'border-radius:10px;">'
+                    f'{_btc_card_emoji} BTC {_card_btc_regime}{_btc_warn_str}'
+                    f'</span></div>',
                     unsafe_allow_html=True,
                 )
+
+                # ── QuantFlow Combo Match panel (only when combos active) ──────
+                # Renders rollup PF / mean R / recommended trade plan / recent
+                # verification for each combo this signal matches. Sorted by
+                # tier asc (highest PF first). Empty if user ticked no combos.
+                if _QFCOMBOS_OK:
+                    _qf_matches_card = sig.get("_qf_matches") or []
+                    if _qf_matches_card:
+                        # Level summary banner FIRST — belt-and-suspenders so
+                        # the user sees the level even if the imported
+                        # render_combo_panel_html is from an older version
+                        # of quantflow_combos.py that doesn't display badges.
+                        _level_banner = _qf_render_level_summary_html(_qf_matches_card)
+                        if _level_banner:
+                            st.markdown(_level_banner, unsafe_allow_html=True)
+                        # Imported panel render. Wrap in try/except — if the
+                        # imported render is incompatible with the level
+                        # metadata we attach, fall through gracefully (the
+                        # banner above already conveyed the level info).
+                        try:
+                            _qf_panel_html = _qfcombos.render_combo_panel_html(
+                                _qf_matches_card, sig
+                            )
+                            if _qf_panel_html:
+                                st.markdown(_qf_panel_html, unsafe_allow_html=True)
+                        except Exception:
+                            # Render failed (incompatible old version of
+                            # quantflow_combos.py). The level banner above
+                            # already showed the essentials; show a short
+                            # combo-name list as fallback so the user still
+                            # sees which combo(s) matched.
+                            _names = ", ".join(
+                                f"{m['name']} (Tier {m.get('tier','?')}, "
+                                f"{m.get('_matched_level','STRICT')})"
+                                for m in _qf_matches_card
+                            )
+                            st.caption(f"Combo matches: {_names}")
 
                 # ── Entry method explanation ──────────────────────────────────
                 # The scanner uses 0% retracement (immediate entry at candle close) as
@@ -4969,12 +6260,12 @@ def render_auto_analyzer(ticker: str, df_full_1d: pd.DataFrame, tc: float,
                 if _is_fresh:
                     _freshness_html = (
                         "<span style='color:#3fb950;font-weight:700;'>🟢 FRESH — candle just closed.</span> "
-                        "All three entry zones are valid. Prefer Standard or Sniper for better R:R."
+                        "All four entry zones are valid. Prefer Standard, Golden Fibo or Sniper for better R:R."
                     )
                 else:
                     _freshness_html = (
                         f"<span style='color:#e3b341;font-weight:700;'>⚠️ Signal is {_bar_off-1} candle(s) old.</span> "
-                        "Aggressive entry may already be missed. Use Standard or Sniper zone only, "
+                        "Aggressive entry may already be missed. Use Standard, Golden Fibo or Sniper zone only, "
                         "or skip if price is >1R away."
                     )
 
@@ -4984,15 +6275,17 @@ def render_auto_analyzer(ticker: str, df_full_1d: pd.DataFrame, tc: float,
                     _atr_pct  = _etp.get("atr_pct", 0)
                     _dir      = sig["direction"]
                     _std_valid    = _etp.get("std_valid",    True)
+                    _golden_valid = _etp.get("golden_valid", True)
                     _sniper_valid = _etp.get("sniper_valid", True)
 
                     def _fmt(v):
                         return f"{v:.6g}" if v else "—"
 
                     # Update freshness note if any zone is invalid
-                    if not _std_valid or not _sniper_valid:
+                    if not _std_valid or not _golden_valid or not _sniper_valid:
                         _invalid_names = []
                         if not _std_valid:    _invalid_names.append("Standard")
+                        if not _golden_valid: _invalid_names.append("Golden Fibo")
                         if not _sniper_valid: _invalid_names.append("Sniper")
                         _zone_warn = (
                             f" <span style='color:#ff6b6b;font-weight:700;'>⚠️ "
@@ -5034,13 +6327,41 @@ def render_auto_analyzer(ticker: str, df_full_1d: pd.DataFrame, tc: float,
     </div>
   </div>"""
 
-                    # ── Sniper zone HTML ──────────────────────────────────────
+                    # ── Golden Fibo zone HTML (Apr 25 — 61.8%) ────────────────
+                    if _golden_valid:
+                        _golden_zone_html = f"""
+  <div style="background:#1a1208;border:1px solid #5a4015;border-radius:6px;padding:10px;">
+    <div style="color:#e3b341;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;">
+      🥇 Golden Fibo Entry (61.8%)</div>
+    <div style="color:#aab;font-size:10px;margin-bottom:8px;">Wait for 61.8% golden ratio retrace. Balanced R:R + fill rate.</div>
+    <div style="color:#8892b0;font-size:10px;">ENTRY</div>
+    <div style="color:#ccd6f6;font-weight:700;font-size:13px;">{_fmt(_etp['golden_entry'])}</div>
+    <div style="color:#8892b0;font-size:10px;margin-top:5px;">STOP LOSS</div>
+    <div style="color:#ff6b6b;font-weight:700;font-size:13px;">{_fmt(_etp['golden_sl'])}</div>
+    <div style="color:#8892b0;font-size:10px;margin-top:5px;">TP1 / TP2 / TP3</div>
+    <div style="color:#64ffda;font-size:12px;">{_fmt(_etp['golden_tp1'])} / {_fmt(_etp['golden_tp2'])} / {_fmt(_etp['golden_tp3'])}</div>
+  </div>"""
+                    else:
+                        _sl_pct_used = _etp.get("sl_dist_pct", 0)
+                        _golden_zone_html = f"""
+  <div style="background:#1a0a0a;border:2px solid #6b2222;border-radius:6px;padding:10px;opacity:0.75;">
+    <div style="color:#ff6b6b;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;">
+      ❌ Golden Fibo Entry — UNAVAILABLE</div>
+    <div style="color:#cc8888;font-size:11px;line-height:1.4;">
+      Candle body is too large relative to the structural SL distance
+      ({_sl_pct_used:.1f}%). The 61.8% retrace zone falls at or beyond the
+      stop-loss level — entering here would mean your SL is already hit.
+      <br><br><strong style="color:#ffaa88;">Use Aggressive or Standard zone only.</strong>
+    </div>
+  </div>"""
+
+                    # ── Sniper zone HTML (Apr 25 — moved to 78.6%) ────────────
                     if _sniper_valid:
                         _sniper_zone_html = f"""
   <div style="background:#14100a;border:1px solid #4a3a1a;border-radius:6px;padding:10px;">
     <div style="color:#e3b341;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;">
-      🎯 Sniper Entry (61.8%)</div>
-    <div style="color:#aab;font-size:10px;margin-bottom:8px;">Wait for 61.8% fib retrace. Best R:R, lower fill probability.</div>
+      🎯 Sniper Entry (78.6%)</div>
+    <div style="color:#aab;font-size:10px;margin-bottom:8px;">Wait for 78.6% Fib retrace. Best R:R, lowest fill probability.</div>
     <div style="color:#8892b0;font-size:10px;">ENTRY</div>
     <div style="color:#ccd6f6;font-weight:700;font-size:13px;">{_fmt(_etp['sniper_entry'])}</div>
     <div style="color:#8892b0;font-size:10px;margin-top:5px;">STOP LOSS</div>
@@ -5056,14 +6377,14 @@ def render_auto_analyzer(ticker: str, df_full_1d: pd.DataFrame, tc: float,
       ❌ Sniper Entry — UNAVAILABLE</div>
     <div style="color:#cc8888;font-size:11px;line-height:1.4;">
       Candle body is too large relative to the structural SL distance
-      ({_sl_pct_used:.1f}%). The 61.8% retrace zone falls at or beyond the
+      ({_sl_pct_used:.1f}%). The 78.6% retrace zone falls at or beyond the
       stop-loss level — entering here would mean your SL is already hit.
-      <br><br><strong style="color:#ffaa88;">Use Aggressive zone only.</strong>
+      <br><br><strong style="color:#ffaa88;">Use Aggressive or Standard zone only.</strong>
     </div>
   </div>"""
 
                     _zone_rows = f"""
-<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;margin:10px 0;">
+<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:6px;margin:10px 0;">
 
   <div style="background:#0a1628;border:1px solid #1f3a5f;border-radius:6px;padding:10px;">
     <div style="color:#8892b0;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;">
@@ -5078,6 +6399,8 @@ def render_auto_analyzer(ticker: str, df_full_1d: pd.DataFrame, tc: float,
   </div>
 
   {_std_zone_html}
+
+  {_golden_zone_html}
 
   {_sniper_zone_html}
 
@@ -5390,7 +6713,16 @@ def render_auto_analyzer(ticker: str, df_full_1d: pd.DataFrame, tc: float,
                                "with time-decay buckets + WFO mini-validation. "
                                "Also refreshes Pulse (on-chain + derivatives).")):
                 with st.spinner("Deep backtest + WFO + Pulse…"):
-                    _bt  = _scanner_quick_backtest(sig)
+                    # Route to CT backtest when the highest-tier match is
+                    # countertrend (lowest tier number = first in sorted list).
+                    # Trend-only signals go to the standard multi-method backtest.
+                    _primary_match_for_bt = (sig.get("_qf_matches") or [None])[0]
+                    if (_primary_match_for_bt is not None
+                            and _primary_match_for_bt.get("combo_type") == "countertrend"):
+                        _bt = _scanner_countertrend_quick_backtest(
+                            sig, _primary_match_for_bt)
+                    else:
+                        _bt  = _scanner_quick_backtest(sig)
                     _wfo = _scanner_mini_wfo(sig, _bt)
                     # Pulse fetch runs alongside so the signal card can show
                     # on-chain confluence before the user clicks Step 2/3.
@@ -6085,10 +7417,11 @@ def render_auto_analyzer(ticker: str, df_full_1d: pd.DataFrame, tc: float,
                     return "#3fb950" if wr >= 55 else "#e3b341" if wr >= 45 else "#f85149"
                 def _fill_color(fr):
                     # Fill rate sensitivity: Aggressive zone ~100% always, so
-                    # green starts at 80% (where even Standard/Sniper becomes
-                    # credible); 50-80% = yellow ("half the signals fill, half
-                    # vanish — so reported WR is a lucky-subset stat"); <50% =
-                    # red (most signals never fill, selection bias severe).
+                    # green starts at 80% (where even Standard/Golden Fibo/
+                    # Sniper become credible); 50-80% = yellow ("half the
+                    # signals fill, half vanish — so reported WR is a lucky-
+                    # subset stat"); <50% = red (most signals never fill,
+                    # selection bias severe).
                     return "#3fb950" if fr >= 80 else "#e3b341" if fr >= 50 else "#f85149"
 
 
@@ -6099,9 +7432,10 @@ def render_auto_analyzer(ticker: str, df_full_1d: pd.DataFrame, tc: float,
 
                 # Zone → _etp field prefix mapping
                 _zone_etp = {
-                    "Aggressive": ("agg_entry",    "agg_sl",    "agg_tp1",    "agg_tp2",    "agg_tp3"),
-                    "Standard":   ("std_entry",    "std_sl",    "std_tp1",    "std_tp2",    "std_tp3"),
-                    "Sniper":     ("sniper_entry", "sniper_sl", "sniper_tp1", "sniper_tp2", "sniper_tp3"),
+                    "Aggressive":  ("agg_entry",    "agg_sl",    "agg_tp1",    "agg_tp2",    "agg_tp3"),
+                    "Standard":    ("std_entry",    "std_sl",    "std_tp1",    "std_tp2",    "std_tp3"),
+                    "Golden Fibo": ("golden_entry", "golden_sl", "golden_tp1", "golden_tp2", "golden_tp3"),
+                    "Sniper":      ("sniper_entry", "sniper_sl", "sniper_tp1", "sniper_tp2", "sniper_tp3"),
                 }
                 FIXED_SL_PCT = 0.015
 
@@ -6163,14 +7497,15 @@ def render_auto_analyzer(ticker: str, df_full_1d: pd.DataFrame, tc: float,
                     return ""
 
                 _zone_table_rows = ""
-                _zone_icons = {"Aggressive": "⚡", "Standard": "✅", "Sniper": "🎯"}
+                _zone_icons = {"Aggressive": "⚡", "Standard": "✅", "Golden Fibo": "🥇", "Sniper": "🎯"}
                 _zone_desc  = {
-                    "Aggressive": "Enter at candle close — highest fill chance",
-                    "Standard":   "Wait for 38.2% retrace into candle body",
-                    "Sniper":     "Wait for 61.8% Fibonacci retrace — best R:R",
+                    "Aggressive":  "Enter at candle close — highest fill chance",
+                    "Standard":    "Wait for 38.2% retrace into candle body",
+                    "Golden Fibo": "Wait for 61.8% golden ratio retrace — balanced R:R + fill",
+                    "Sniper":      "Wait for 78.6% Fib retrace — deepest pullback, lowest fill rate",
                 }
 
-                for _zn in ("Aggressive", "Standard", "Sniper"):
+                for _zn in ("Aggressive", "Standard", "Golden Fibo", "Sniper"):
                     _zd       = _zone_best.get(_zn, {})
                     _is_best_zone = _best_key and _zd.get("key", "") == _best_key
                     _border   = "border:1px solid #3fb950;" if _is_best_zone else "border:1px solid #30363d;"
@@ -6195,14 +7530,20 @@ def render_auto_analyzer(ticker: str, df_full_1d: pd.DataFrame, tc: float,
                     _structurally_invalid = False
                     if _zd.get("structurally_invalid"):
                         _structurally_invalid = True
-                    elif _zn == "Standard" and not _etp_card.get("std_valid", True):
+                    elif _zn == "Standard"    and not _etp_card.get("std_valid",    True):
                         _structurally_invalid = True
-                    elif _zn == "Sniper" and not _etp_card.get("sniper_valid", True):
+                    elif _zn == "Golden Fibo" and not _etp_card.get("golden_valid", True):
+                        _structurally_invalid = True
+                    elif _zn == "Sniper"      and not _etp_card.get("sniper_valid", True):
                         _structurally_invalid = True
 
                     if _structurally_invalid:
                         _sl_pct_conf = _etp_card.get("sl_dist_pct", 0)
-                        _fib_label   = "38.2%" if _zn == "Standard" else "61.8%"
+                        _fib_label   = (
+                            "38.2%" if _zn == "Standard"    else
+                            "61.8%" if _zn == "Golden Fibo" else
+                            "78.6%"  # Sniper
+                        )
                         _zone_table_rows += (
                             f'<div style="background:#1a0a0a;border:2px solid #6b2222;border-radius:6px;'
                             f'padding:10px 12px;margin-bottom:6px;">'
@@ -6349,9 +7690,11 @@ def render_auto_analyzer(ticker: str, df_full_1d: pd.DataFrame, tc: float,
                 # best_key somehow slipped through (e.g. cached from earlier run).
                 _best_zone_name = _best.get("zone", "Aggressive") if _best else "Aggressive"
                 _best_structurally_ok = True
-                if _best_zone_name == "Standard" and not _etp_card.get("std_valid", True):
+                if _best_zone_name == "Standard"    and not _etp_card.get("std_valid",    True):
                     _best_structurally_ok = False
-                elif _best_zone_name == "Sniper" and not _etp_card.get("sniper_valid", True):
+                elif _best_zone_name == "Golden Fibo" and not _etp_card.get("golden_valid", True):
+                    _best_structurally_ok = False
+                elif _best_zone_name == "Sniper"    and not _etp_card.get("sniper_valid", True):
                     _best_structurally_ok = False
 
                 if _best and _best_key and not _best_structurally_ok:
@@ -6364,9 +7707,11 @@ def render_auto_analyzer(ticker: str, df_full_1d: pd.DataFrame, tc: float,
                         if _fb_v.get("insufficient") or _fb_v.get("n", 0) < 4:
                             continue
                         _fb_zone = _fb_v.get("zone", "Aggressive")
-                        if _fb_zone == "Standard" and not _etp_card.get("std_valid", True):
+                        if _fb_zone == "Standard"    and not _etp_card.get("std_valid",    True):
                             continue
-                        if _fb_zone == "Sniper" and not _etp_card.get("sniper_valid", True):
+                        if _fb_zone == "Golden Fibo" and not _etp_card.get("golden_valid", True):
+                            continue
+                        if _fb_zone == "Sniper"      and not _etp_card.get("sniper_valid", True):
                             continue
                         _fallback_best_key = _fb_k
                         _fallback_best     = _fb_v
@@ -6495,9 +7840,9 @@ def render_auto_analyzer(ticker: str, df_full_1d: pd.DataFrame, tc: float,
 
                     # Fill rate: % of qualifying signals whose limit order was
                     # actually filled within 3 bars. Aggressive zones are
-                    # market-entry (always 100%), Standard/Sniper require a
-                    # retrace to the zone band and can fall far below 100%.
-                    # Low fill = the reported WR/EV only include the lucky
+                    # market-entry (always 100%), Standard/Golden Fibo/Sniper
+                    # require a retrace to the zone band and can fall far below
+                    # 100%. Low fill = the reported WR/EV only include the lucky
                     # filled subset — so a "great" Standard method that fills
                     # 30% of the time is materially different from one that
                     # fills 90%.
@@ -6599,7 +7944,8 @@ def render_auto_analyzer(ticker: str, df_full_1d: pd.DataFrame, tc: float,
                         # method's limit order even get filled within 3 bars?"
                         # Low fill = high selection bias in the WR/EV numbers
                         # (only the filled trades count). Aggressive zone =
-                        # usually 100% fill. Standard/Sniper can drop to 40-70%.
+                        # usually 100% fill. Standard/Golden Fibo/Sniper can
+                        # drop to 40-70% (Sniper at 0.786 is the lowest of all).
                         + f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr 1fr 1fr;gap:6px;margin-top:8px;'
                         f'padding-top:8px;border-top:1px solid #21262d;">'
                         f'<div><div style="color:#8892b0;font-size:9px;">All-time WR</div>'
@@ -7054,12 +8400,12 @@ def render_auto_analyzer(ticker: str, df_full_1d: pd.DataFrame, tc: float,
 
                 # ── Expanders for advanced details (collapsed by default) ─────
                 if _bt_valid:
-                    # Expander 1: Full 3-zone comparison (Aggressive/Standard/Sniper)
-                    with st.expander("▸ View Full 3-Zone Comparison  (Aggressive / Standard / Sniper)", expanded=False):
+                    # Expander 1: Full 4-zone comparison (Aggressive/Standard/Golden Fibo/Sniper)
+                    with st.expander("▸ View Full 4-Zone Comparison  (Aggressive / Standard / Golden Fibo / Sniper)", expanded=False):
                         _zone_expander_html = (
                             f'<div style="padding:6px 0;">'
                             f'<div style="color:#8892b0;font-size:11px;margin-bottom:8px;">'
-                            f'Best config found for each of the three entry zones, '
+                            f'Best config found for each of the four entry zones, '
                             f'plus the legacy "EXECUTE THIS" recommendation.</div>'
                             + _zone_table_rows
                             + _recommendation_html
@@ -7067,9 +8413,9 @@ def render_auto_analyzer(ticker: str, df_full_1d: pd.DataFrame, tc: float,
                         )
                         st.markdown(_zone_expander_html, unsafe_allow_html=True)
 
-                    # Expander 2: Full method breakdown (all 54 combinations)
+                    # Expander 2: Full method breakdown (all 96 combinations)
                     if _mgmt_table:
-                        with st.expander("▸ Full Method Breakdown  (all 54 combinations sorted by EVw)", expanded=False):
+                        with st.expander("▸ Full Method Breakdown  (all 96 combinations sorted by EVw)", expanded=False):
                             st.markdown(
                                 f'<div style="padding:6px 0;">'
                                 f'<div style="color:#8892b0;font-size:11px;margin-bottom:8px;">'
@@ -7114,7 +8460,13 @@ def render_auto_analyzer(ticker: str, df_full_1d: pd.DataFrame, tc: float,
             "Std_TP1":         _etp_dl.get("std_tp1",  ""),
             "Std_TP2":         _etp_dl.get("std_tp2",  ""),
             "Std_TP3":         _etp_dl.get("std_tp3",  ""),
-            # Sniper zone (61.8% retrace)
+            # Golden Fibo zone (61.8% retrace — Apr 25)
+            "Golden_Entry":    _etp_dl.get("golden_entry", ""),
+            "Golden_SL":       _etp_dl.get("golden_sl",   ""),
+            "Golden_TP1":      _etp_dl.get("golden_tp1",  ""),
+            "Golden_TP2":      _etp_dl.get("golden_tp2",  ""),
+            "Golden_TP3":      _etp_dl.get("golden_tp3",  ""),
+            # Sniper zone (78.6% retrace — Apr 25)
             "Sniper_Entry":    _etp_dl.get("sniper_entry", ""),
             "Sniper_SL":       _etp_dl.get("sniper_sl",   ""),
             "Sniper_TP1":      _etp_dl.get("sniper_tp1",  ""),
@@ -7649,6 +9001,7 @@ def _render_enhanced_trade_plan_html(sig: dict) -> str:
     _sl_pct       = _etp.get("sl_dist_pct", 1.5)
     _atr_pct      = _etp.get("atr_pct", 0)
     _std_valid    = _etp.get("std_valid",    True)
+    _golden_valid = _etp.get("golden_valid", True)
     _sniper_valid = _etp.get("sniper_valid", True)
     _bar_off      = sig.get("bar_offset", 1)
     _is_fresh     = _bar_off == 1
@@ -7660,19 +9013,20 @@ def _render_enhanced_trade_plan_html(sig: dict) -> str:
     if _is_fresh:
         _freshness_html = (
             "<span style='color:#3fb950;font-weight:700;'>🟢 FRESH — candle just closed.</span> "
-            "All three entry zones are valid. Prefer Standard or Sniper for better R:R."
+            "All four entry zones are valid. Prefer Standard, Golden Fibo or Sniper for better R:R."
         )
     else:
         _freshness_html = (
             f"<span style='color:#e3b341;font-weight:700;'>⚠️ Signal is {_bar_off-1} candle(s) old.</span> "
-            "Aggressive entry may already be missed. Use Standard or Sniper zone only, "
+            "Aggressive entry may already be missed. Use Standard, Golden Fibo or Sniper zone only, "
             "or skip if price is >1R away."
         )
 
     # Zone-validity warning
-    if not _std_valid or not _sniper_valid:
+    if not _std_valid or not _golden_valid or not _sniper_valid:
         _invalid_names = []
         if not _std_valid:    _invalid_names.append("Standard")
+        if not _golden_valid: _invalid_names.append("Golden Fibo")
         if not _sniper_valid: _invalid_names.append("Sniper")
         _freshness_html += (
             f" <span style='color:#ff6b6b;font-weight:700;'>⚠️ "
@@ -7709,13 +9063,40 @@ def _render_enhanced_trade_plan_html(sig: dict) -> str:
     </div>
   </div>"""
 
-    # Sniper zone HTML
+    # Golden Fibo zone HTML (Apr 25 — 61.8%)
+    if _golden_valid:
+        _golden_zone_html = f"""
+  <div style="background:#1a1208;border:1px solid #5a4015;border-radius:6px;padding:10px;">
+    <div style="color:#e3b341;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;">
+      🥇 Golden Fibo Entry (61.8%)</div>
+    <div style="color:#aab;font-size:10px;margin-bottom:8px;">Wait for 61.8% golden ratio retrace. Balanced R:R + fill rate.</div>
+    <div style="color:#8892b0;font-size:10px;">ENTRY</div>
+    <div style="color:#ccd6f6;font-weight:700;font-size:13px;">{_fmt(_etp.get('golden_entry'))}</div>
+    <div style="color:#8892b0;font-size:10px;margin-top:5px;">STOP LOSS</div>
+    <div style="color:#ff6b6b;font-weight:700;font-size:13px;">{_fmt(_etp.get('golden_sl'))}</div>
+    <div style="color:#8892b0;font-size:10px;margin-top:5px;">TP1 / TP2 / TP3</div>
+    <div style="color:#64ffda;font-size:12px;">{_fmt(_etp.get('golden_tp1'))} / {_fmt(_etp.get('golden_tp2'))} / {_fmt(_etp.get('golden_tp3'))}</div>
+  </div>"""
+    else:
+        _golden_zone_html = f"""
+  <div style="background:#1a0a0a;border:2px solid #6b2222;border-radius:6px;padding:10px;opacity:0.75;">
+    <div style="color:#ff6b6b;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;">
+      ❌ Golden Fibo Entry — UNAVAILABLE</div>
+    <div style="color:#cc8888;font-size:11px;line-height:1.4;">
+      Candle body is too large relative to the structural SL distance
+      ({_sl_pct_used:.1f}%). The 61.8% retrace zone falls at or beyond the
+      stop-loss level — entering here would mean your SL is already hit.
+      <br><br><strong style="color:#ffaa88;">Use Aggressive or Standard zone only.</strong>
+    </div>
+  </div>"""
+
+    # Sniper zone HTML (Apr 25 — moved to 78.6%)
     if _sniper_valid:
         _sniper_zone_html = f"""
   <div style="background:#14100a;border:1px solid #4a3a1a;border-radius:6px;padding:10px;">
     <div style="color:#e3b341;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;">
-      🎯 Sniper Entry (61.8%)</div>
-    <div style="color:#aab;font-size:10px;margin-bottom:8px;">Wait for 61.8% fib retrace. Best R:R, lower fill probability.</div>
+      🎯 Sniper Entry (78.6%)</div>
+    <div style="color:#aab;font-size:10px;margin-bottom:8px;">Wait for 78.6% Fib retrace. Best R:R, lowest fill probability.</div>
     <div style="color:#8892b0;font-size:10px;">ENTRY</div>
     <div style="color:#ccd6f6;font-weight:700;font-size:13px;">{_fmt(_etp.get('sniper_entry'))}</div>
     <div style="color:#8892b0;font-size:10px;margin-top:5px;">STOP LOSS</div>
@@ -7730,14 +9111,14 @@ def _render_enhanced_trade_plan_html(sig: dict) -> str:
       ❌ Sniper Entry — UNAVAILABLE</div>
     <div style="color:#cc8888;font-size:11px;line-height:1.4;">
       Candle body is too large relative to the structural SL distance
-      ({_sl_pct_used:.1f}%). The 61.8% retrace zone falls at or beyond the
+      ({_sl_pct_used:.1f}%). The 78.6% retrace zone falls at or beyond the
       stop-loss level — entering here would mean your SL is already hit.
-      <br><br><strong style="color:#ffaa88;">Use Aggressive zone only.</strong>
+      <br><br><strong style="color:#ffaa88;">Use Aggressive or Standard zone only.</strong>
     </div>
   </div>"""
 
     _zone_rows = f"""
-<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;margin:10px 0;">
+<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:6px;margin:10px 0;">
 
   <div style="background:#0a1628;border:1px solid #1f3a5f;border-radius:6px;padding:10px;">
     <div style="color:#8892b0;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;">
@@ -7752,6 +9133,8 @@ def _render_enhanced_trade_plan_html(sig: dict) -> str:
   </div>
 
   {_std_zone_html}
+
+  {_golden_zone_html}
 
   {_sniper_zone_html}
 
@@ -7809,7 +9192,7 @@ def _render_enhanced_trade_plan_html(sig: dict) -> str:
 
 def _render_method_breakdown_table(bt_result: dict) -> str:
     """
-    Build the 'Full Method Breakdown' table HTML — all 72 method combinations
+    Build the 'Full Method Breakdown' table HTML — all 96 method combinations
     sorted by EVw with the 👑 crown on the best. Used by both Scanner and
     Manual Analyzer.
 
@@ -8533,7 +9916,29 @@ def render_manual_analyzer_tab():
                  disabled=(_bt_key in st.session_state),
                  help="Runs 72 method combinations + purged WFO + Pulse (on-chain + derivatives). Takes ~10-30 sec."):
         with st.spinner("Backtesting 72 methods + WFO + Pulse..."):
-            _bt = _scanner_quick_backtest(sig)
+            # Detect CT vs trend: _qf_matches is absent in manual mode so we
+            # classify live against all known combos. If the top match is
+            # countertrend, run the CT backtest instead of the trend grid.
+            _manual_primary_for_bt = None
+            if _QFCOMBOS_OK:
+                _manual_matches = sig.get("_qf_matches")
+                if _manual_matches is None:
+                    try:
+                        _manual_matches = _qf_get_matching_combos(
+                            sig, list(_qfcombos.COMBOS_BY_NAME.keys()),
+                        )
+                    except Exception:
+                        _manual_matches = []
+                _manual_primary_for_bt = (_manual_matches or [None])[0]
+            _is_ct_manual = (
+                _manual_primary_for_bt is not None
+                and _manual_primary_for_bt.get("combo_type") == "countertrend"
+            )
+            if _is_ct_manual:
+                _bt = _scanner_countertrend_quick_backtest(
+                    sig, _manual_primary_for_bt)
+            else:
+                _bt = _scanner_quick_backtest(sig)
             _wfo = _scanner_mini_wfo(sig, _bt)
             # Pulse fetches alongside so on-chain confluence is visible pre-Step 2/3.
             # Historical candles still get fresh Pulse data — Pulse composites are
@@ -8561,6 +9966,24 @@ def render_manual_analyzer_tab():
             st.markdown(_m_pulse_html, unsafe_allow_html=True)
 
     # Show compact backtest summary
+    # Detect CT mode from stored meta (set by _scanner_countertrend_quick_backtest)
+    _is_ct_panel = bool(_bt.get("meta", {}).get("ct_combo"))
+    if _is_ct_panel:
+        _ct_combo_name = _bt["meta"]["ct_combo"]
+        _ct_trade_dir  = _bt["meta"].get("ct_trade_dir", "")
+        st.markdown(
+            f'<div style="background:#0f0a1a;border:1px solid #7c3aed;border-radius:6px;'
+            f'padding:8px 14px;margin-top:10px;margin-bottom:4px;">'
+            f'<div style="color:#a78bfa;font-size:11px;text-transform:uppercase;'
+            f'letter-spacing:1px;font-weight:700;">'
+            f'🔄 PER-COIN COUNTERTREND BACKTEST — {_ct_combo_name} '
+            f'({_ct_trade_dir.upper()} fade)</div>'
+            f'<div style="color:#8892b0;font-size:11px;margin-top:2px;">'
+            f'Simulates the OPPOSITE trade to the scanner signal. '
+            f'Plan pulled from combo primary (entry retrace, SL method, TP target).'
+            f'</div></div>',
+            unsafe_allow_html=True,
+        )
     _best = _bt.get("best", {}) or {}
     _best_key_disp = _bt.get("best_key", "—") or "—"
     _pf = _best.get("pf", 0)
