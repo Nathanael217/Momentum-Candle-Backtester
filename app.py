@@ -317,6 +317,677 @@ def _qf_format_ai_level_appendix(matches: list) -> str:
     lines.append("=== END CONFIDENCE LEVEL CONTEXT ===")
     return "\n".join(lines)
 
+# ─── "Why no matches?" diagnostic ────────────────────────────────────────────
+# Triggered automatically when combo-enabled scan produces zero matches.
+# Replaces the existing text-only st.warning when sufficient signal data is
+# available. Falls back to the text warning on any computation error.
+#
+# Sections:
+#   A  Universe stats (text)
+#   B  Body % distribution — Plotly horizontal bar, dead zone red, combo bands
+#   C  Vol multiple distribution — same treatment
+#   D  ADX distribution — 50+ bar red (hard cap)
+#   E  Top 3 actionable hints derived from the distributions
+#
+# Body scale: sig["body_pct"] is stored as 0-100 (e.g. 65.2 for 65.2%).
+# Combo criteria body_min/max are in 0-1 scale.  All histogram x-axes and
+# combo overlays are presented in 0-1 scale after dividing body_pct by 100.
+
+def _qf_zero_match_diagnostic(
+    raw_signals: list,
+    enabled_combos: list,
+    btc_regime: str,
+    allowed_levels: tuple,
+) -> bool:
+    """
+    Render the "📊 Why no matches?" diagnostic.
+
+    Parameters
+    ----------
+    raw_signals    : signals BEFORE combo filter (list of signal dicts)
+    enabled_combos : list of combo name strings the user ticked
+    btc_regime     : "BULL" | "BEAR" | "CHOP" | "UNKNOWN"
+    allowed_levels : e.g. ("STRICT",) or ("STRICT", "RELAXED")
+
+    Returns True if the diagnostic was rendered, False if it fell back to
+    the caller's text warning (data was insufficient or an exception occurred).
+    """
+    try:
+        import random as _random
+
+        n_raw = len(raw_signals)
+
+        # ── Sample if too large ────────────────────────────────────────────────
+        sigs = raw_signals
+        if n_raw > 1000:
+            sigs = _random.sample(raw_signals, 500)
+
+        # ── Extract metric arrays (body converted to 0-1 scale) ───────────────
+        bodies  = [abs(float(s.get("body_pct", 0) or 0)) / 100.0 for s in sigs]
+        vols    = [float(s.get("vol_mult", 0) or 0)               for s in sigs]
+        adxs    = [float(s.get("adx", 0) or 0)                    for s in sigs]
+
+        if not bodies:
+            return False   # no data → caller shows text warning
+
+        # ── Gather enabled combo STRICT criteria for overlays ─────────────────
+        # Also collect widened criteria per allowed_levels for "1-away" hint.
+        combo_crits: list[dict] = []   # {name, body_min, body_max, vol_min, vol_max, adx_min, adx_max}
+        if _QFCOMBOS_OK and _qfcombos is not None:
+            for combo in _qfcombos.COMBOS:
+                if combo["name"] not in enabled_combos:
+                    continue
+                # STRICT criteria for overlay bands
+                crit_strict = dict(combo["criteria"])
+                # Widest allowed criteria for "1-away" proximity check
+                crit_wide = _qf_widen_criteria(combo, allowed_levels[-1])
+                combo_crits.append({
+                    "name":        combo["name"],
+                    "type":        combo.get("combo_type", "trend_following"),
+                    "body_min":    float(crit_strict.get("body_min", 0)),
+                    "body_max":    float(crit_strict.get("body_max", 1)),
+                    "vol_min":     float(crit_strict.get("vol_min", 0)),
+                    "vol_max":     float(crit_strict.get("vol_max", 99)),
+                    "adx_min":     float(crit_strict.get("adx_min", 0)),
+                    "adx_max":     float(crit_strict.get("adx_max", 999)),
+                    # Widened bounds for proximity hint
+                    "body_min_w":  float(crit_wide.get("body_min", 0)),
+                    "body_max_w":  float(crit_wide.get("body_max", 1)),
+                    "vol_min_w":   float(crit_wide.get("vol_min", 0)),
+                    "vol_max_w":   float(crit_wide.get("vol_max", 99)),
+                    "adx_min_w":   float(crit_wide.get("adx_min", 0)),
+                    "adx_max_w":   float(crit_wide.get("adx_max", 999)),
+                })
+
+        # ── Section A: Universe stats ─────────────────────────────────────────
+        med_body = float(np.median(bodies))
+        med_vol  = float(np.median(vols))
+        med_adx  = float(np.median(adxs))
+        n_a_combos = sum(1 for c in enabled_combos if c.endswith("-A"))
+
+        st.markdown(
+            '<div style="background:#161b22;border:1px solid #f85149;'
+            'border-radius:8px;padding:12px 16px;margin:8px 0;">'
+            '<b style="color:#f85149;font-size:14px;">📊 Why no matches?</b>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+        _level_summary = (
+            "STRICT only" if allowed_levels == ("STRICT",)
+            else "STRICT + RELAXED" if allowed_levels == ("STRICT", "RELAXED")
+            else "STRICT + RELAXED + LOOSE"
+        )
+
+        st.markdown(
+            f'**Section A — Universe ({n_raw} raw signals before combo filter)**\n\n'
+            f'- Combos active: **{", ".join(enabled_combos)}** at scope **{_level_summary}**\n'
+            f'- Median body: **{med_body:.2f}** ({med_body*100:.1f}% of range) '
+            f'· Median vol mult: **{med_vol:.2f}×** · Median ADX: **{med_adx:.1f}**\n'
+            f'- BTC regime: **{btc_regime}** · '
+            f'{n_a_combos} regime-aligned (-A) combo(s) enabled'
+            + (' — **cannot classify if regime = UNKNOWN**' if btc_regime == "UNKNOWN" and n_a_combos else '')
+        )
+
+        # ── Section B: Body % distribution ───────────────────────────────────
+        _body_edges = [0.0, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.01]
+        _body_labels = ["<0.40", "0.40-0.50", "0.50-0.60",
+                        "0.60-0.70\n(DEAD ZONE)", "0.70-0.80",
+                        "0.80-0.90", "0.90-1.00"]
+        _body_counts = [0] * len(_body_labels)
+        for b in bodies:
+            for i in range(len(_body_edges) - 1):
+                if _body_edges[i] <= b < _body_edges[i + 1]:
+                    _body_counts[i] += 1
+                    break
+
+        _body_colors = [
+            "#f85149" if "DEAD" in lbl else "#58a6ff"
+            for lbl in _body_labels
+        ]
+
+        fig_body = go.Figure()
+        fig_body.add_trace(go.Bar(
+            x=_body_counts,
+            y=_body_labels,
+            orientation="h",
+            marker_color=_body_colors,
+            name="Signals",
+            text=[str(c) if c else "" for c in _body_counts],
+            textposition="auto",
+        ))
+
+        # Overlay combo body bands as vertical shapes on the 0-1 x-axis
+        # The bar chart x-axis is signal COUNT; we can't overlay a separate
+        # axis directly. Instead, annotate with text labels on the bars.
+        # For the body chart we add a second trace showing "combo target" bins.
+        if combo_crits:
+            _band_labels = []
+            for cc in combo_crits:
+                blo, bhi = cc["body_min"], cc["body_max"]
+                # Find which bins the combo's body range covers
+                for i in range(len(_body_edges) - 1):
+                    bin_lo = _body_edges[i]
+                    bin_hi = _body_edges[i + 1]
+                    overlap_lo = max(blo, bin_lo)
+                    overlap_hi = min(bhi, bin_hi)
+                    if overlap_hi > overlap_lo + 1e-6:
+                        _band_labels.append(
+                            f'{cc["name"]} target: {blo:.2f}-{bhi:.2f}'
+                        )
+            if _band_labels:
+                # Deduplicate
+                _band_labels = list(dict.fromkeys(_band_labels))
+                fig_body.add_annotation(
+                    text="<b>Combo targets:</b><br>" + "<br>".join(_band_labels),
+                    xref="paper", yref="paper",
+                    x=1.0, y=0.0, xanchor="right", yanchor="bottom",
+                    showarrow=False,
+                    font=dict(size=10, color="#34d399"),
+                    bgcolor="#0d2818", bordercolor="#238636",
+                    borderwidth=1, borderpad=4,
+                )
+
+        fig_body.update_layout(
+            title=dict(text="Body % — your signals vs combo bands", font=dict(size=13)),
+            xaxis_title="Signal count",
+            yaxis_title="Body % bin",
+            height=320,
+            margin=dict(l=10, r=10, t=40, b=10),
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            font=dict(color="#ccd6f6", size=11),
+            showlegend=False,
+        )
+        fig_body.update_xaxes(gridcolor="#21262d")
+        fig_body.update_yaxes(gridcolor="#21262d")
+        st.markdown("**Section B — Body % distribution**")
+        st.plotly_chart(fig_body, use_container_width=True)
+
+        # ── Section C: Vol multiple distribution ──────────────────────────────
+        _vol_edges  = [0.0, 1.2, 1.5, 2.0, 3.0, 5.0, 8.0, 1e9]
+        _vol_labels = ["<1.2", "1.2-1.5", "1.5-2.0", "2.0-3.0",
+                       "3.0-5.0", "5.0-8.0", "8.0+"]
+        _vol_counts = [0] * len(_vol_labels)
+        for v in vols:
+            for i in range(len(_vol_edges) - 1):
+                if _vol_edges[i] <= v < _vol_edges[i + 1]:
+                    _vol_counts[i] += 1
+                    break
+
+        fig_vol = go.Figure()
+        fig_vol.add_trace(go.Bar(
+            x=_vol_counts,
+            y=_vol_labels,
+            orientation="h",
+            marker_color="#58a6ff",
+            name="Signals",
+            text=[str(c) if c else "" for c in _vol_counts],
+            textposition="auto",
+        ))
+
+        if combo_crits:
+            _vol_band_strs = []
+            for cc in combo_crits:
+                _vol_band_strs.append(
+                    f'{cc["name"]}: {cc["vol_min"]:.1f}-'
+                    + (f'{cc["vol_max"]:.1f}×' if cc["vol_max"] < 50 else "∞×")
+                )
+            if _vol_band_strs:
+                fig_vol.add_annotation(
+                    text="<b>Combo vol bands:</b><br>" + "<br>".join(_vol_band_strs),
+                    xref="paper", yref="paper",
+                    x=1.0, y=0.0, xanchor="right", yanchor="bottom",
+                    showarrow=False,
+                    font=dict(size=10, color="#34d399"),
+                    bgcolor="#0d2818", bordercolor="#238636",
+                    borderwidth=1, borderpad=4,
+                )
+
+        fig_vol.update_layout(
+            title=dict(text="Vol multiple — your signals vs combo bands", font=dict(size=13)),
+            xaxis_title="Signal count",
+            yaxis_title="Vol × bin",
+            height=300,
+            margin=dict(l=10, r=10, t=40, b=10),
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            font=dict(color="#ccd6f6", size=11),
+            showlegend=False,
+        )
+        fig_vol.update_xaxes(gridcolor="#21262d")
+        fig_vol.update_yaxes(gridcolor="#21262d")
+        st.markdown("**Section C — Vol multiple distribution**")
+        st.plotly_chart(fig_vol, use_container_width=True)
+
+        # ── Section D: ADX distribution ───────────────────────────────────────
+        _adx_edges  = [0.0, 25.0, 30.0, 40.0, 50.0, 1e9]
+        _adx_labels = ["<25", "25-30", "30-40", "40-50", "50+ (HARD CAP)"]
+        _adx_counts = [0] * len(_adx_labels)
+        for a in adxs:
+            for i in range(len(_adx_edges) - 1):
+                if _adx_edges[i] <= a < _adx_edges[i + 1]:
+                    _adx_counts[i] += 1
+                    break
+
+        _adx_colors = [
+            "#f85149" if "CAP" in lbl else "#58a6ff"
+            for lbl in _adx_labels
+        ]
+
+        fig_adx = go.Figure()
+        fig_adx.add_trace(go.Bar(
+            x=_adx_counts,
+            y=_adx_labels,
+            orientation="h",
+            marker_color=_adx_colors,
+            name="Signals",
+            text=[str(c) if c else "" for c in _adx_counts],
+            textposition="auto",
+        ))
+        fig_adx.update_layout(
+            title=dict(text="ADX — your signals vs combo band (30-50)", font=dict(size=13)),
+            xaxis_title="Signal count",
+            yaxis_title="ADX bin",
+            height=260,
+            margin=dict(l=10, r=10, t=40, b=10),
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            font=dict(color="#ccd6f6", size=11),
+            showlegend=False,
+        )
+        fig_adx.update_xaxes(gridcolor="#21262d")
+        fig_adx.update_yaxes(gridcolor="#21262d")
+        st.markdown("**Section D — ADX distribution**")
+        st.plotly_chart(fig_adx, use_container_width=True)
+
+        # ── Section E: Actionable hints ───────────────────────────────────────
+        hints: list[str] = []
+
+        # Hint 1: dead-zone dominance
+        _dead_zone_idx = 3   # index of "0.60-0.70 (DEAD ZONE)" bin
+        _dead_count = _body_counts[_dead_zone_idx]
+        if n_raw > 0 and (_dead_count / max(n_raw, 1)) > 0.40:
+            hints.append(
+                "⚠️ **Most of your signals are in the body 0.60-0.70 dead zone** "
+                f"({_dead_count}/{n_raw} = {_dead_count*100//n_raw}%). "
+                "This is a market regime issue — no clean impulse candles forming "
+                "across the universe right now, not a combo configuration issue. "
+                "Consider waiting for a cleaner trending session or switching scanner profile."
+            )
+
+        # Hint 2: universe too quiet
+        if n_raw < 5:
+            hints.append(
+                f"⚠️ **Universe is too quiet (only {n_raw} raw signals)**. "
+                "Lower the Min vol × slider or expand the timeframe set to pull in more candidates."
+            )
+
+        # Hint 3: combo "1 criterion away" proximity
+        if combo_crits and n_raw >= 5 and len(hints) < 3:
+            for cc in combo_crits:
+                # Count signals that fail body ONLY (pass vol and adx at widened level)
+                # body check uses 0-1 scale; combo body_min_w/body_max_w also 0-1
+                _body_close_count = 0
+                for s in raw_signals:
+                    b01 = abs(float(s.get("body_pct", 0) or 0)) / 100.0
+                    v   = float(s.get("vol_mult", 0) or 0)
+                    a   = float(s.get("adx", 0) or 0)
+                    # Check: passes vol+adx at widened level, but body is outside
+                    # strict range yet within 0.05 of the strict boundary
+                    vol_ok_w = cc["vol_min_w"] <= v < cc["vol_max_w"]
+                    adx_ok_w = cc["adx_min_w"] <= a < cc["adx_max_w"]
+                    body_strict_fail = not (cc["body_min"] <= b01 < cc["body_max"])
+                    # Body "close": within 0.05 of either boundary
+                    body_close = (
+                        abs(b01 - cc["body_min"]) <= 0.05
+                        or abs(b01 - cc["body_max"]) <= 0.05
+                    )
+                    if vol_ok_w and adx_ok_w and body_strict_fail and body_close:
+                        _body_close_count += 1
+                if _body_close_count >= 10:
+                    hints.append(
+                        f"💡 **{cc['name']} is 1 body criterion away for "
+                        f"{_body_close_count} signal(s)**: they pass vol + ADX at "
+                        f"the widened level but sit just outside the strict body band "
+                        f"({cc['body_min']:.2f}-{cc['body_max']:.2f}). "
+                        f"Try enabling **RELAXED** level (body ±0.03 widening, 0.75× sizing)."
+                    )
+                    break   # one proximity hint is enough
+
+        # Hint 4: BTC regime failure blocks -A combos
+        if btc_regime == "UNKNOWN" and n_a_combos and len(hints) < 3:
+            hints.append(
+                f"⚠️ **BTC regime fetch failed** (UNKNOWN) — "
+                f"{n_a_combos} regime-aligned (-A) combo(s) can't classify. "
+                "Use -N variants (no regime filter) or check Binance API connectivity."
+            )
+
+        # Level widening suggestion — only if no more specific hints filled all 3 slots
+        if len(hints) < 3:
+            if allowed_levels == ("STRICT",):
+                hints.append(
+                    "💡 Currently on **STRICT only**. If zero setups persist across "
+                    "multiple days, switch the Confidence level to "
+                    "**STRICT + RELAXED** (body ±0.03, 0.75× sizing) or "
+                    "**+ LOOSE** (body ±0.05, 0.50× sizing). "
+                    "Hard caps (0.60-0.70 dead zone, ADX > 50, CT body floor 0.78) "
+                    "remain enforced at every level."
+                )
+            elif allowed_levels == ("STRICT", "RELAXED"):
+                hints.append(
+                    "💡 On **STRICT + RELAXED**. For more candidates try "
+                    "**STRICT + RELAXED + LOOSE** (0.50× sizing). "
+                    "If even LOOSE yields nothing the hard caps are binding — "
+                    "no audit-safe setup exists right now."
+                )
+            else:
+                hints.append(
+                    "ℹ️ All confidence levels active. The body 0.60-0.70 dead zone "
+                    "and ADX > 50 hard caps are likely binding — no audit-safe "
+                    "setup matches the ticked combos in today's market."
+                )
+
+        st.markdown("**Section E — Actionable hints**")
+        for h in hints[:3]:
+            st.info(h)
+
+        return True
+
+    except Exception:   # noqa: BLE001
+        # Computation error — signal caller to show original text warning
+        return False
+
+
+# ─── Decision Matrix — synthesises all source verdicts into one panel ─────────
+
+def _dm_verdict_cell(verdict: str) -> str:
+    """
+    Colour-coded verdict badge for the decision matrix table.
+    PASS/TRADE/ALIGNED → green  |  FAIL/NO TRADE/FIGHTING → red
+    WAIT/MIXED/MARGINAL/NEUTRAL → yellow  |  anything else → grey.
+    """
+    v = (verdict or "").upper()
+    if v in ("PASS", "TRADE", "ALIGNED"):
+        bg, fg = "#0d2818", "#34d399"
+    elif v in ("FAIL", "NO TRADE", "FIGHTING"):
+        bg, fg = "#3f1d1d", "#f85149"
+    elif v in ("WAIT", "MIXED", "MARGINAL", "NEUTRAL"):
+        bg, fg = "#3a2e0d", "#fbbf24"
+    else:
+        bg, fg = "#161b22", "#8892b0"
+    return (
+        f'<span style="display:inline-block;background:{bg};color:{fg};'
+        f'padding:2px 8px;border-radius:10px;font-size:11px;font-weight:700;'
+        f'letter-spacing:0.4px;">{v}</span>'
+    )
+
+
+def _dm_conf_cell(conf_str: str) -> str:
+    """
+    Format a confidence value (string or int) for the matrix.
+    HIGH → green  |  MEDIUM → yellow  |  LOW / n<5 → orange  |  numeric → plain.
+    """
+    if conf_str is None or conf_str == "":
+        return '<span style="color:#8892b0;">—</span>'
+    s = str(conf_str).upper().strip()
+    if s == "HIGH":
+        return '<span style="color:#34d399;font-weight:700;">HIGH</span>'
+    if s == "MEDIUM":
+        return '<span style="color:#fbbf24;font-weight:700;">MEDIUM</span>'
+    if s == "LOW":
+        return '<span style="color:#fb923c;font-weight:700;">LOW</span>'
+    return f'<span style="color:#ccd6f6;">{conf_str}</span>'
+
+
+def _render_decision_matrix_html(
+    sig: dict,
+    ai_res: dict,
+    ml_a: dict,
+    ml_b: dict,
+    bt_res: dict,
+) -> str:
+    """
+    Render the Decision Matrix panel as an HTML table.
+
+    Synthesises five information sources for the scanner card into one
+    compact table (Source · Verdict · Confidence · Note) plus a single
+    synthesised verdict line below it.  Sources whose data is not yet
+    available are silently skipped — the panel remains useful even after
+    only Step 1 (backtest) or before any step has been run.
+
+    Parameters
+    ----------
+    sig     : the signal dict (always present)
+    ai_res  : cached AI result dict from session_state, or None
+    ml_a    : cached ML candidate-A dict from session_state, or None
+    ml_b    : cached ML candidate-B dict from session_state, or None
+    bt_res  : cached backtest result dict from session_state, or None
+
+    Returns
+    -------
+    HTML string suitable for st.markdown(unsafe_allow_html=True).
+    Empty string when there is literally nothing to show (no matches, no
+    cached data, no regime verdict) — caller should guard on truthiness.
+    """
+
+    rows = []           # list of (source, verdict_str, conf_str, note_str)
+    pass_count = 0
+    fail_count = 0
+    combo_fail = False
+    ai_no_trade = False
+
+    # ── 1. Combo match ────────────────────────────────────────────────────────
+    _qf_matches = sig.get("_qf_matches")   # None → combos not active this run
+    if _qf_matches is not None:
+        # _qf_matches is always a list (may be empty when no combo was ticked
+        # or none matched).  Empty list = FAIL; non-empty = PASS.
+        if _qf_matches:
+            primary  = _qf_matches[0]
+            c_level  = primary.get("_matched_level", "STRICT")
+            c_name   = primary.get("name", "?")
+            c_tier   = primary.get("tier", "?")
+            verdict  = "PASS"
+            conf_val = _qf_level_badge_html(c_level)   # coloured badge inline
+            note     = f"{c_name} · Tier {c_tier}"
+            pass_count += 1
+        else:
+            verdict  = "FAIL"
+            conf_val = "—"
+            note     = "No combo matched"
+            fail_count += 1
+            combo_fail = True
+        rows.append(("🎯 Combo match", verdict, conf_val, note))
+
+    # ── 2. AI verdict ─────────────────────────────────────────────────────────
+    # Only shown when AI result is present in session_state (never trigger a
+    # new API call here — expensive and breaks the "cached only" rule).
+    if ai_res:
+        # Normalise legacy single-candidate format to dual format
+        if not ai_res.get("dual"):
+            ai_res = {
+                "dual": True,
+                "candidate_a": {
+                    "verdict":    ai_res.get("verdict",    "WAIT"),
+                    "confidence": ai_res.get("confidence", "MEDIUM"),
+                    "rationale":  ai_res.get("rationale",  ""),
+                },
+                "candidate_b": None,
+                "winner": "A",
+            }
+        _winner  = ai_res.get("winner", "A") or "A"
+        _cA      = ai_res.get("candidate_a") or {}
+        _cB      = ai_res.get("candidate_b") or {}
+        # Pick the winner candidate; fall back to A
+        _win_cand = _cA if (_winner in ("A", "NONE") or not _cB) else _cB
+        _ai_v    = (_win_cand.get("verdict") or "WAIT").upper()
+        _ai_c    = (_win_cand.get("confidence") or "MEDIUM").upper()
+        # Trim rationale to one line ≤ 80 chars
+        _rat     = (_win_cand.get("rationale") or "").split("\n")[0][:80]
+        # Map confidence label to numeric if possible
+        _conf_display = _ai_c  # HIGH / MEDIUM / LOW — _dm_conf_cell handles colouring
+        if _ai_v == "TRADE":
+            pass_count += 1
+        elif _ai_v == "NO TRADE":
+            fail_count += 1
+            ai_no_trade = True
+        # WAIT counts as neither pass nor fail — intentionally neutral
+        rows.append(("🤖 AI verdict", _ai_v, _conf_display, _rat or "—"))
+
+    # ── 3. ML ensemble ────────────────────────────────────────────────────────
+    if ml_a or ml_b:
+        _a_pct = float(ml_a.get("pct", 0)) if ml_a else None
+        _b_pct = float(ml_b.get("pct", 0)) if ml_b else None
+        _both  = _a_pct is not None and _b_pct is not None
+        _mean  = (
+            (_a_pct + _b_pct) / 2.0 if _both
+            else (_a_pct if _a_pct is not None else _b_pct)
+        )
+        # Verdict: TRADE only when all available models say ≥ 55 %
+        _avail_pcts = [p for p in (_a_pct, _b_pct) if p is not None]
+        if all(p >= 55 for p in _avail_pcts):
+            ml_v = "TRADE"
+            pass_count += 1
+        elif all(p < 45 for p in _avail_pcts):
+            ml_v = "FAIL"
+            fail_count += 1
+        else:
+            ml_v = "MIXED"
+        note_parts = []
+        if _a_pct is not None:
+            note_parts.append(f"A: {_a_pct:.0f}%")
+        if _b_pct is not None:
+            note_parts.append(f"B: {_b_pct:.0f}%")
+        rows.append(("🧠 ML ensemble", ml_v, f"{_mean:.0f}%", " · ".join(note_parts)))
+
+    # ── 4. Per-coin backtest ──────────────────────────────────────────────────
+    if bt_res and not bt_res.get("error") and not bt_res.get("insufficient"):
+        _best = bt_res.get("best") or {}
+        _pf   = float(_best.get("pf",     0))
+        _mr   = float(_best.get("mean_r", 0))
+        _n    = int(_best.get("n",        0))
+        if _n > 0:
+            if _pf > 1.20 and _mr > 0.05:
+                bt_v = "PASS"
+                pass_count += 1
+            elif _pf < 1.0 or _mr <= 0:
+                bt_v = "FAIL"
+                fail_count += 1
+            else:
+                bt_v = "MARGINAL"
+            # n > 20 = HIGH confidence, 10-20 = MEDIUM, < 10 = LOW
+            _bt_conf = "HIGH" if _n >= 20 else ("MEDIUM" if _n >= 10 else "LOW")
+            _pf_s = "∞" if _pf >= 9.9 else f"{_pf:.2f}"
+            rows.append(("📊 Backtest", bt_v, _bt_conf, f"PF {_pf_s} · n={_n}"))
+
+    # ── 5. Macro / regime ─────────────────────────────────────────────────────
+    _reg    = sig.get("regime", "")          # GREEN / YELLOW / RED
+    _rscore = sig.get("regime_score", 0)
+    _btcr   = sig.get("_qf_btc_regime", "") # BULL / BEAR / CHOP
+    _dir    = sig.get("direction", "")
+    if _reg:
+        _btc_aligns = (
+            (_dir == "long"  and _btcr == "BULL") or
+            (_dir == "short" and _btcr == "BEAR") or
+            (_btcr == "CHOP")   # chop = neutral, not fighting
+        )
+        _btc_fights = (
+            (_dir == "long"  and _btcr == "BEAR") or
+            (_dir == "short" and _btcr == "BULL")
+        )
+        if _reg == "RED" or _btc_fights:
+            macro_v = "FIGHTING"
+            fail_count += 1
+        elif _reg == "GREEN" and _btc_aligns:
+            macro_v = "ALIGNED"
+            pass_count += 1
+        else:
+            macro_v = "NEUTRAL"
+        _mac_conf = "HIGH" if _rscore >= 70 else ("MEDIUM" if _rscore >= 40 else "LOW")
+        _mac_note = f"{_reg}" + (f" · BTC {_btcr}" if _btcr else "")
+        rows.append(("🌐 Macro/regime", macro_v, _mac_conf, _mac_note))
+
+    # ── Nothing to show yet ────────────────────────────────────────────────────
+    if not rows:
+        return ""
+
+    # ── Synthesised verdict ───────────────────────────────────────────────────
+    if combo_fail or ai_no_trade or fail_count >= 2:
+        synth_icon  = "🔴"
+        synth_label = "SKIP"
+        synth_color = "#f85149"
+        synth_bg    = "#3f1d1d"
+        synth_note  = (
+            "Combo FAIL" if combo_fail else
+            ("AI says NO TRADE" if ai_no_trade else
+             f"{fail_count} sources FAIL")
+        )
+    elif pass_count >= 3 and fail_count == 0:
+        synth_icon  = "🟢"
+        synth_label = "STRONG " + ("BUY" if _dir == "long" else "SELL")
+        synth_color = "#34d399"
+        synth_bg    = "#0d2818"
+        synth_note  = f"{pass_count} sources PASS, {fail_count} FAIL"
+    else:
+        synth_icon  = "🟡"
+        synth_label = "MARGINAL"
+        synth_color = "#fbbf24"
+        synth_bg    = "#3a2e0d"
+        synth_note  = f"{pass_count} PASS · {fail_count} FAIL — review details"
+
+    # ── Build HTML ────────────────────────────────────────────────────────────
+    _row_html = ""
+    for src, vrd, cof, nte in rows:
+        _row_html += (
+            f'<tr style="border-bottom:1px solid #21262d;">'
+            f'<td style="padding:5px 8px;color:#8892b0;font-size:11px;'
+            f'white-space:nowrap;">{src}</td>'
+            f'<td style="padding:5px 8px;">{_dm_verdict_cell(vrd)}</td>'
+            f'<td style="padding:5px 8px;font-size:11px;">{_dm_conf_cell(cof) if cof not in ("HIGH","MEDIUM","LOW","—","") else _dm_conf_cell(cof)}</td>'
+            f'<td style="padding:5px 8px;color:#8892b0;font-size:11px;'
+            f'max-width:220px;overflow:hidden;text-overflow:ellipsis;'
+            f'white-space:nowrap;" title="{nte}">{nte}</td>'
+            f'</tr>'
+        )
+
+    html = (
+        f'<div style="background:#161b22;border:1px solid #30363d;'
+        f'border-radius:6px;margin-bottom:10px;overflow:hidden;">'
+        # Panel header
+        f'<div style="background:#0d1117;padding:5px 10px;font-size:11px;'
+        f'font-weight:700;color:#8892b0;letter-spacing:0.8px;'
+        f'text-transform:uppercase;border-bottom:1px solid #21262d;">'
+        f'⚖ Decision Matrix</div>'
+        # Table
+        f'<table style="width:100%;border-collapse:collapse;">'
+        f'<thead><tr style="background:#0d1117;">'
+        f'<th style="padding:4px 8px;text-align:left;font-size:10px;'
+        f'color:#6e7681;font-weight:600;text-transform:uppercase;'
+        f'letter-spacing:0.6px;">Source</th>'
+        f'<th style="padding:4px 8px;text-align:left;font-size:10px;'
+        f'color:#6e7681;font-weight:600;text-transform:uppercase;'
+        f'letter-spacing:0.6px;">Verdict</th>'
+        f'<th style="padding:4px 8px;text-align:left;font-size:10px;'
+        f'color:#6e7681;font-weight:600;text-transform:uppercase;'
+        f'letter-spacing:0.6px;">Confidence</th>'
+        f'<th style="padding:4px 8px;text-align:left;font-size:10px;'
+        f'color:#6e7681;font-weight:600;text-transform:uppercase;'
+        f'letter-spacing:0.6px;">Note</th>'
+        f'</tr></thead>'
+        f'<tbody>{_row_html}</tbody>'
+        f'</table>'
+        # Synthesised verdict line
+        f'<div style="background:{synth_bg};padding:7px 10px;'
+        f'border-top:1px solid #30363d;font-size:12px;">'
+        f'{synth_icon} <b style="color:{synth_color};">{synth_label}</b>'
+        f' &nbsp;<span style="color:#8892b0;">{synth_note}'
+        f' &nbsp;—&nbsp; descriptive only, trader decides</span>'
+        f'</div>'
+        f'</div>'
+    )
+    return html
+
+
 # ─── sklearn (optional — falls back to heuristic if missing) ──────────────────
 try:
     from sklearn.linear_model    import LogisticRegression
@@ -5416,6 +6087,151 @@ def _scanner_setup_grade(sig: dict, ml: dict, bt: dict) -> tuple:
     return "C", "#f85149", "Weak — wait for better conditions"
 
 
+# ============================================================================
+# QUANTFLOW TRADE JOURNAL — Piece 1: persistence helpers
+# ============================================================================
+# Design rules (from spec):
+#   - All disk I/O funnels through _qf_journal_persist() — never open() elsewhere.
+#   - Fail closed: surface errors to the user; never silently swallow data.
+#   - CSV path is always relative ("./quantflow_journal.csv") — no absolute paths.
+#   - Session-state write-lock prevents double-write on rapid button clicks.
+#
+# Columns:
+#   ts_utc, symbol, tf, direction, body_pct, vol_mult, adx,
+#   combo_name, matched_level, size_factor, pf_haircut,
+#   ai_verdict, ml_verdict, decision, entry_price, sl_price,
+#   tp_price, risk_pct, outcome, outcome_ts, realized_r, notes
+# ============================================================================
+
+_QF_JOURNAL_CSV  = "./quantflow_journal.csv"
+_QF_JOURNAL_COLS = [
+    "ts_utc", "symbol", "tf", "direction", "body_pct", "vol_mult", "adx",
+    "combo_name", "matched_level", "size_factor", "pf_haircut",
+    "ai_verdict", "ml_verdict", "decision", "entry_price", "sl_price",
+    "tp_price", "risk_pct", "outcome", "outcome_ts", "realized_r", "notes",
+]
+# Level → assumed audit PF haircut (mirrors _QF_LEVEL_SETTINGS)
+_QF_ASSUMED_HAIRCUT = {"STRICT": 1.00, "RELAXED": 0.92, "LOOSE": 0.80}
+
+
+def _qf_journal_persist(rows: list) -> None:
+    """
+    Write `rows` (list of dicts) to the journal CSV.
+
+    Called for BOTH append (new trade capture) and full-rewrite (outcome save).
+    Always writes the canonical column order defined in _QF_JOURNAL_COLS.
+    Raises on any I/O failure — caller is responsible for surfacing to user.
+    Fail closed: no silent swallowing.
+    """
+    df_new = pd.DataFrame(rows, columns=_QF_JOURNAL_COLS)
+    # Ensure all required columns exist; fill any gaps with ""
+    for col in _QF_JOURNAL_COLS:
+        if col not in df_new.columns:
+            df_new[col] = ""
+    df_new = df_new[_QF_JOURNAL_COLS]  # enforce column order
+    df_new.to_csv(_QF_JOURNAL_CSV, index=False)
+
+
+def _qf_journal_load() -> list:
+    """
+    Load the journal CSV and return a list of row dicts.
+
+    Returns [] if the file does not yet exist (first run).
+    Raises on corrupted/unreadable files so the caller can warn the user.
+    """
+    import os
+    if not os.path.isfile(_QF_JOURNAL_CSV):
+        return []
+    df = pd.read_csv(_QF_JOURNAL_CSV, dtype=str).fillna("")
+    # Back-compat: add any missing columns introduced after initial creation
+    for col in _QF_JOURNAL_COLS:
+        if col not in df.columns:
+            df[col] = ""
+    return df[_QF_JOURNAL_COLS].to_dict("records")
+
+
+def _qf_journal_capture(sig: dict, decision: str, plan: dict) -> None:
+    """
+    Piece 1 — Append one journal row for a trade decision.
+
+    Parameters
+    ----------
+    sig      : the scanner signal dict (always present)
+    decision : one of "TAKE" | "SKIP" | "PAPER"
+    plan     : {entry_price, sl_price, tp_price, risk_pct}
+
+    The outcome / outcome_ts / realized_r / notes fields start blank —
+    they're filled in by the journal expander (Piece 3).
+
+    Uses a session-state write-lock counter (_qf_journal_lock) so rapid
+    double-clicks cannot race into two simultaneous appends.
+    """
+    # Write-lock: increment; if already > 0 when we enter, bail
+    lock_key = "_qf_journal_lock"
+    if st.session_state.get(lock_key, 0) > 0:
+        return
+    st.session_state[lock_key] = st.session_state.get(lock_key, 0) + 1
+    try:
+        # Extract combo metadata from the primary match (first in sorted list)
+        _qf_matches  = sig.get("_qf_matches") or []
+        _primary     = _qf_matches[0] if _qf_matches else {}
+        combo_name    = _primary.get("name", "")
+        matched_level = _primary.get("_matched_level", "")
+        size_factor   = _primary.get("_size_factor", "")
+        pf_haircut    = _primary.get("_pf_haircut", "")
+
+        # AI verdict: winner candidate's verdict from the dual-candidate result
+        _ai_res   = st.session_state.get(
+            f"ai_result_{sig['symbol']}_{sig['timeframe']}_{sig['direction']}", {}) or {}
+        if _ai_res.get("dual"):
+            _winner   = _ai_res.get("winner", "A") or "A"
+            _cA       = _ai_res.get("candidate_a") or {}
+            _cB       = _ai_res.get("candidate_b") or {}
+            _win_cand = _cA if (_winner in ("A", "NONE") or not _cB) else _cB
+            ai_verdict = (_win_cand.get("verdict") or "").upper()
+        else:
+            ai_verdict = (_ai_res.get("verdict") or "").upper()
+
+        # ML verdict: primary ML result (prefer candidate A when available)
+        _ml_a     = st.session_state.get(
+            f"mlA_{sig['symbol']}_{sig['timeframe']}_{sig['direction']}") or {}
+        _ml_main  = st.session_state.get(
+            f"ml_{sig['symbol']}_{sig['timeframe']}_{sig['direction']}") or {}
+        _ml       = _ml_a if _ml_a else _ml_main
+        ml_verdict = _ml.get("label", "")
+
+        new_row = {
+            "ts_utc":        datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "symbol":        sig.get("symbol", ""),
+            "tf":            sig.get("timeframe", ""),
+            "direction":     sig.get("direction", ""),
+            "body_pct":      sig.get("body_pct", ""),
+            "vol_mult":      sig.get("vol_mult", ""),
+            "adx":           sig.get("adx", ""),
+            "combo_name":    combo_name,
+            "matched_level": matched_level,
+            "size_factor":   size_factor,
+            "pf_haircut":    pf_haircut,
+            "ai_verdict":    ai_verdict,
+            "ml_verdict":    ml_verdict,
+            "decision":      decision,
+            "entry_price":   plan.get("entry_price", ""),
+            "sl_price":      plan.get("sl_price", ""),
+            "tp_price":      plan.get("tp_price", ""),
+            "risk_pct":      plan.get("risk_pct", ""),
+            "outcome":       "",
+            "outcome_ts":    "",
+            "realized_r":    "",
+            "notes":         "",
+        }
+        existing = _qf_journal_load()
+        existing.append(new_row)
+        _qf_journal_persist(existing)
+    finally:
+        # Always release lock — even if an exception occurred above
+        st.session_state[lock_key] = max(0, st.session_state.get(lock_key, 1) - 1)
+
+
 def render_auto_analyzer(ticker: str, df_full_1d: pd.DataFrame, tc: float,
                           current_tf: str):
     """
@@ -5437,6 +6253,194 @@ def render_auto_analyzer(ticker: str, df_full_1d: pd.DataFrame, tc: float,
         '<b>Regime RED signals are automatically excluded.</b></div>',
         unsafe_allow_html=True,
     )
+
+    # ── Piece 3: Trade Journal expander ─────────────────────────────────────
+    # Lists all captured rows. Rows with empty outcome show editable fields.
+    # Bottom section shows realized PF stats by level.
+    # Placed at the TOP of the scanner page so it's always accessible.
+    with st.expander("📓 Trade Journal", expanded=False):
+        try:
+            _jrows = _qf_journal_load()
+        except Exception as _je:
+            st.error(f"Journal load error: {_je}")
+            _jrows = []
+
+        if not _jrows:
+            st.markdown(
+                '<div style="color:#8892b0;font-size:12px;padding:6px 0;">'
+                'No trades captured yet. Click <b>TAKE / SKIP / PAPER</b> on any signal card below.</div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            # ── Editable outcome rows ────────────────────────────────────────
+            st.markdown(
+                f'<div style="color:#58a6ff;font-size:12px;font-weight:700;'
+                f'margin-bottom:8px;">{len(_jrows)} trade(s) captured</div>',
+                unsafe_allow_html=True,
+            )
+            _outcome_opts = ["", "TP", "SL", "TIMESTOP", "MANUAL", "PARTIAL"]
+            _rows_changed = False
+            for _ji, _jr in enumerate(_jrows):
+                _open = not bool(_jr.get("outcome", "").strip())
+                _dec_color = {
+                    "TAKE": "#3fb950", "PAPER": "#58a6ff", "SKIP": "#8892b0",
+                }.get(_jr.get("decision", ""), "#ccd6f6")
+                _ts_display = _jr.get("ts_utc", "")[:16].replace("T", " ")
+                st.markdown(
+                    f'<div style="background:#0d1117;border:1px solid #21262d;'
+                    f'border-radius:6px;padding:8px 12px;margin-bottom:6px;">'
+                    f'<span style="color:{_dec_color};font-weight:700;font-size:12px;">'
+                    f'{_jr.get("decision","")}</span>'
+                    f'<span style="color:#8892b0;font-size:11px;margin-left:8px;">'
+                    f'{_ts_display} UTC &nbsp;|&nbsp; '
+                    f'<b style="color:#ccd6f6;">{_jr.get("symbol","")}</b> '
+                    f'{_jr.get("tf","")} {_jr.get("direction","").upper()} &nbsp;|&nbsp; '
+                    f'Combo: {_jr.get("combo_name","—")} '
+                    f'({_jr.get("matched_level","—")})'
+                    f'</span></div>',
+                    unsafe_allow_html=True,
+                )
+                if _open:
+                    _oc1, _oc2, _oc3, _oc4 = st.columns([1.2, 0.8, 1.5, 0.5])
+                    with _oc1:
+                        _new_out = st.selectbox(
+                            "Outcome",
+                            _outcome_opts,
+                            index=_outcome_opts.index(_jr.get("outcome", ""))
+                            if _jr.get("outcome", "") in _outcome_opts else 0,
+                            key=f"jout_{_ji}",
+                        )
+                    with _oc2:
+                        _realized_r_str = _jr.get("realized_r", "") or ""
+                        try:
+                            _rr_default = float(_realized_r_str)
+                        except (ValueError, TypeError):
+                            _rr_default = 0.0
+                        _new_rr = st.number_input(
+                            "Realized R",
+                            value=_rr_default,
+                            step=0.1,
+                            format="%.2f",
+                            key=f"jrr_{_ji}",
+                        )
+                    with _oc3:
+                        _new_notes = st.text_input(
+                            "Notes",
+                            value=_jr.get("notes", ""),
+                            key=f"jnotes_{_ji}",
+                            placeholder="Optional notes…",
+                        )
+                    with _oc4:
+                        st.markdown("<div style='margin-top:28px;'></div>", unsafe_allow_html=True)
+                        if st.button("💾 Save", key=f"jsave_{_ji}", use_container_width=True):
+                            if _new_out:
+                                _jrows[_ji]["outcome"]     = _new_out
+                                _jrows[_ji]["realized_r"]  = str(_new_rr)
+                                _jrows[_ji]["notes"]       = _new_notes
+                                _jrows[_ji]["outcome_ts"]  = datetime.utcnow().strftime(
+                                    "%Y-%m-%dT%H:%M:%SZ")
+                                _rows_changed = True
+                else:
+                    # Closed trade — show read-only summary line
+                    _out_color = {
+                        "TP": "#3fb950", "SL": "#f85149",
+                        "TIMESTOP": "#e3b341", "MANUAL": "#8892b0", "PARTIAL": "#58a6ff",
+                    }.get(_jr.get("outcome", ""), "#ccd6f6")
+                    st.markdown(
+                        f'<div style="color:{_out_color};font-size:11px;'
+                        f'padding:2px 0 6px 4px;">'
+                        f'✓ {_jr.get("outcome","")} · '
+                        f'R={_jr.get("realized_r","—")} · {_jr.get("notes","")}</div>',
+                        unsafe_allow_html=True,
+                    )
+            if _rows_changed:
+                try:
+                    _qf_journal_persist(_jrows)
+                    st.success("✅ Journal saved.", icon="💾")
+                    st.rerun()
+                except Exception as _jse:
+                    st.error(f"❌ Journal save failed: {_jse}")
+
+            # ── Per-level realized PF stats ──────────────────────────────────
+            st.markdown("---")
+            st.markdown(
+                '<div style="color:#58a6ff;font-size:12px;font-weight:700;margin-bottom:6px;">'
+                '📊 Realized Performance by Level</div>',
+                unsafe_allow_html=True,
+            )
+            for _lvl in _QF_LEVELS:
+                _lvl_rows = [
+                    r for r in _jrows
+                    if r.get("matched_level") == _lvl
+                    and r.get("decision") in ("TAKE", "PAPER")
+                    and r.get("outcome") in ("TP", "SL", "TIMESTOP", "MANUAL", "PARTIAL")
+                ]
+                _n = len(_lvl_rows)
+                if _n == 0:
+                    st.markdown(
+                        f'<div style="color:#8892b0;font-size:11px;padding:2px 0;">'
+                        f'<b style="color:#ccd6f6;">{_lvl}</b>: n=0 — no closed trades yet</div>',
+                        unsafe_allow_html=True,
+                    )
+                    continue
+                # Parse realized_r values
+                _realized_rs = []
+                for r in _lvl_rows:
+                    try:
+                        _realized_rs.append(float(r.get("realized_r", "") or "nan"))
+                    except (ValueError, TypeError):
+                        pass
+                _valid_rs    = [v for v in _realized_rs if not (v != v)]  # filter NaN
+                _wins        = [v for v in _valid_rs if v > 0]
+                _losses      = [v for v in _valid_rs if v < 0]
+                _win_rate    = (len(_wins) / len(_valid_rs) * 100) if _valid_rs else 0.0
+                _mean_r      = (sum(_valid_rs) / len(_valid_rs)) if _valid_rs else 0.0
+                _gross_win   = sum(_wins)
+                _gross_loss  = abs(sum(_losses))
+                _real_pf     = (_gross_win / _gross_loss) if _gross_loss > 0 else float("inf")
+                _enough      = _n >= 30
+                # Audit PF from the combo data — use realized_pf / assumed_haircut
+                # to back out the "effective audit PF" this level is achieving.
+                # Find the most common combo in this level to get the audit rollup PF
+                _combo_pfs   = []
+                if _QFCOMBOS_OK and _qfcombos is not None:
+                    for r in _lvl_rows:
+                        _cn = r.get("combo_name", "")
+                        _cb = next((c for c in _qfcombos.COMBOS if c["name"] == _cn), None)
+                        if _cb:
+                            _combo_pfs.append(float(_cb.get("rollup", {}).get("pf", 0) or 0))
+                _audit_pf  = (sum(_combo_pfs) / len(_combo_pfs)) if _combo_pfs else 0.0
+                _assumed_h = _QF_ASSUMED_HAIRCUT.get(_lvl, 1.0)
+                # Realized haircut = realized PF / audit PF (only meaningful when audit_pf > 0)
+                _real_haircut = (_real_pf / _audit_pf) if (_audit_pf > 0 and _enough) else None
+                _real_pf_str  = f"{_real_pf:.2f}" if _gross_loss > 0 else "∞"
+                # Badge: bold red if realized haircut < 0.85 × assumed haircut
+                if _real_haircut is not None and _assumed_h > 0:
+                    _haircut_ok = _real_haircut >= 0.85 * _assumed_h
+                else:
+                    _haircut_ok = True
+                _haircut_color = "#ccd6f6" if _haircut_ok else "#f85149"
+                _haircut_str   = (
+                    f' &nbsp;·&nbsp; realized haircut <span style="font-weight:700;color:{_haircut_color};">'
+                    f'{_real_haircut:.2f}</span> vs assumed {_assumed_h:.2f}'
+                    + (' <span style="color:#f85149;">⚠ BELOW EXPECTED — consider retightening</span>'
+                       if not _haircut_ok else "")
+                ) if _real_haircut is not None else ""
+                _lvl_color = {"STRICT": "#34d399", "RELAXED": "#fbbf24", "LOOSE": "#fb923c"}.get(
+                    _lvl, "#ccd6f6")
+                st.markdown(
+                    f'<div style="background:#0d1117;border-left:3px solid {_lvl_color};'
+                    f'border-radius:4px;padding:6px 10px;margin-bottom:4px;font-size:12px;">'
+                    f'<b style="color:{_lvl_color};">{_lvl}</b>'
+                    f'<span style="color:#8892b0;">'
+                    f' n={_n} · win rate {_win_rate:.0f}% · mean R {_mean_r:+.2f} · '
+                    f'realized PF {_real_pf_str}'
+                    + (_haircut_str or "")
+                    + ('</span><span style="color:#8892b0;font-size:10px;"> (need ≥30 to show haircut)</span>'
+                       if not _enough else '</span>')
+                    + '</div>',
+                    unsafe_allow_html=True,
+                )
 
     # ── Controls ──────────────────────────────────────────────────────────────
     rc1, rc2, rc3 = st.columns(3)
@@ -5927,6 +6931,9 @@ def render_auto_analyzer(ticker: str, df_full_1d: pd.DataFrame, tc: float,
     _btc_regime_for_combos = (_scanner_btc_regime_for_combos()
                               if _QFCOMBOS_OK else "UNKNOWN")
     _n_before_combo_filter = len(all_signals_deduped)
+    # Snapshot raw signals before combo filter — used by the "Why no matches?"
+    # diagnostic if the filter produces zero results.
+    _raw_signals_for_diag = list(all_signals_deduped)
     if _QFCOMBOS_OK:
         _filtered_with_matches = []
         for s in all_signals_deduped:
@@ -5965,73 +6972,86 @@ def render_auto_analyzer(ticker: str, df_full_1d: pd.DataFrame, tc: float,
             # 5) Strict-mode setup just isn't there today (boundary noise) —
             #    suggest enabling RELAXED or LOOSE if user is on STRICT only.
             # We surface these as actionable hints.
-            _hints = []
-            if min_vol_mult < 1.5:
-                _hints.append(
-                    f"⚠️ Scanner Min volume × is {min_vol_mult:.1f}× but every "
-                    f"combo requires ≥1.5×. Most of your {_n_before_combo_filter} "
-                    f"signals may have vol_mult between 1.0-1.5 → can never "
-                    f"match. Raise Min volume × to 1.5."
-                )
-            if min_body_pct * 100 < 50:
-                _hints.append(
-                    f"⚠️ Scanner Min body % is {min_body_pct*100:.0f}% but every "
-                    f"combo requires ≥50%. Raise Min body % to 50."
-                )
-            if (_btc_regime_for_combos == "UNKNOWN"
-                and any(c.endswith("-A") for c in enabled_combos)):
-                _hints.append(
-                    f"⚠️ BTC regime fetch failed (UNKNOWN). Aligned combos "
-                    f"(-A) cannot classify without it. Try -N variants only "
-                    f"or check Binance API connectivity."
-                )
-            # Loose-mode remediation — only suggest if user is on STRICT only.
-            # When already on RELAXED/LOOSE, more widening won't help (hard
-            # caps still bind). Phrase carefully so user understands the
-            # tradeoff: more setups but lower confidence, sized down.
-            if _allowed_levels == ("STRICT",):
-                _hints.append(
-                    "💡 Currently on <b>STRICT only</b>. If you've been seeing "
-                    "zero setups for multiple days, switch the Confidence level "
-                    "(top of the combo filter expander) to <b>STRICT + RELAXED</b> "
-                    "(small boundary widening, sized 0.75×) or <b>+ LOOSE</b> "
-                    "(more widening, sized 0.50×). Hard caps (body 0.60-0.70 "
-                    "dead zone, ADX > 50, CT body 0.78 floor) stay enforced "
-                    "at every level."
-                )
-            elif _allowed_levels == ("STRICT", "RELAXED"):
-                _hints.append(
-                    "💡 Currently on <b>STRICT + RELAXED</b>. To pull in more "
-                    "boundary signals, switch to <b>STRICT + RELAXED + LOOSE</b> "
-                    "(sized 0.50×). If even LOOSE yields nothing, the dead-zone "
-                    "caps are likely binding — there genuinely is no audit-safe "
-                    "setup right now."
-                )
-            else:
-                _hints.append(
-                    "ℹ️ All confidence levels (STRICT + RELAXED + LOOSE) are "
-                    "active. The hard caps (body 0.60-0.70 dead zone, ADX > 50, "
-                    "CT body 0.78 floor) are likely binding — there genuinely "
-                    "is no audit-safe setup matching the ticked combos right now."
-                )
-            _hints.append(
-                "Note: combos require ADX 30-50 (combos with ADX 50-60 were "
-                "audit losers and excluded). High-ADX signals won't match."
+            # ── "Why no matches?" diagnostic ────────────────────────────────
+            # Attempt the rich histogram diagnostic first.  If it renders
+            # successfully it returns True and we are done.  On any failure
+            # (missing data, exception) it returns False and we fall through
+            # to the original text warning so the user always sees *something*.
+            _diag_rendered = _qf_zero_match_diagnostic(
+                raw_signals    = _raw_signals_for_diag,
+                enabled_combos = enabled_combos,
+                btc_regime     = _btc_regime_for_combos,
+                allowed_levels = _allowed_levels,
             )
-            hints_html = "<br>".join(_hints)
-            _level_summary = (
-                "STRICT only" if _allowed_levels == ("STRICT",)
-                else "STRICT + RELAXED" if _allowed_levels == ("STRICT", "RELAXED")
-                else "STRICT + RELAXED + LOOSE"
-            )
-            st.warning(
-                f"No signals match the active combo filter "
-                f"({len(enabled_combos)} combo(s) at level scope **{_level_summary}**: "
-                f"{', '.join(enabled_combos)}). "
-                f"Scan + age filter produced {_n_before_combo_filter} signals; "
-                f"none satisfied any of the ticked combos' criteria.\n\n"
-                f"{hints_html}"
-            )
+            if not _diag_rendered:
+                # ── Fallback: original text-only warning ─────────────────────
+                _hints = []
+                if min_vol_mult < 1.5:
+                    _hints.append(
+                        f"⚠️ Scanner Min volume × is {min_vol_mult:.1f}× but every "
+                        f"combo requires ≥1.5×. Most of your {_n_before_combo_filter} "
+                        f"signals may have vol_mult between 1.0-1.5 → can never "
+                        f"match. Raise Min volume × to 1.5."
+                    )
+                if min_body_pct * 100 < 50:
+                    _hints.append(
+                        f"⚠️ Scanner Min body % is {min_body_pct*100:.0f}% but every "
+                        f"combo requires ≥50%. Raise Min body % to 50."
+                    )
+                if (_btc_regime_for_combos == "UNKNOWN"
+                    and any(c.endswith("-A") for c in enabled_combos)):
+                    _hints.append(
+                        f"⚠️ BTC regime fetch failed (UNKNOWN). Aligned combos "
+                        f"(-A) cannot classify without it. Try -N variants only "
+                        f"or check Binance API connectivity."
+                    )
+                # Loose-mode remediation — only suggest if user is on STRICT only.
+                # When already on RELAXED/LOOSE, more widening won't help (hard
+                # caps still bind). Phrase carefully so user understands the
+                # tradeoff: more setups but lower confidence, sized down.
+                if _allowed_levels == ("STRICT",):
+                    _hints.append(
+                        "💡 Currently on <b>STRICT only</b>. If you've been seeing "
+                        "zero setups for multiple days, switch the Confidence level "
+                        "(top of the combo filter expander) to <b>STRICT + RELAXED</b> "
+                        "(small boundary widening, sized 0.75×) or <b>+ LOOSE</b> "
+                        "(more widening, sized 0.50×). Hard caps (body 0.60-0.70 "
+                        "dead zone, ADX > 50, CT body 0.78 floor) stay enforced "
+                        "at every level."
+                    )
+                elif _allowed_levels == ("STRICT", "RELAXED"):
+                    _hints.append(
+                        "💡 Currently on <b>STRICT + RELAXED</b>. To pull in more "
+                        "boundary signals, switch to <b>STRICT + RELAXED + LOOSE</b> "
+                        "(sized 0.50×). If even LOOSE yields nothing, the dead-zone "
+                        "caps are likely binding — there genuinely is no audit-safe "
+                        "setup right now."
+                    )
+                else:
+                    _hints.append(
+                        "ℹ️ All confidence levels (STRICT + RELAXED + LOOSE) are "
+                        "active. The hard caps (body 0.60-0.70 dead zone, ADX > 50, "
+                        "CT body 0.78 floor) are likely binding — there genuinely "
+                        "is no audit-safe setup matching the ticked combos right now."
+                    )
+                _hints.append(
+                    "Note: combos require ADX 30-50 (combos with ADX 50-60 were "
+                    "audit losers and excluded). High-ADX signals won't match."
+                )
+                hints_html = "<br>".join(_hints)
+                _level_summary = (
+                    "STRICT only" if _allowed_levels == ("STRICT",)
+                    else "STRICT + RELAXED" if _allowed_levels == ("STRICT", "RELAXED")
+                    else "STRICT + RELAXED + LOOSE"
+                )
+                st.warning(
+                    f"No signals match the active combo filter "
+                    f"({len(enabled_combos)} combo(s) at level scope **{_level_summary}**: "
+                    f"{', '.join(enabled_combos)}). "
+                    f"Scan + age filter produced {_n_before_combo_filter} signals; "
+                    f"none satisfied any of the ticked combos' criteria.\n\n"
+                    f"{hints_html}"
+                )
             return
 
     # Summary banner
@@ -6864,6 +7884,82 @@ def render_auto_analyzer(ticker: str, df_full_1d: pd.DataFrame, tc: float,
             _ml_res  = st.session_state.get(_ml_cache_key)
             _wfo_res = st.session_state.get(_wfo_cache_key)
             _ai_res  = st.session_state.get(_ai_key)
+
+            # ── Decision Matrix — synthesised verdict panel (TOP of confluence) ─
+            # Renders BEFORE all existing detail sections. Uses only data that is
+            # already cached in session_state — never triggers a new AI call.
+            _dm_html = _render_decision_matrix_html(
+                sig    = sig,
+                ai_res = _ai_res,
+                ml_a   = st.session_state.get(_ml_a_key),
+                ml_b   = st.session_state.get(_ml_b_key),
+                bt_res = _bt_res,
+            )
+            if _dm_html:
+                st.markdown(_dm_html, unsafe_allow_html=True)
+
+            # ── Piece 2: 📓 Add to Journal buttons ───────────────────────────
+            # Three decision buttons below the decision matrix. Clicking one
+            # writes a row to quantflow_journal.csv via _qf_journal_capture().
+            # The plan dict is populated from the signal's aggressive-zone
+            # entry/SL/TP and the primary combo's sizing info.
+            # Key suffix uses _sym_key so each card has independent buttons.
+            _jbtn_c1, _jbtn_c2, _jbtn_c3, _jbtn_c4 = st.columns([0.8, 0.8, 0.8, 2.6])
+            _jplan = {
+                "entry_price": sig.get("entry", ""),
+                "sl_price":    sig.get("sl", ""),
+                "tp_price":    sig.get("tp2r", ""),
+                "risk_pct":    (
+                    _qf_effective_size_pct(
+                        (sig.get("_qf_matches") or [{}])[0].get(
+                            "primary", {}).get("sizing", "FULL"),
+                        float((sig.get("_qf_matches") or [{}])[0].get("_size_factor", 1.0)),
+                    )
+                    if sig.get("_qf_matches") else 0.50
+                ),
+            }
+            _taken_key = f"_journal_taken_{_sym_key}"
+            with _jbtn_c1:
+                if st.button("✅ TAKE", key=f"jbtntake_{_sym_key}_{i}",
+                             use_container_width=True,
+                             help="Log this signal as a live trade entry"):
+                    try:
+                        _qf_journal_capture(sig, "TAKE", _jplan)
+                        st.session_state[_taken_key] = "TAKE"
+                        st.toast("📓 Logged as TAKE — good luck!", icon="✅")
+                    except Exception as _je:
+                        st.error(f"Journal write failed: {_je}")
+            with _jbtn_c2:
+                if st.button("📄 PAPER", key=f"jbtnpaper_{_sym_key}_{i}",
+                             use_container_width=True,
+                             help="Log as paper trade (simulated, no real money)"):
+                    try:
+                        _qf_journal_capture(sig, "PAPER", _jplan)
+                        st.session_state[_taken_key] = "PAPER"
+                        st.toast("📓 Logged as PAPER trade", icon="📄")
+                    except Exception as _je:
+                        st.error(f"Journal write failed: {_je}")
+            with _jbtn_c3:
+                if st.button("⛔ SKIP", key=f"jbtnkip_{_sym_key}_{i}",
+                             use_container_width=True,
+                             help="Log this signal as deliberately skipped"):
+                    try:
+                        _qf_journal_capture(sig, "SKIP", _jplan)
+                        st.session_state[_taken_key] = "SKIP"
+                        st.toast("📓 Logged as SKIP", icon="⛔")
+                    except Exception as _je:
+                        st.error(f"Journal write failed: {_je}")
+            with _jbtn_c4:
+                _taken_tag = st.session_state.get(_taken_key, "")
+                if _taken_tag:
+                    _tag_color = {
+                        "TAKE": "#3fb950", "PAPER": "#58a6ff", "SKIP": "#8892b0",
+                    }.get(_taken_tag, "#ccd6f6")
+                    st.markdown(
+                        f'<div style="margin-top:6px;color:{_tag_color};'
+                        f'font-size:11px;font-weight:700;">📓 {_taken_tag} logged this session</div>',
+                        unsafe_allow_html=True,
+                    )
 
             if _bt_res or _ml_res:
                 _ml_res = _ml_res or _scanner_heuristic_ml(sig)
