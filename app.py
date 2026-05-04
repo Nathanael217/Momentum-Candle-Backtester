@@ -169,12 +169,25 @@ def _qf_signal_matches_at_level(sig: dict, combo: dict, btc_regime: str,
             return False
 
     try:
-        body_abs = abs(float(sig.get("body_pct", 0)))
-        vol_mult = float(sig.get("vol_mult", 0))
-        adx      = float(sig.get("adx", 0))
+        # AUTO-NORMALIZE body_pct units. The app's _scanner_score_signal
+        # stores body_pct as percent (0-100), but combo bands are fractions
+        # (0-1, e.g. body_min=0.7, body_max=0.8). The headless worker stores
+        # body_pct as fraction. Detect the format and normalize to fraction.
+        # A body_pct value > 1.5 is unambiguously percent (no candle has a
+        # body more than 100% of its range; in fraction form max is 1.0).
+        _raw_body = abs(float(sig.get("body_pct", 0)))
+        body_abs  = _raw_body / 100.0 if _raw_body > 1.5 else _raw_body
+        vol_mult  = float(sig.get("vol_mult", 0))
+        adx       = float(sig.get("adx", 0))
     except (TypeError, ValueError):
         return False
     if not (crit["body_min"] <= body_abs   < crit["body_max"]):  return False
+    # Hard cap: trend body 0.60-0.70 dead zone — reject regardless of combo/level.
+    # Audited combos never straddle this range so this check is a no-op for them;
+    # it only matters for custom combos whose user-defined band may span the zone.
+    if combo_type == "trend_following":
+        if _QF_BODY_DEAD_ZONE_MIN <= body_abs < _QF_BODY_DEAD_ZONE_MAX:
+            return False
     if not (crit["vol_min"]  <= vol_mult   < crit["vol_max"]):   return False
     if not (crit["adx_min"]  <= adx        < crit["adx_max"]):   return False
 
@@ -220,6 +233,33 @@ def _qf_get_matching_combos(sig: dict, enabled_combos: list,
     matches.sort(key=lambda c: (c["tier"],
                                 _level_rank.get(c.get("_matched_level"), 9)))
     return matches
+
+
+def _qf_get_matching_combos_with_custom(sig: dict, enabled_combos: list,
+                                        btc_regime: str = None,
+                                        allowed_levels: tuple = ("STRICT",),
+                                        custom_combo: dict = None) -> list:
+    """
+    Wrapper around _qf_get_matching_combos that appends a user-defined
+    custom combo to the classification run without mutating _qfcombos.COMBOS.
+    custom_combo must carry _is_custom=True; it goes through the SAME
+    _qf_classify_signal_level pipeline as audited combos, so all hard caps
+    (body 0.60-0.70 dead zone, ADX > 50 cap, CT body 0.78 floor) still apply.
+    """
+    results = _qf_get_matching_combos(sig, enabled_combos, btc_regime, allowed_levels)
+    if custom_combo and custom_combo["name"] in enabled_combos:
+        # Classify the signal against the user-defined bands
+        lvl = _qf_classify_signal_level(sig, custom_combo, btc_regime, allowed_levels)
+        if lvl is not None:
+            mc = dict(custom_combo)
+            mc["_matched_level"] = lvl
+            mc["_size_factor"]   = _QF_LEVEL_SETTINGS[lvl]["size_factor"]
+            mc["_pf_haircut"]    = _QF_LEVEL_SETTINGS[lvl]["pf_haircut"]
+            results.append(mc)
+    _level_rank = {"STRICT": 0, "RELAXED": 1, "LOOSE": 2}
+    results.sort(key=lambda c: (c["tier"],
+                                _level_rank.get(c.get("_matched_level"), 9)))
+    return results
 
 
 def _qf_level_badge_html(level: str) -> str:
@@ -6784,6 +6824,164 @@ def render_auto_analyzer(ticker: str, df_full_1d: pd.DataFrame, tc: float,
                     "to filter to backtest-validated setups."
                 )
 
+    # ── Custom Combo Builder (user-defined bands, no audit PF) ────────────────
+    # Lives BESIDE the 17 audited combos — never replaces or mutates them.
+    # All hard caps (_qf_widen_criteria: dead zone, ADX cap, CT floor) still
+    # apply because the custom combo goes through _qf_classify_signal_level.
+    _custom_combo: dict = None   # will hold the synthetic dict if enabled
+    if _QFCOMBOS_OK:
+        with st.expander(
+            "🛠 Custom Combo Builder — define your own bands (no audit PF)",
+            expanded=False,
+        ):
+            st.markdown(
+                '<div style="background:#1a0d2e;border:1px solid #a78bfa;'
+                'border-radius:6px;padding:8px 12px;font-size:11px;color:#ccd6f6;'
+                'margin-bottom:10px;line-height:1.6;">'
+                '<b style="color:#a78bfa;">USER-DEFINED filter — no historical audit.</b> '
+                'Build a synthetic combo on the fly by choosing body / volume / ADX bands. '
+                'Hard caps still apply: body 0.60-0.70 dead zone, ADX &gt; 50 cap, '
+                'CT body &lt; 0.78 floor. '
+                'Default sizing is SMALL (0.15% risk). '
+                'Treat output as <b>paper-trade exploration</b>, not validated edge.'
+                '</div>',
+                unsafe_allow_html=True,
+            )
+
+            _custom_enabled = st.checkbox(
+                "Enable custom combo",
+                value=False,
+                key="mscanner_custom_combo_enabled",
+            )
+
+            _ccol1, _ccol2 = st.columns(2)
+            with _ccol1:
+                _cc_body_min, _cc_body_max = st.slider(
+                    "Body %",
+                    min_value=0.50, max_value=0.85,
+                    value=(0.30, 0.70),
+                    step=0.01,
+                    key="mscanner_custom_body",
+                    help="Candle body as fraction of total high-low range. "
+                         "Hard dead zone 0.60-0.70 still applies internally.",
+                )
+                _cc_vol_min, _cc_vol_max = st.slider(
+                    "Volume ×",
+                    min_value=1.5, max_value=10.0,
+                    value=(1.2, 4.0),
+                    step=0.1,
+                    key="mscanner_custom_vol",
+                    help="Volume as multiple of the rolling average.",
+                )
+            with _ccol2:
+                _cc_adx_min, _cc_adx_max = st.slider(
+                    "ADX",
+                    min_value=25, max_value=50,
+                    value=(25, 50),
+                    step=1,
+                    key="mscanner_custom_adx",
+                    help="ADX range. Hard cap: ADX > 50 always rejected.",
+                )
+                _cc_combo_type = st.radio(
+                    "Combo type",
+                    options=["trend_following", "countertrend"],
+                    index=0,
+                    horizontal=True,
+                    key="mscanner_custom_combo_type",
+                    format_func=lambda x: "⦿ trend-following" if x == "trend_following" else "◯ countertrend",
+                )
+
+            _ddir_col, _dtf_col, _dreg_col = st.columns(3)
+            with _ddir_col:
+                _cc_directions = st.multiselect(
+                    "Direction",
+                    options=["long", "short"],
+                    default=["long", "short"],
+                    key="mscanner_custom_directions",
+                )
+            with _dtf_col:
+                _cc_tfs = st.multiselect(
+                    "Timeframes",
+                    options=["4h", "1d"],
+                    default=["4h", "1d"],
+                    key="mscanner_custom_tfs",
+                )
+            with _dreg_col:
+                _cc_regime_raw = st.radio(
+                    "BTC regime",
+                    options=["N", "A"],
+                    index=0,
+                    horizontal=True,
+                    key="mscanner_custom_regime",
+                    format_func=lambda x: "⦿ no filter (N)" if x == "N" else "◯ aligned only (A)",
+                )
+
+            # Dead-zone warning — if user's full body band is inside the trend
+            # dead zone (0.60-0.70), nothing can ever match; tell them now.
+            if (_cc_combo_type == "trend_following"
+                    and _cc_body_min >= 0.60 and _cc_body_max <= 0.70):
+                st.warning(
+                    "⚠ Your band is entirely inside the trend dead zone (0.60-0.70). "
+                    "No signal can match. Pick a different range."
+                )
+
+            st.markdown(
+                '<div style="background:#1a0d2e;border-left:3px solid #ef4444;'
+                'border-radius:4px;padding:6px 10px;font-size:10px;color:#fca5a5;'
+                'margin-top:8px;">'
+                '📌 NOTE: This is a USER-DEFINED filter. There is NO historical audit '
+                'backing these bands. Default sizing is 0.25× (small). Treat output as '
+                'paper-trade exploration, not validated edge.'
+                '</div>',
+                unsafe_allow_html=True,
+            )
+
+            st.caption("Active when checkbox above is ticked.")
+
+            # Build the synthetic combo dict when enabled
+            if _custom_enabled:
+                _cc_dirs = _cc_directions if _cc_directions else ["long", "short"]
+                _cc_tf_list = _cc_tfs if _cc_tfs else ["4h"]
+                # CT-only fields — only populated for countertrend to satisfy
+                # _qf_signal_matches_at_level without breaking trend classification
+                _cc_criteria = {
+                    "body_min":  _cc_body_min,
+                    "body_max":  _cc_body_max,
+                    "vol_min":   _cc_vol_min,
+                    "vol_max":   _cc_vol_max,
+                    "adx_min":   float(_cc_adx_min),
+                    "adx_max":   float(_cc_adx_max),
+                    "regime_mode": _cc_regime_raw,
+                    "directions":  _cc_dirs,
+                }
+                if _cc_combo_type == "countertrend":
+                    # CT combos need signal_direction_required + trade_direction.
+                    # Use "either" sentinel so classifier doesn't block by direction.
+                    _cc_criteria["signal_direction_required"] = None
+                    _cc_criteria["trade_direction"] = None
+                _custom_combo = {
+                    "name":        "CUSTOM-1",
+                    "tier":        99,            # sorted last — never displaces audited combos
+                    "combo_type":  _cc_combo_type,
+                    "label_short": "CUSTOM-1 — User-defined bands (no audit PF)",
+                    "criteria":    _cc_criteria,
+                    "tf_eligible": _cc_tf_list,
+                    "rollup": {
+                        "n": 0, "wr": 0.0, "mean_r": 0.0, "sharpe": 0.0, "pf": 0.0,
+                    },
+                    "primary": {
+                        "tf":          _cc_tf_list[0],
+                        "direction":   _cc_dirs[0],
+                        "entry_zone":  "0%",   # immediate entry (no retrace)
+                        "tp_R":        2.0,
+                        "sizing":      "SMALL",  # 0.15% base risk
+                        "n": 0, "wr": 0.0, "mean_r": 0.0, "pf": 0.0,
+                    },
+                    "_is_custom":  True,  # marker so card renderer applies purple style
+                }
+                # Add CUSTOM-1 to the enabled set so the classifier sees it
+                enabled_combos.append("CUSTOM-1")
+
     if not scan_tfs:
         st.warning("Select at least one timeframe.")
         return
@@ -6942,10 +7140,11 @@ def render_auto_analyzer(ticker: str, df_full_1d: pd.DataFrame, tc: float,
             # purely as a data source. This means: regardless of what version
             # of quantflow_combos.py is deployed, the level system here works.
             if enabled_combos:
-                matches = _qf_get_matching_combos(
+                matches = _qf_get_matching_combos_with_custom(
                     s, enabled_combos,
                     btc_regime=_btc_regime_for_combos,
                     allowed_levels=_allowed_levels,
+                    custom_combo=_custom_combo,
                 )
             else:
                 matches = []
@@ -7240,35 +7439,78 @@ def render_auto_analyzer(ticker: str, df_full_1d: pd.DataFrame, tc: float,
                 if _QFCOMBOS_OK:
                     _qf_matches_card = sig.get("_qf_matches") or []
                     if _qf_matches_card:
-                        # Level summary banner FIRST — belt-and-suspenders so
-                        # the user sees the level even if the imported
-                        # render_combo_panel_html is from an older version
-                        # of quantflow_combos.py that doesn't display badges.
-                        _level_banner = _qf_render_level_summary_html(_qf_matches_card)
-                        if _level_banner:
-                            st.markdown(_level_banner, unsafe_allow_html=True)
-                        # Imported panel render. Wrap in try/except — if the
-                        # imported render is incompatible with the level
-                        # metadata we attach, fall through gracefully (the
-                        # banner above already conveyed the level info).
-                        try:
-                            _qf_panel_html = _qfcombos.render_combo_panel_html(
-                                _qf_matches_card, sig
+                        # Separate audited combos from user-defined custom combo
+                        _audited_matches = [m for m in _qf_matches_card
+                                           if not m.get("_is_custom")]
+                        _custom_matches  = [m for m in _qf_matches_card
+                                           if m.get("_is_custom")]
+
+                        # ── Audited combo panel (unchanged path) ──────────────
+                        if _audited_matches:
+                            # Level summary banner FIRST — belt-and-suspenders so
+                            # the user sees the level even if the imported
+                            # render_combo_panel_html is from an older version
+                            # of quantflow_combos.py that doesn't display badges.
+                            _level_banner = _qf_render_level_summary_html(_audited_matches)
+                            if _level_banner:
+                                st.markdown(_level_banner, unsafe_allow_html=True)
+                            # Imported panel render. Wrap in try/except — if the
+                            # imported render is incompatible with the level
+                            # metadata we attach, fall through gracefully (the
+                            # banner above already conveyed the level info).
+                            try:
+                                _qf_panel_html = _qfcombos.render_combo_panel_html(
+                                    _audited_matches, sig
+                                )
+                                if _qf_panel_html:
+                                    st.markdown(_qf_panel_html, unsafe_allow_html=True)
+                            except Exception:
+                                # Render failed (incompatible old version of
+                                # quantflow_combos.py). The level banner above
+                                # already showed the essentials; show a short
+                                # combo-name list as fallback so the user still
+                                # sees which combo(s) matched.
+                                _names = ", ".join(
+                                    f"{m['name']} (Tier {m.get('tier','?')}, "
+                                    f"{m.get('_matched_level','STRICT')})"
+                                    for m in _audited_matches
+                                )
+                                st.caption(f"Combo matches: {_names}")
+
+                        # ── Custom combo panel (distinct purple style) ─────────
+                        # Never uses audited PF stats. Sized as SMALL always.
+                        for _cm in _custom_matches:
+                            _cm_level = _cm.get("_matched_level", "STRICT")
+                            _cm_crit  = _cm.get("criteria", {})
+                            _cm_tf    = ", ".join(_cm.get("tf_eligible", ["?"]))
+                            _cm_dirs  = ", ".join(_cm_crit.get("directions", ["?"]))
+                            st.markdown(
+                                f'<div style="border:2px solid #a78bfa;border-radius:8px;'
+                                f'padding:10px 14px;margin-top:8px;background:#1a0d2e;">'
+                                f'<div style="display:flex;align-items:center;gap:8px;'
+                                f'margin-bottom:6px;">'
+                                f'<span style="background:#4c1d95;color:#c4b5fd;'
+                                f'padding:2px 8px;border-radius:10px;font-size:11px;'
+                                f'font-weight:700;">🛠 CUSTOM-1</span>'
+                                f'<span style="color:#ef4444;font-size:11px;font-weight:700;">'
+                                f'USER-DEFINED — NO AUDIT PF</span>'
+                                f'<span style="margin-left:auto;background:#1e1b4b;'
+                                f'color:#a78bfa;padding:2px 8px;border-radius:10px;'
+                                f'font-size:10px;">{_cm_level}</span>'
+                                f'</div>'
+                                f'<div style="font-size:11px;color:#ccd6f6;line-height:1.8;">'
+                                f'body {_cm_crit.get("body_min",0):.2f}–{_cm_crit.get("body_max",1):.2f} · '
+                                f'vol {_cm_crit.get("vol_min",0):.1f}–{_cm_crit.get("vol_max",0):.1f}× · '
+                                f'ADX {int(_cm_crit.get("adx_min",0))}–{int(_cm_crit.get("adx_max",50))} · '
+                                f'tf {_cm_tf} · dir {_cm_dirs} · '
+                                f'regime {"aligned" if _cm_crit.get("regime_mode")=="A" else "no filter"}'
+                                f'<br>'
+                                f'<b style="color:#fca5a5;">Sizing: SMALL · 0.15% risk '
+                                f'(exploratory — paper-trade first)</b>'
+                                f'</div>'
+                                f'</div>',
+                                unsafe_allow_html=True,
                             )
-                            if _qf_panel_html:
-                                st.markdown(_qf_panel_html, unsafe_allow_html=True)
-                        except Exception:
-                            # Render failed (incompatible old version of
-                            # quantflow_combos.py). The level banner above
-                            # already showed the essentials; show a short
-                            # combo-name list as fallback so the user still
-                            # sees which combo(s) matched.
-                            _names = ", ".join(
-                                f"{m['name']} (Tier {m.get('tier','?')}, "
-                                f"{m.get('_matched_level','STRICT')})"
-                                for m in _qf_matches_card
-                            )
-                            st.caption(f"Combo matches: {_names}")
 
                 # ── Entry method explanation ──────────────────────────────────
                 # The scanner uses 0% retracement (immediate entry at candle close) as
