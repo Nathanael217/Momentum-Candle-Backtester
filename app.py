@@ -169,16 +169,9 @@ def _qf_signal_matches_at_level(sig: dict, combo: dict, btc_regime: str,
             return False
 
     try:
-        # AUTO-NORMALIZE body_pct units. The app's _scanner_score_signal
-        # stores body_pct as percent (0-100), but combo bands are fractions
-        # (0-1, e.g. body_min=0.7, body_max=0.8). The headless worker stores
-        # body_pct as fraction. Detect the format and normalize to fraction.
-        # A body_pct value > 1.5 is unambiguously percent (no candle has a
-        # body more than 100% of its range; in fraction form max is 1.0).
-        _raw_body = abs(float(sig.get("body_pct", 0)))
-        body_abs  = _raw_body / 100.0 if _raw_body > 1.5 else _raw_body
-        vol_mult  = float(sig.get("vol_mult", 0))
-        adx       = float(sig.get("adx", 0))
+        body_abs = abs(float(sig.get("body_pct", 0)))
+        vol_mult = float(sig.get("vol_mult", 0))
+        adx      = float(sig.get("adx", 0))
     except (TypeError, ValueError):
         return False
     if not (crit["body_min"] <= body_abs   < crit["body_max"]):  return False
@@ -7463,7 +7456,22 @@ def render_auto_analyzer(ticker: str, df_full_1d: pd.DataFrame, tc: float,
                                     _audited_matches, sig
                                 )
                                 if _qf_panel_html:
-                                    st.markdown(_qf_panel_html, unsafe_allow_html=True)
+                                    # Streamlit's markdown parser treats lines with
+                                    # 4+ leading spaces as <pre><code> blocks even
+                                    # with unsafe_allow_html=True. The HTML returned
+                                    # by render_combo_panel_html in quantflow_combos.py
+                                    # is built from a triple-quoted f-string inside a
+                                    # function body, so every line starts with 8 spaces
+                                    # of Python indentation — which Streamlit then
+                                    # renders as literal <div> code.
+                                    # Fix: strip leading whitespace from each line.
+                                    # Safe here because the panel HTML contains no
+                                    # <pre>, <code>, or <textarea> tags that depend
+                                    # on whitespace preservation.
+                                    _qf_panel_html_clean = "\n".join(
+                                        ln.lstrip() for ln in _qf_panel_html.splitlines()
+                                    )
+                                    st.markdown(_qf_panel_html_clean, unsafe_allow_html=True)
                             except Exception:
                                 # Render failed (incompatible old version of
                                 # quantflow_combos.py). The level banner above
