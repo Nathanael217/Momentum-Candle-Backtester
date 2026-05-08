@@ -946,6 +946,247 @@ COMBOS_BY_NAME = {c["name"]: c for c in COMBOS}
 
 
 # ============================================================================
+# UNIFIED TIER DEFINITIONS — added Phase 4 (May 2026), backfilled Phase 4b
+# ============================================================================
+# These three filters consolidate the 17 individual combos into wider bands
+# that are easier to reason about and produce more daily setups. Audit PF
+# values come from the unified-tier audit run (audit_results_20260505_093019).
+#
+# The 17 individual COMBOS above remain in this file as REFERENCE — the
+# scanner uses them only to annotate which specific combo a unified-tier
+# signal is "similar to" (the inner combo whose strict bands the signal
+# falls inside).
+#
+# IMPORTANT: hard caps from the level system still apply. Body 0.60-0.70
+# trend dead zone, ADX > 50 cap, CT body 0.78 floor are all enforced
+# regardless of which tier the user ticks.
+#
+# AUDIT (run 2026-05-05, 200 coins, 4h+1d, 2022-01-01 → now):
+#   TIER 1 — n=8503  PF=1.139  best entry: Standard 0.382 (PF=1.186)
+#   TIER 2 — n=2984  PF=1.041  WEAK; best: Sniper 0.786 (PF=1.056)
+#   TIER 3 — n=4383  PF=1.139  best entry: Aggressive 0.000 (PF=1.156)
+# ============================================================================
+
+UNIFIED_TIERS = {
+    "TIER_1": {
+        "name":           "TIER 1",
+        "label":          "TREND-FOLLOWING (TOP CONVICTION)",
+        "combo_type":     "trend_following",
+        "criteria": {
+            "body_min":   0.70, "body_max":  0.80,
+            "vol_min":    1.50, "vol_max":   2.50,
+            "adx_min":    30.0, "adx_max":   50.0,
+            "regime_mode": "N",
+            "directions": ["long", "short"],
+        },
+        "tf_eligible":     ["1h", "4h", "1d"],
+        "rollup": {
+            # Audit-validated overall stats (all 4 entries combined)
+            "n":      8503,
+            "wr":     40.82,
+            "mean_r": 0.078,
+            "sharpe": 0.06,
+            "pf":     1.139,
+        },
+        # Best entry zone from audit (highest-PF entry retracement)
+        "best_entry": {
+            "label":   "Standard",
+            "retrace": 0.382,
+            "pf":      1.186,
+            "wr":      41.63,
+            "n":       2246,
+            "mean_r":  0.102,
+        },
+        # Direction-asymmetric stats — important warning
+        "by_direction": {
+            "long":  {"pf": 1.002, "n": 4014, "verdict": "BREAKEVEN"},
+            "short": {"pf": 1.280, "n": 4489, "verdict": "DECENT"},
+        },
+        # Constituent 17-combo names (used for "Similar to" annotation)
+        "constituent_combos": ["C6A-N", "C6A-A", "C5B-A", "C5B-N", "C1A-A"],
+        "primary": {
+            "tf":         "4h",
+            "direction":  "long",        # placeholder, set per-signal
+            "entry_zone": "0%",
+            "entry_retrace": 0.382,      # Standard (best per audit)
+            "tp_R":       2.0,
+            "sl_method":  "atr_1.5x",
+            "sizing":     "FULL",
+            "n":      8503, "wr": 40.82, "mean_r": 0.078, "pf": 1.139,
+        },
+    },
+    "TIER_2": {
+        "name":           "TIER 2",
+        "label":          "TREND-FOLLOWING (MID CONVICTION)",
+        "combo_type":     "trend_following",
+        "criteria": {
+            "body_min":   0.50, "body_max":  0.60,
+            "vol_min":    2.00, "vol_max":   2.50,
+            "adx_min":    30.0, "adx_max":   50.0,
+            "regime_mode": "N",
+            "directions": ["long", "short"],
+        },
+        "tf_eligible":     ["1h", "4h", "1d"],
+        "rollup": {
+            "n":      2984,
+            "wr":     38.51,
+            "mean_r": 0.024,
+            "sharpe": 0.02,
+            "pf":     1.041,
+        },
+        "best_entry": {
+            "label":   "Sniper",
+            "retrace": 0.786,
+            "pf":      1.056,
+            "wr":      39.66,
+            "n":       469,
+            "mean_r":  0.032,
+        },
+        "by_direction": {
+            "long":  {"pf": 1.034, "n": 1467, "verdict": "BREAKEVEN"},
+            "short": {"pf": 1.047, "n": 1517, "verdict": "BREAKEVEN"},
+        },
+        "constituent_combos": ["C2A-A", "C2B-A", "C2B-N", "C1A-N", "C2A-N"],
+        "primary": {
+            "tf":         "4h",
+            "direction":  "long",
+            "entry_zone": "78.6%",
+            "entry_retrace": 0.786,
+            "tp_R":       2.0,
+            "sl_method":  "atr_1.5x",
+            "sizing":     "HALF",
+            "n":      2984, "wr": 38.51, "mean_r": 0.024, "pf": 1.041,
+        },
+        # Marginal-edge warning shown in UI and Telegram
+        "warning": "PF 1.04 — paper-trade only until edge confirmed",
+    },
+    "TIER_3": {
+        "name":           "TIER 3",
+        "label":          "COUNTERTREND / FADE",
+        "combo_type":     "countertrend",
+        "criteria": {
+            "body_min":   0.80, "body_max":  1.01,
+            "vol_min":    4.00, "vol_max":   999.0,
+            "adx_min":    0.0,  "adx_max":   999.0,    # no ADX filter
+            "regime_mode": "N",
+            "directions": ["long", "short"],
+            # signal_direction_required=None means "accept both candle dirs;
+            # trade direction will be the OPPOSITE of the candle for fade".
+            "signal_direction_required": None,
+            "trade_direction":           None,
+        },
+        "tf_eligible":     ["4h"],
+        "rollup": {
+            "n":      4383,
+            "wr":     38.85,
+            "mean_r": 0.082,
+            "sharpe": 0.06,
+            "pf":     1.139,
+        },
+        "best_entry": {
+            "label":   "Aggressive",
+            "retrace": 0.000,
+            "pf":      1.156,
+            "wr":      38.91,
+            "n":       1740,
+            "mean_r":  0.092,
+        },
+        "by_direction": {
+            # For CT, "trade direction" is what's tracked here (opposite of candle)
+            "long":  {"pf": 1.329, "n": 1184, "verdict": "STRONG"},
+            "short": {"pf": 1.079, "n": 3199, "verdict": "MARGINAL"},
+        },
+        "constituent_combos": ["CT1", "CT2", "CT3", "CT4", "CT5", "CT6", "CT7"],
+        "primary": {
+            "tf":            "4h",
+            "direction":     "short",     # opposite of candle, set per-signal
+            "entry_retrace": 0.000,       # Aggressive (best per audit)
+            "sl_method":     "atr_1.5x",  # 1.5x ATR or fixed_1.5pct
+            "tp_R":          2.0,
+            "sizing":        "HALF",
+            "n":      4383, "wr": 38.85, "mean_r": 0.082, "pf": 1.139,
+        },
+    },
+}
+
+
+def get_unified_tier_for_signal(sig: dict) -> Optional[dict]:
+    """
+    Return the unified TIER dict whose criteria match this signal, or None.
+    Tries TIER_1 first, then TIER_2, then TIER_3.
+
+    body_pct in `sig` may be in fraction (0-1) or percent (0-100) — auto-normalize.
+    """
+    body = abs(float(sig.get("body_pct", 0)))
+    if body > 1.5:
+        body = body / 100.0
+    vol = float(sig.get("vol_mult", 0))
+    adx = float(sig.get("adx", 0))
+
+    for tier_key, tier in UNIFIED_TIERS.items():
+        crit = tier["criteria"]
+        if not (crit["body_min"] <= body < crit["body_max"]):  continue
+        if not (crit["vol_min"]  <= vol  < crit["vol_max"]):   continue
+        if not (crit["adx_min"]  <= adx  < crit["adx_max"]):   continue
+        return tier
+    return None
+
+
+def find_similar_combo(sig: dict, tier: dict) -> Optional[str]:
+    """
+    Given a signal that matched a unified tier, return the name of the most-
+    similar individual combo from `tier["constituent_combos"]` (whose strict
+    criteria the signal falls inside). Returns None if no constituent matches.
+
+    Used for the "Similar to: C6A-A" annotation in scanner cards and Telegram.
+    """
+    body = abs(float(sig.get("body_pct", 0)))
+    if body > 1.5:
+        body = body / 100.0
+    vol = float(sig.get("vol_mult", 0))
+    adx = float(sig.get("adx", 0))
+    tf  = (sig.get("timeframe") or "").lower()
+    direction = sig.get("direction", "")
+
+    for combo_name in tier["constituent_combos"]:
+        c = COMBOS_BY_NAME.get(combo_name)
+        if c is None:
+            continue
+        if tf not in c.get("tf_eligible", []):
+            continue
+        crit = c.get("criteria", {})
+        if not (crit.get("body_min", 0) <= body < crit.get("body_max", 1.01)):  continue
+        if not (crit.get("vol_min",  0) <= vol  < crit.get("vol_max",  999)):   continue
+        if not (crit.get("adx_min",  0) <= adx  < crit.get("adx_max",  999)):   continue
+        # Direction check (CT uses signal_direction_required, trend uses directions list)
+        if c.get("combo_type") == "countertrend":
+            sdr = crit.get("signal_direction_required")
+            if sdr is not None and direction != sdr:
+                continue
+        else:
+            if direction not in crit.get("directions", []):
+                continue
+        return combo_name
+    return None
+
+
+def tier_group_label(combo: dict) -> str:
+    """
+    Convert a 17-combo dict (from COMBOS_BY_NAME) to its user-facing tier group.
+    Mirrors the grouping used in the app UI:
+      countertrend → "Tier 3"
+      trend rank 1-5 → "Tier 1"
+      trend rank 6-10 → "Tier 2"
+    """
+    if combo.get("combo_type") == "countertrend":
+        return "Tier 3"
+    rank = int(combo.get("tier", 99))
+    if 1 <= rank <= 5:  return "Tier 1"
+    if 6 <= rank <= 10: return "Tier 2"
+    return "Tier ?"
+
+
+# ============================================================================
 # CONFIDENCE LEVELS — strict / relaxed / loose match support (Apr 29, 2026)
 # ============================================================================
 # Each combo's STRICT criteria is the empirically-validated band from the audit.

@@ -162,7 +162,17 @@ def _qf_signal_matches_at_level(sig: dict, combo: dict, btc_regime: str,
 
     sig_dir = sig.get("direction", "")
     if combo_type == "countertrend":
-        if sig_dir != crit.get("signal_direction_required", ""):
+        # signal_direction_required can be:
+        #   - a string ('long' or 'short') for the 17 individual CT combos,
+        #     which require the candle direction to match exactly
+        #   - None for the unified TIER_3 synth combo, meaning "accept both
+        #     directions, the tier's bands are direction-agnostic"
+        # The previous check `sig_dir != crit.get("signal_direction_required", "")`
+        # treated None as a value that no string equals, silently rejecting every
+        # signal — that's why TIER_3 never matched in the app while the Telegram
+        # worker (which goes through a different combo data path) still alerted.
+        sdr = crit.get("signal_direction_required")
+        if sdr is not None and sig_dir != sdr:
             return False
     else:
         if sig_dir not in crit["directions"]:
@@ -170,6 +180,10 @@ def _qf_signal_matches_at_level(sig: dict, combo: dict, btc_regime: str,
 
     try:
         body_abs = abs(float(sig.get("body_pct", 0)))
+        # body_pct in signal dicts is stored as 0-100 (e.g. 72.3 for 72.3%);
+        # criteria body_min/body_max are in 0-1 scale — normalize before compare.
+        if body_abs > 1.5:
+            body_abs = body_abs / 100.0
         vol_mult = float(sig.get("vol_mult", 0))
         adx      = float(sig.get("adx", 0))
     except (TypeError, ValueError):
@@ -316,6 +330,24 @@ def _qf_render_level_summary_html(matches: list) -> str:
         f'(sizing {sizing} × {size_factor:.2f}) · '
         f'expected PF <b>~{expected_pf:.2f}</b> '
         f'(audit {rollup_pf:.2f} × {pf_haircut:.2f})'
+        f'</div>'
+    )
+
+
+def _qf_render_similar_to_banner(matches: list) -> str:
+    """For unified-tier matches, show 'Similar to: COMBO_NAME' as a hint."""
+    if not matches:
+        return ""
+    primary = matches[0]
+    similar = primary.get("_similar_to")
+    if not similar:
+        return ""
+    return (
+        f'<div style="margin:4px 0;padding:6px 10px;'
+        f'background:rgba(167,139,250,0.08);border-left:3px solid #a78bfa;'
+        f'border-radius:4px;font-size:11px;color:#ccd6f6;">'
+        f'ⓘ This signal is similar to combo <b style="color:#a78bfa;">{similar}</b> '
+        f'in the audit (its strict bands match this candle).'
         f'</div>'
     )
 
@@ -912,6 +944,36 @@ def _render_decision_matrix_html(
             _bt_conf = "HIGH" if _n >= 20 else ("MEDIUM" if _n >= 10 else "LOW")
             _pf_s = "∞" if _pf >= 9.9 else f"{_pf:.2f}"
             rows.append(("📊 Backtest", bt_v, _bt_conf, f"PF {_pf_s} · n={_n}"))
+
+    # ── 4b. CT Grid Audit row (Tier 3 unified only) ───────────────────────────
+    _bt_meta_dm = (bt_res or {}).get("meta", {}) or {}
+    _is_unified_t3_dm = _bt_meta_dm.get("ct_unified_tier3", False)
+    if _is_unified_t3_dm and bt_res:
+        _ct_per_method = (bt_res.get("per_method") or {})
+        if _ct_per_method:
+            _ct_best_dm = max(
+                (m for m in _ct_per_method.values() if m.get("n", 0) >= 5),
+                key=lambda m: m.get("ev", -999),
+                default=None,
+            )
+            if _ct_best_dm:
+                ev_dm  = _ct_best_dm.get("ev", 0)
+                wr_dm  = _ct_best_dm.get("win_rate", 0)
+                n_dm   = _ct_best_dm.get("n", 0)
+                if ev_dm >= 0.20:
+                    ct_v = "STRONG"
+                    pass_count += 1
+                elif ev_dm >= 0.05:
+                    ct_v = "DECENT"
+                    pass_count += 1
+                else:
+                    ct_v = "MARGINAL"
+                _ct_conf = "HIGH" if n_dm >= 20 else ("MEDIUM" if n_dm >= 10 else "LOW")
+                _ct_zone = _ct_best_dm.get("zone", "?")
+                rows.append((
+                    "🧮 CT Grid Audit", ct_v, _ct_conf,
+                    f"Best zone: {_ct_zone} · EV {ev_dm:+.3f}R · WR {wr_dm:.0f}%"
+                ))
 
     # ── 5. Macro / regime ─────────────────────────────────────────────────────
     _reg    = sig.get("regime", "")          # GREEN / YELLOW / RED
@@ -2390,7 +2452,16 @@ def _scanner_get_universe(min_volume_usdt: float) -> list:
     return universe
 
 
-def _scanner_fetch_candles(symbol: str, interval: str, limit: int = 100) -> pd.DataFrame:
+def _scanner_get_universe_all() -> list:
+    """
+    Fetch ALL Binance USDT-margined perpetuals (no volume gate, no top-N cap).
+    Returns list of dicts sorted by volume desc: {symbol, volume_24h, price}.
+    Covers ~340 symbols as of Phase 4 (May 2026).
+    """
+    return _scanner_get_universe(min_volume_usdt=0.0)
+
+
+def _scanner_fetch_candles(symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
     """
     Fetch last `limit` klines for symbol/interval from Binance.
     Returns cleaned DataFrame or empty DataFrame on failure.
@@ -2870,6 +2941,7 @@ def _scanner_score_signal(
         "regime":        regime_verdict,
         "regime_score":  regime_score_val,
         "body_pct":      round(abs(body_pct) * 100, 1),
+        "body_abs_price": round(abs(body_abs), 8),
         "vol_mult":      round(vol_mult, 2),
         "adx":           round(adx_val,  1),
         "di_plus":       round(di_plus,  1),
@@ -2882,6 +2954,13 @@ def _scanner_score_signal(
         "candle_rank":   round(c_rank,   2),
         "vol_rank":      round(v_rank,   2),
         "close":         close_px,
+        # OHLC + atr stored so downstream consumers (Tier 3 flip path,
+        # CT card, post-scan recompute) can rebuild the trade plan without
+        # going back to the candle dataframe.
+        "open":          open_px,
+        "high":          high_px,
+        "low":           low_px,
+        "atr14":         atr14_val,
         "entry":         entry,
         "sl":            sl,
         "tp2r":          tp2r,
@@ -4364,6 +4443,247 @@ def _scanner_quick_backtest(sig: dict) -> dict:
     }
 
 
+# ── Tier 3 CT method grid (Phase 4b May 2026) ────────────────────────────────
+# When the user has unified TIER_3 ticked (synth combo with _unified_tier=
+# "TIER_3"), the CT backtester sweeps a 4x2x3=24 method grid instead of the
+# single primary-plan method used by the audited CT1-CT7 individual combos.
+# This gives the user multiple entry zones to choose from in the card UI.
+#
+# Negative retracement = "let the move extend further before fading":
+#   0.000  → immediate fade at trigger close (Aggressive)
+#   -0.10  → wait for 10% body extension past close (Shallow)
+#   -0.27  → wait for 27% body extension (Standard CT)
+#   -0.618 → wait for 61.8% body extension (Deep / exhaustion)
+#
+# SL methods: ATR (1.5x) tracks volatility; fixed (1.5%) is conservative cap.
+# TP multiples: 2R / 2.5R / 3R let user pick risk:reward profile.
+_CT_TIER3_ZONES = [
+    {"name": "Aggressive",  "retrace":  0.000, "expiry_bars": 0,
+     "desc": "Immediate fade at trigger close. Highest fill rate, lowest R:R."},
+    {"name": "Shallow",     "retrace": -0.100, "expiry_bars": 3,
+     "desc": "Wait for 10% body extension. Slightly better entry."},
+    {"name": "Standard CT", "retrace": -0.270, "expiry_bars": 3,
+     "desc": "Wait for 27% extension. Balanced fill rate vs. R:R."},
+    {"name": "Deep",        "retrace": -0.618, "expiry_bars": 4,
+     "desc": "Wait for 61.8% exhaustion. Best entry but lowest fill rate."},
+]
+_CT_TIER3_SL_METHODS = ["atr_1.5x", "fixed_1.5pct"]   # 2 methods
+_CT_TIER3_TP_MULTS   = [2.0, 2.5, 3.0]                 # 3 multiples
+
+
+def _ct_simulate_zone(df, qualifying_bars: list, zone_cfg: dict,
+                      sl_method: str, tp_R: float,
+                      signal_dir_resolver,
+                      fixed_sl_pct: float, atr_mult: float, max_hold: int) -> tuple:
+    """
+    Simulate ONE (zone × SL × TP) variant across all qualifying CT trigger bars.
+
+    Args:
+        df: OHLCV DataFrame with body_pct, vol_mult, atr14 columns.
+        qualifying_bars: list of bar indices that passed body/vol/floor filters.
+        zone_cfg: dict from _CT_TIER3_ZONES (has 'name', 'retrace', 'expiry_bars').
+        sl_method: 'atr_1.5x' or 'fixed_1.5pct'.
+        tp_R: take-profit multiple (e.g. 2.0).
+        signal_dir_resolver: None for unified TIER_3 (resolve trade dir from candle),
+                             or "short"/"long" for individual CT combos.
+        fixed_sl_pct: SL distance for 'fixed_1.5pct' (typically 0.015).
+        atr_mult: ATR multiplier for 'atr_1.5x' (typically 1.5).
+        max_hold: bars to hold before time-stop.
+
+    Returns:
+        (trades_raw, n_filled, n_expired): list of trade dicts and counts.
+    """
+    import math
+    entry_ret = float(zone_cfg["retrace"])
+    expiry    = int(zone_cfg["expiry_bars"])
+    n_df      = len(df)
+    trades    = []
+    n_filled  = 0
+    n_expired = 0
+
+    for i in qualifying_bars:
+        bar      = df.iloc[i]
+        body_pct = float(bar.get("body_pct", 0) or 0)
+        is_bull  = body_pct > 0
+
+        # Resolve trade direction.
+        # For unified TIER_3 (signal_dir_resolver=None), trade is OPPOSITE of candle.
+        # For CT1-CT7, signal_dir_resolver is a string; this helper isn't called for those.
+        trade_dir = "short" if is_bull else "long"
+
+        close_v  = float(bar["close"])
+        open_v   = float(bar.get("open", close_v))
+        body_abs = abs(close_v - open_v)
+        atr14    = float(bar.get("atr14", close_v * 0.02) or close_v * 0.02)
+        if close_v <= 0 or body_abs <= 0:
+            continue
+
+        # Entry target — negative retrace pushes entry FURTHER in candle direction
+        if trade_dir == "long":
+            # Fading bear candle: wait for further drop, enter long below close
+            entry_target = round(close_v + body_abs * entry_ret, 8)   # entry_ret<0 → below close
+            entry_target = max(entry_target, close_v * 0.85)          # floor at -15%
+        else:
+            # Fading bull candle: wait for further rise, enter short above close
+            entry_target = round(close_v - body_abs * entry_ret, 8)   # -entry_ret>0 → above close
+            entry_target = min(entry_target, close_v * 1.15)          # cap at +15%
+
+        # Walk forward to find fill (or expire)
+        fill_idx = None
+        if entry_ret == 0.0:
+            # Immediate fill at next bar open
+            if i + 1 >= n_df:
+                continue
+            fill_idx    = i + 1
+            entry_price = float(df.iloc[i + 1]["open"])
+        else:
+            # Limit-style: walk forward up to expiry bars looking for touch
+            fill_horizon = min(i + 1 + expiry, n_df - 1)
+            for j in range(i + 1, fill_horizon + 1):
+                bar_j = df.iloc[j]
+                bj_h = float(bar_j["high"])
+                bj_l = float(bar_j["low"])
+                if bj_l <= entry_target <= bj_h:
+                    fill_idx    = j
+                    entry_price = entry_target
+                    break
+            if fill_idx is None:
+                n_expired += 1
+                continue
+
+        if entry_price <= 0:
+            continue
+
+        # Compute SL based on method
+        if sl_method == "atr_1.5x":
+            risk = atr14 * atr_mult
+        else:   # fixed_1.5pct
+            risk = entry_price * fixed_sl_pct
+        if risk <= 0:
+            continue
+
+        if trade_dir == "long":
+            sl = entry_price - risk
+            tp = entry_price + risk * tp_R
+        else:
+            sl = entry_price + risk
+            tp = entry_price - risk * tp_R
+
+        # Walk forward for exit
+        last_idx   = min(fill_idx + max_hold, n_df - 1)
+        outcome    = "TIMEOUT"
+        exit_idx   = last_idx
+        exit_price = float(df.iloc[last_idx]["close"])
+
+        for k in range(fill_idx + 1, last_idx + 1):
+            barK = df.iloc[k]
+            kh = float(barK["high"])
+            kl = float(barK["low"])
+            if trade_dir == "long":
+                tp_hit = kh >= tp
+                sl_hit = kl <= sl
+            else:
+                tp_hit = kl <= tp
+                sl_hit = kh >= sl
+            if tp_hit and sl_hit:
+                outcome    = "SL"
+                exit_idx   = k
+                exit_price = sl
+                break
+            elif tp_hit:
+                outcome    = "TP"
+                exit_idx   = k
+                exit_price = tp
+                break
+            elif sl_hit:
+                outcome    = "SL"
+                exit_idx   = k
+                exit_price = sl
+                break
+
+        if outcome == "TP":
+            realized_r = tp_R
+        elif outcome == "SL":
+            realized_r = -1.0
+        else:
+            if trade_dir == "long":
+                realized_r = (exit_price - entry_price) / risk
+            else:
+                realized_r = (entry_price - exit_price) / risk
+
+        trades.append({
+            "trigger_idx": i,
+            "fill_idx":    fill_idx,
+            "exit_idx":    exit_idx,
+            "bars_held":   exit_idx - fill_idx,
+            "entry":       entry_price,
+            "sl":          sl,
+            "tp":          tp,
+            "exit_price":  exit_price,
+            "outcome":     outcome,
+            "realized_r":  realized_r,
+            "trade_dir":   trade_dir,
+        })
+        n_filled += 1
+
+    return trades, n_filled, n_expired
+
+
+def _ct_compute_method_stats(trades: list, n_filled: int, n_expired: int,
+                             n_qualifying: int, zone_name: str, sl_label: str,
+                             tp_mult: float) -> dict:
+    """
+    Aggregate one method's trades into the same dict shape that
+    _scanner_quick_backtest's method_results uses, so all downstream rendering
+    (zone_best, WFO, ML, card) works without modification.
+
+    Required keys for trend-tier compatibility: zone, sl_label, mgmt, tp_mult,
+    n, win_rate, ev, pf, ev_weighted, wr_weighted, avg_r, avg_bars, buckets,
+    newest_bucket, n_qualifying, n_filled, n_expired, fill_rate, insufficient.
+    """
+    if not trades:
+        return {
+            "zone": zone_name, "sl_label": sl_label, "mgmt": "Simple",
+            "tp_mult": tp_mult, "n": 0, "win_rate": 0.0, "ev": 0.0, "pf": 0.0,
+            "ev_weighted": 0.0, "wr_weighted": 0.0, "avg_r": 0.0, "avg_bars": 0,
+            "insufficient": True, "buckets": [],
+            "newest_bucket": {"n": 0, "wr": 0.0, "ev": 0.0},
+            "n_qualifying": n_qualifying, "n_filled": n_filled,
+            "n_expired": n_expired,
+            "fill_rate": (n_filled / n_qualifying) if n_qualifying > 0 else 0.0,
+        }
+
+    rs       = [t["realized_r"] for t in trades]
+    wins     = [r for r in rs if r > 0]
+    losses   = [r for r in rs if r <= 0]
+    sum_w    = sum(wins)
+    sum_l    = abs(sum(losses))
+    pf       = (sum_w / sum_l) if sum_l > 0 else (float("inf") if sum_w > 0 else 0.0)
+    avg_r    = sum(rs) / len(rs)
+    avg_bars = sum(t["bars_held"] for t in trades) / len(trades)
+    win_rate = 100.0 * len(wins) / len(trades)
+
+    return {
+        "zone": zone_name, "sl_label": sl_label, "mgmt": "Simple",
+        "tp_mult": tp_mult,
+        "n": len(trades),
+        "win_rate": round(win_rate, 2),
+        "ev": round(avg_r, 4),
+        "pf": round(pf, 3) if pf != float("inf") else 999.0,
+        "ev_weighted": round(avg_r, 4),    # no regime weighting for CT for now
+        "wr_weighted": round(win_rate, 2),
+        "avg_r": round(avg_r, 4),
+        "avg_bars": round(avg_bars, 2),
+        "insufficient": len(trades) < 5,
+        "buckets": [],                       # not computed for CT grid
+        "newest_bucket": {"n": len(trades), "wr": round(win_rate, 2), "ev": round(avg_r, 4)},
+        "n_qualifying": n_qualifying,
+        "n_filled": n_filled,
+        "n_expired": n_expired,
+        "fill_rate": (n_filled / n_qualifying) if n_qualifying > 0 else 0.0,
+    }
+
+
 def _scanner_countertrend_quick_backtest(sig: dict, combo: dict) -> dict:
     """
     Per-coin countertrend backtest — mirrors _scanner_quick_backtest's return shape
@@ -4450,159 +4770,362 @@ def _scanner_countertrend_quick_backtest(sig: dict, combo: dict) -> dict:
     n_df = len(df)
     _method_key = f"CT {combo['name']} / {sl_method} / Simple / TP{tp_R:.1f}R"
 
+    # ── Tier 3 unified path: sweep 24-method grid ─────────────────────────────
+    _is_unified_tier3 = (combo.get("_unified_tier") == "TIER_3")
+
+    if _is_unified_tier3:
+        # Build the method-results dict in the same shape as the trend tier's
+        # method_results (used by zone_best computation, WFO, ML, card render).
+        method_results = {}
+        _all_qualifying_count = 0   # qualifying triggers (filter passers, before fill check)
+
+        # Pre-pass: find all qualifying trigger bars ONCE so we can re-use them
+        # across the 24 method variants. This is a major optimization — avoids
+        # 24x duplicate filter passes.
+        qualifying_bars = []
+        for i in range(14, n_df - 2):
+            bar        = df.iloc[i]
+            body_pct_v = float(bar.get("body_pct", 0) or 0)
+            vol_mult_v = float(bar.get("vol_mult",  0) or 0)
+            is_bull    = body_pct_v > 0
+            # signal_dir filter — for unified TIER_3 with signal_dir=None, accept both
+            if signal_dir == "short" and is_bull:     continue
+            if signal_dir == "long"  and not is_bull: continue
+            # signal_dir is None for unified TIER_3 — both directions pass
+            body_abs_frac = abs(body_pct_v)
+            if not (body_min <= body_abs_frac < body_max):  continue
+            if not (vol_min  <= vol_mult_v   < vol_max):    continue
+            # Hard CT body floor (matches level system)
+            if body_abs_frac < 0.78:  continue
+            qualifying_bars.append(i)
+
+        _all_qualifying_count = len(qualifying_bars)
+
+        # Sweep the grid
+        for zone_cfg in _CT_TIER3_ZONES:
+            for sl_method_iter in _CT_TIER3_SL_METHODS:
+                for tp_R_iter in _CT_TIER3_TP_MULTS:
+                    _zone_trades, _zone_filled, _zone_expired = _ct_simulate_zone(
+                        df, qualifying_bars,
+                        zone_cfg=zone_cfg,
+                        sl_method=sl_method_iter,
+                        tp_R=tp_R_iter,
+                        signal_dir_resolver=signal_dir,    # may be None for TIER_3
+                        fixed_sl_pct=FIXED_SL,
+                        atr_mult=ATR_MULT,
+                        max_hold=MAX_HOLD,
+                    )
+                    # Build method key matching trend-tier convention
+                    _method_key_iter = (
+                        f"CT TIER_3 / {zone_cfg['name']} / {sl_method_iter} "
+                        f"/ Simple / TP{tp_R_iter:.1f}R"
+                    )
+                    method_results[_method_key_iter] = _ct_compute_method_stats(
+                        _zone_trades, _zone_filled, _zone_expired, _all_qualifying_count,
+                        zone_name=zone_cfg["name"], sl_label=sl_method_iter,
+                        tp_mult=tp_R_iter,
+                    )
+
+        # Skip the original single-method loop
+        trades_raw    = []   # zone_best computation reads from method_results, not trades_raw
+        _n_qualifying = _all_qualifying_count
+        _n_filled     = sum(m.get("n", 0) for m in method_results.values()) // max(
+            len(_CT_TIER3_SL_METHODS) * len(_CT_TIER3_TP_MULTS), 1)
+        _n_expired    = _n_qualifying * 4 - _n_filled    # 4 zones, rough
+
+    else:
+        # ── ORIGINAL single-method CT path (CT1-CT7) — unchanged ──────────────
+        method_results = {}   # keep the existing trades_raw loop below populating this
+
     # ── Simulate single-method CT trades ──────────────────────────────────────
     # Unlike trend-following's 72-method grid, CT combos specify one validated
     # primary plan. We simulate exactly that plan.
-    trades_raw    = []
-    _n_qualifying = 0
-    _n_filled     = 0
-    _n_expired    = 0
+    # NOTE: this block is ONLY executed when _is_unified_tier3 is False.
+    if not _is_unified_tier3:
+        trades_raw    = []
+        _n_qualifying = 0
+        _n_filled     = 0
+        _n_expired    = 0
 
-    for i in range(14, n_df - 2):
-        bar      = df.iloc[i]
-        body_pct = float(bar.get("body_pct", 0) or 0)   # fraction 0-1 from df
-        vol_mult = float(bar.get("vol_mult",  0) or 0)
-        is_bull  = body_pct > 0
+        for i in range(14, n_df - 2):
+            bar      = df.iloc[i]
+            body_pct = float(bar.get("body_pct", 0) or 0)   # fraction 0-1 from df
+            vol_mult = float(bar.get("vol_mult",  0) or 0)
+            is_bull  = body_pct > 0
 
-        # signal_dir filter: "short" → scanner flagged a BEAR candle; "long" → BULL
-        if signal_dir == "short" and is_bull:      continue
-        if signal_dir == "long"  and not is_bull:  continue
+            # signal_dir filter: "short" → scanner flagged a BEAR candle; "long" → BULL
+            if signal_dir == "short" and is_bull:      continue
+            if signal_dir == "long"  and not is_bull:  continue
 
-        # Body band (fraction, matches df body_pct units and combo criteria units)
-        body_abs_frac = abs(body_pct)
-        if not (body_min <= body_abs_frac < body_max):  continue
+            # Body band (fraction, matches df body_pct units and combo criteria units)
+            body_abs_frac = abs(body_pct)
+            if not (body_min <= body_abs_frac < body_max):  continue
 
-        # Vol band
-        if not (vol_min <= vol_mult < vol_max):  continue
+            # Vol band
+            if not (vol_min <= vol_mult < vol_max):  continue
 
-        _n_qualifying += 1
+            _n_qualifying += 1
 
-        close_v  = float(bar["close"])
-        open_v   = float(bar.get("open", close_v))
-        body_abs = abs(close_v - open_v)     # candle body in price units
-        atr14    = float(bar.get("atr14", close_v * 0.02) or close_v * 0.02)
-        bar_low  = float(bar.get("low",  close_v))
-        bar_high = float(bar.get("high", close_v))
-        if close_v <= 0:
-            continue
+            close_v  = float(bar["close"])
+            open_v   = float(bar.get("open", close_v))
+            body_abs = abs(close_v - open_v)     # candle body in price units
+            atr14    = float(bar.get("atr14", close_v * 0.02) or close_v * 0.02)
+            bar_low  = float(bar.get("low",  close_v))
+            bar_high = float(bar.get("high", close_v))
+            if close_v <= 0:
+                continue
 
-        # ── Entry target ──────────────────────────────────────────────────────
-        # entry_ret is negative → wick AGAINST the signal candle's direction.
-        # "Signal candle direction" is the SCANNER's candle (bear for CT1-4, bull for CT5-7).
-        # LONG  (fading bear): bounce UP from close → entry = close - entry_ret * body_abs
-        #   entry_ret < 0 → -entry_ret > 0 → entry ABOVE close (wait for bounce up).
-        # SHORT (fading bull): pullback DOWN from close → entry = close + entry_ret * body_abs
-        #   entry_ret < 0 → adds a negative → entry BELOW close (wait for pullback down).
-        # entry_ret == 0 → immediate fill at close (both directions).
-        if trade_dir == "long":
-            # -entry_ret is positive when entry_ret<0 → entry above close (bounce up)
-            entry_target = round(close_v - body_abs * entry_ret, 8)
-            entry_target = min(entry_target, close_v * 1.15)    # sanity cap: max 15% above close
-        else:
-            # entry_ret is negative → close + negative → entry below close (pullback down)
-            entry_target = round(close_v + body_abs * entry_ret, 8)
-            entry_target = max(entry_target, close_v * 0.85)    # sanity floor: max 15% below close
-
-        # ── Stop loss ─────────────────────────────────────────────────────────
-        if sl_method == "wick_anchor":
+            # ── Entry target ──────────────────────────────────────────────────────
+            # entry_ret is negative → wick AGAINST the signal candle's direction.
+            # "Signal candle direction" is the SCANNER's candle (bear for CT1-4, bull for CT5-7).
+            # LONG  (fading bear): bounce UP from close → entry = close - entry_ret * body_abs
+            #   entry_ret < 0 → -entry_ret > 0 → entry ABOVE close (wait for bounce up).
+            # SHORT (fading bull): pullback DOWN from close → entry = close + entry_ret * body_abs
+            #   entry_ret < 0 → adds a negative → entry BELOW close (wait for pullback down).
+            # entry_ret == 0 → immediate fill at close (both directions).
             if trade_dir == "long":
-                # SL just below the bear candle's wick low
-                sl_px = round(bar_low * (1 - 0.001), 8)
+                # -entry_ret is positive when entry_ret<0 → entry above close (bounce up)
+                entry_target = round(close_v - body_abs * entry_ret, 8)
+                entry_target = min(entry_target, close_v * 1.15)    # sanity cap: max 15% above close
             else:
-                # SL just above the bull candle's wick high
-                sl_px = round(bar_high * (1 + 0.001), 8)
-        elif sl_method == "atr_1.5x":
-            if trade_dir == "long":
-                sl_px = round(entry_target - ATR_MULT * atr14, 8)
-                sl_px = max(sl_px, entry_target * (1 - 0.06))   # clamp: max 6% SL
-            else:
-                sl_px = round(entry_target + ATR_MULT * atr14, 8)
-                sl_px = min(sl_px, entry_target * (1 + 0.06))
-        else:
-            # fixed_1.5pct — matches FIXED_SL constant above
-            if trade_dir == "long":
-                sl_px = round(entry_target * (1 - FIXED_SL), 8)
-            else:
-                sl_px = round(entry_target * (1 + FIXED_SL), 8)
+                # entry_ret is negative → close + negative → entry below close (pullback down)
+                entry_target = round(close_v + body_abs * entry_ret, 8)
+                entry_target = max(entry_target, close_v * 0.85)    # sanity floor: max 15% below close
 
-        risk_amt = abs(entry_target - sl_px)
-        # Skip degenerate SL (>15% risk, or zero, or directionally inverted)
-        if risk_amt <= 0 or risk_amt / entry_target > 0.15:
-            continue
-        if trade_dir == "long"  and entry_target <= sl_px:  continue
-        if trade_dir == "short" and entry_target >= sl_px:  continue
-
-        if trade_dir == "long":
-            tp_px = round(entry_target + tp_R * risk_amt, 8)
-        else:
-            tp_px = round(entry_target - tp_R * risk_amt, 8)
-
-        # ── Fill logic ────────────────────────────────────────────────────────
-        # entry_ret == 0 → immediate fill at trigger bar close.
-        # entry_ret != 0 → wait up to EXPIRY_BARS for the wick to touch entry.
-        immediate    = (abs(entry_ret) < 1e-9)
-        entry_filled = immediate
-        entry_fill_bar = i if immediate else None
-        EXPIRY_BARS  = 0 if immediate else 3    # mirrors Standard zone expiry
-        result       = "OPEN"
-        bars_held    = 0
-        r_mult       = 0.0
-        j            = i    # ensure j is defined for label_end_bar after inner loop
-
-        for j in range(i + 1, min(i + 1 + MAX_HOLD + EXPIRY_BARS + 1, n_df)):
-            fb = df.iloc[j]
-            hi = float(fb["high"])
-            lo = float(fb["low"])
-
-            if not entry_filled:
-                # LONG: entry is ABOVE close (bounce up) → filled when hi touches it
-                # SHORT: entry is BELOW close (pullback down) → filled when lo touches it
-                fill_cond = (hi >= entry_target if trade_dir == "long"
-                             else lo <= entry_target)
-                if fill_cond:
-                    entry_filled   = True
-                    entry_fill_bar = j
+            # ── Stop loss ─────────────────────────────────────────────────────────
+            if sl_method == "wick_anchor":
+                if trade_dir == "long":
+                    # SL just below the bear candle's wick low
+                    sl_px = round(bar_low * (1 - 0.001), 8)
                 else:
-                    if EXPIRY_BARS > 0 and (j - i) >= EXPIRY_BARS:
-                        result = "EXPIRED"; break
-                    continue
+                    # SL just above the bull candle's wick high
+                    sl_px = round(bar_high * (1 + 0.001), 8)
+            elif sl_method == "atr_1.5x":
+                if trade_dir == "long":
+                    sl_px = round(entry_target - ATR_MULT * atr14, 8)
+                    sl_px = max(sl_px, entry_target * (1 - 0.06))   # clamp: max 6% SL
+                else:
+                    sl_px = round(entry_target + ATR_MULT * atr14, 8)
+                    sl_px = min(sl_px, entry_target * (1 + 0.06))
+            else:
+                # fixed_1.5pct — matches FIXED_SL constant above
+                if trade_dir == "long":
+                    sl_px = round(entry_target * (1 - FIXED_SL), 8)
+                else:
+                    sl_px = round(entry_target * (1 + FIXED_SL), 8)
 
-            bars_held = j - entry_fill_bar
+            risk_amt = abs(entry_target - sl_px)
+            # Skip degenerate SL (>15% risk, or zero, or directionally inverted)
+            if risk_amt <= 0 or risk_amt / entry_target > 0.15:
+                continue
+            if trade_dir == "long"  and entry_target <= sl_px:  continue
+            if trade_dir == "short" and entry_target >= sl_px:  continue
 
-            if bars_held >= MAX_HOLD:
-                ep     = float(fb.get("close", entry_target))
-                r_mult = ((ep - entry_target) / risk_amt if trade_dir == "long"
-                          else (entry_target - ep) / risk_amt) - 0.002
-                result = "WIN" if r_mult > 0 else "LOSS"; break
+            if trade_dir == "long":
+                tp_px = round(entry_target + tp_R * risk_amt, 8)
+            else:
+                tp_px = round(entry_target - tp_R * risk_amt, 8)
 
-            # SL hit
-            sl_hit = (lo <= sl_px if trade_dir == "long" else hi >= sl_px)
-            if sl_hit:
-                r_mult = ((sl_px - entry_target) / risk_amt if trade_dir == "long"
-                          else (entry_target - sl_px) / risk_amt) - 0.002
-                result = "WIN" if r_mult > 0 else "LOSS"; break
+            # ── Fill logic ────────────────────────────────────────────────────────
+            # entry_ret == 0 → immediate fill at trigger bar close.
+            # entry_ret != 0 → wait up to EXPIRY_BARS for the wick to touch entry.
+            immediate    = (abs(entry_ret) < 1e-9)
+            entry_filled = immediate
+            entry_fill_bar = i if immediate else None
+            EXPIRY_BARS  = 0 if immediate else 3    # mirrors Standard zone expiry
+            result       = "OPEN"
+            bars_held    = 0
+            r_mult       = 0.0
+            j            = i    # ensure j is defined for label_end_bar after inner loop
 
-            # TP hit
-            tp_hit = (hi >= tp_px if trade_dir == "long" else lo <= tp_px)
-            if tp_hit:
-                r_mult = tp_R - 0.002
-                result = "WIN"; break
+            for j in range(i + 1, min(i + 1 + MAX_HOLD + EXPIRY_BARS + 1, n_df)):
+                fb = df.iloc[j]
+                hi = float(fb["high"])
+                lo = float(fb["low"])
 
-        if result in ("WIN", "LOSS"):
-            _n_filled += 1
-            trades_raw.append({
-                "result":        result,
-                "r_mult":        r_mult,
-                "bars_held":     bars_held,
-                "bar_index":     i,
-                "label_end_bar": j,
-                "direction":     trade_dir,    # CT trade direction (opposite of signal)
-                "outcome_class": _classify_outcome(r_mult),
-            })
-        elif result == "EXPIRED":
-            _n_expired += 1
+                if not entry_filled:
+                    # LONG: entry is ABOVE close (bounce up) → filled when hi touches it
+                    # SHORT: entry is BELOW close (pullback down) → filled when lo touches it
+                    fill_cond = (hi >= entry_target if trade_dir == "long"
+                                 else lo <= entry_target)
+                    if fill_cond:
+                        entry_filled   = True
+                        entry_fill_bar = j
+                    else:
+                        if EXPIRY_BARS > 0 and (j - i) >= EXPIRY_BARS:
+                            result = "EXPIRED"; break
+                        continue
+
+                bars_held = j - entry_fill_bar
+
+                if bars_held >= MAX_HOLD:
+                    ep     = float(fb.get("close", entry_target))
+                    r_mult = ((ep - entry_target) / risk_amt if trade_dir == "long"
+                              else (entry_target - ep) / risk_amt) - 0.002
+                    result = "WIN" if r_mult > 0 else "LOSS"; break
+
+                # SL hit
+                sl_hit = (lo <= sl_px if trade_dir == "long" else hi >= sl_px)
+                if sl_hit:
+                    r_mult = ((sl_px - entry_target) / risk_amt if trade_dir == "long"
+                              else (entry_target - sl_px) / risk_amt) - 0.002
+                    result = "WIN" if r_mult > 0 else "LOSS"; break
+
+                # TP hit
+                tp_hit = (hi >= tp_px if trade_dir == "long" else lo <= tp_px)
+                if tp_hit:
+                    r_mult = tp_R - 0.002
+                    result = "WIN"; break
+
+            if result in ("WIN", "LOSS"):
+                _n_filled += 1
+                trades_raw.append({
+                    "result":        result,
+                    "r_mult":        r_mult,
+                    "bars_held":     bars_held,
+                    "bar_index":     i,
+                    "label_end_bar": j,
+                    "direction":     trade_dir,    # CT trade direction (opposite of signal)
+                    "outcome_class": _classify_outcome(r_mult),
+                })
+            elif result == "EXPIRED":
+                _n_expired += 1
 
     # ── Aggregate stats ────────────────────────────────────────────────────────
+    # ── TIER_3 early return: method_results already fully populated ─────────
+    if _is_unified_tier3:
+        _decay_buckets  = _compute_decay_buckets(n_df)
+        _current_regime = float(sig.get("regime_score", 50) or 50)
+        _meta_t3 = {
+            "bars_requested": deep_limit, "bars_used": n_df,
+            "bars_coverage": (
+                f"{df.index[0].strftime('%Y-%m-%d')} → "
+                f"{df.index[-1].strftime('%Y-%m-%d')}"
+            ),
+            "bucket_count":   _decay_buckets["count"],
+            "bucket_weights": _decay_buckets["weights"],
+            "bucket_labels":  _decay_buckets["labels"],
+            "filter_ratio":   None,
+            "filter_min_body": body_min,
+            "filter_min_vol":  vol_min,
+            "regime_weighted": False,
+            "current_regime_score": _current_regime,
+            "ct_combo":    combo["name"],
+            "ct_trade_dir": "both",    # TIER_3 accepts both candle directions
+            "ct_unified_tier3": True,
+        }
+        # Derive a synthetic "best" entry from the highest-EV method (n >= 5)
+        _t3_best = max(
+            (m for m in method_results.values() if m.get("n", 0) >= 5),
+            key=lambda m: m.get("ev", -999),
+            default=list(method_results.values())[0] if method_results else {},
+        )
+        _t3_total_n = sum(m.get("n", 0) for m in method_results.values())
+
+        # ── Build candidates A and B for Step 2 ML and WFO (Phase 4b fix) ────
+        # Without these, _bt_for_pick.get("candidate_newest") is None, ML
+        # training gets "— n/a —" labels, and WFO runs on the bare 'best' dict
+        # without method_cfg metadata. Mirror the trend-tier candidate selection
+        # logic: A = best in newest bucket, B = best by all-time EV. For Tier 3
+        # we don't have time-decay buckets (the grid runs once across all bars),
+        # so "newest_bucket" stats == overall stats and the two candidates may
+        # collapse to the same method — that's OK, the UI handles _ab_same.
+        _t3_candidate_pool = {
+            f"CT_T3_{m['zone']}/{m['sl_label']}/TP{m['tp_mult']}": m
+            for m in method_results.values()
+            if not m.get("insufficient")
+            and m.get("n", 0) >= 5
+            and m.get("win_rate", 0) >= 30
+        }
+        # If strict pool is empty, fall back to relaxed (n>=3) so users still
+        # see candidates instead of "— n/a —" on coins with sparse triggers.
+        if not _t3_candidate_pool:
+            _t3_candidate_pool = {
+                f"CT_T3_{m['zone']}/{m['sl_label']}/TP{m['tp_mult']}": m
+                for m in method_results.values()
+                if m.get("n", 0) >= 3
+            }
+
+        _t3_cand_newest   = None
+        _t3_cand_weighted = None
+        if _t3_candidate_pool:
+            # Candidate A: highest EV (Tier 3 has no bucket weighting, so
+            # ev == ev_weighted == newest_bucket.ev)
+            _key_a = max(_t3_candidate_pool,
+                         key=lambda k: _t3_candidate_pool[k].get("ev", -999))
+            _m_a = _t3_candidate_pool[_key_a]
+            _t3_cand_newest = {
+                **_m_a,
+                "key": _key_a,
+                "method_cfg": {
+                    "zone":     _m_a["zone"],
+                    "sl_label": _m_a["sl_label"],
+                    "mgmt":     _m_a["mgmt"],
+                    "tp_mult":  _m_a["tp_mult"],
+                },
+            }
+            # Candidate B: highest WR among methods with n>=5 (different angle
+            # than EV — favors consistency over magnitude)
+            _key_b = max(_t3_candidate_pool,
+                         key=lambda k: _t3_candidate_pool[k].get("win_rate", -999))
+            _m_b = _t3_candidate_pool[_key_b]
+            _t3_cand_weighted = {
+                **_m_b,
+                "key": _key_b,
+                "method_cfg": {
+                    "zone":     _m_b["zone"],
+                    "sl_label": _m_b["sl_label"],
+                    "mgmt":     _m_b["mgmt"],
+                    "tp_mult":  _m_b["tp_mult"],
+                },
+            }
+
+        # Enrich 'best' with method_cfg too (WFO and AI verdict expect this key)
+        _t3_best_enriched = {
+            **_t3_best,
+            "key": (f"CT_T3_{_t3_best.get('zone','?')}/"
+                    f"{_t3_best.get('sl_label','?')}/"
+                    f"TP{_t3_best.get('tp_mult', 2.0)}"),
+            "method_cfg": {
+                "zone":     _t3_best.get("zone", "Aggressive"),
+                "sl_label": _t3_best.get("sl_label", "atr_1.5x"),
+                "mgmt":     _t3_best.get("mgmt", "Simple"),
+                "tp_mult":  _t3_best.get("tp_mult", 2.0),
+            },
+        } if _t3_best else {}
+
+        return {
+            "n":             _t3_total_n,
+            "wr":            round(_t3_best.get("win_rate", 0), 1),
+            "mean_r":        round(_t3_best.get("ev", 0), 3),
+            "pf":            round(_t3_best.get("pf", 0), 3),
+            "sample_trades": [],
+            "win_2r":   round(_t3_best.get("win_rate", 0), 1),
+            "win_3r":   round(_t3_best.get("win_rate", 0), 1),
+            "ev_2r":    round(_t3_best.get("ev", 0), 3),
+            "ev_3r":    round(_t3_best.get("ev", 0), 3),
+            "avg_bars": round(_t3_best.get("avg_bars", 0), 1),
+            "error":    None if _t3_total_n >= 3 else "Insufficient TIER_3 triggers",
+            "per_method":  method_results,
+            "zone_best":   {z["name"]: max(
+                (m for m in method_results.values()
+                 if m.get("zone") == z["name"] and m.get("n", 0) >= 3),
+                key=lambda m: m.get("ev", -999),
+                default={"zone": z["name"], "insufficient": True, "n": 0,
+                         "win_rate": 0, "ev": 0, "pf": 0, "ev_weighted": 0,
+                         "wr_weighted": 0, "avg_r": 0, "avg_bars": 0,
+                         "sl_label": "atr_1.5x", "mgmt": "Simple", "tp_mult": 2.0,
+                         "buckets": [], "newest_bucket": {"n": 0, "wr": 0, "ev": 0},
+                         "n_qualifying": _n_qualifying, "n_filled": 0,
+                         "n_expired": 0, "fill_rate": 0.0},
+            ) for z in _CT_TIER3_ZONES},
+            "best_key":    _t3_best_enriched.get("key", f"CT TIER_3 / {_t3_best.get('zone','?')} / {_t3_best.get('sl_label','?')} / Simple / TP{_t3_best.get('tp_mult',2.0):.1f}R"),
+            "best":        _t3_best_enriched if _t3_best_enriched else _t3_best,
+            "meta":        _meta_t3,
+            "candidate_newest":   _t3_cand_newest,
+            "candidate_weighted": _t3_cand_weighted,
+        }
+
     _fill_rate = (
         round(_n_filled / _n_qualifying * 100, 1) if _n_qualifying > 0 else 0.0
     )
@@ -4743,6 +5266,41 @@ def _scanner_mini_wfo(sig: dict, bt_results: dict) -> dict:
             "verdict":     "INSUFFICIENT",
             "method_used": best_key or "—",
             "note":        "Backtest found no valid method (need ≥ 4 trades). WFO cannot run.",
+        }
+
+    # ── Tier 3 unified path: skip trend-style WFO ───────────────────────────
+    # The trend-style WFO walks the entire candle history applying TREND retrace
+    # math (entry = close - body × ret_frac), which is wrong for CT (where
+    # ret_frac is negative and the entry must EXTEND past the candle, not
+    # retrace into it). Plus the trend WFO's _ZONE_CFG dict only knows the
+    # 4 trend zone names — Tier 3 uses Shallow/Standard CT/Deep which fall
+    # through to retrace=0 silently, producing wrong stats. Rather than
+    # silently rendering wrong WFO numbers, return a clean message pointing
+    # the user to the CT Grid Audit row in the Decision Matrix, which DOES
+    # validate Tier 3 across the whole 24-method grid against full history.
+    _wfo_meta = bt_results.get("meta", {}) or {}
+    if _wfo_meta.get("ct_unified_tier3"):
+        _per_method = bt_results.get("per_method") or {}
+        _t3_n_total = sum(m.get("n", 0) for m in _per_method.values())
+        return {
+            "ok":          True,
+            "verdict":     "BORDERLINE" if _t3_n_total >= 30 else "INSUFFICIENT",
+            "method_used": best_key,
+            "is_pf":       float(best.get("pf", 0)),
+            "is_n":        int(best.get("n", 0)),
+            "oos_pf":      float(best.get("pf", 0)),
+            "oos_wr":      float(best.get("win_rate", 0)),
+            "oos_n":       int(best.get("n", 0)),
+            "oos_is_ratio": 1.0,
+            "tier_label":  "TIER_3 — full-history grid (no IS/OOS split)",
+            "note": (
+                f"Tier 3 unified — backtest already evaluates the full 24-method "
+                f"grid against ALL available history ({_t3_n_total} total trades "
+                f"across all 24 zone × SL × TP combinations). Standard IS/OOS "
+                f"split-validation isn't run because each method's per-method n "
+                f"is too small for splitting. See the CT Grid Audit row in the "
+                f"Decision Matrix for the validated best zone."
+            ),
         }
 
     zone_name   = best.get("zone",     "Aggressive")
@@ -6476,54 +7034,64 @@ def render_auto_analyzer(ticker: str, df_full_1d: pd.DataFrame, tc: float,
                 )
 
     # ── Controls ──────────────────────────────────────────────────────────────
-    rc1, rc2, rc3 = st.columns(3)
+    # Phase 4 (May 2026): removed "Min 24h Volume" and "Coins to scan" sliders.
+    # Scanner now scans ALL USDT-margined perpetuals on Binance Futures (~340
+    # symbols) with no volume gate or top-N cap.
+    rc1, rc2 = st.columns(2)
     with rc1:
-        _vol_options = [500_000, 1_000_000, 5_000_000, 10_000_000, 25_000_000, 50_000_000]
-        _vol_labels  = ["$500K", "$1M", "$5M", "$10M", "$25M", "$50M"]
-        _vol_idx     = st.select_slider(
-            "Min 24h Volume",
-            options=range(len(_vol_options)),
-            value=2,
-            format_func=lambda i: _vol_labels[i],
-            key="mscanner_vol",
-        )
-        min_vol_usdt = _vol_options[_vol_idx]
-
-    with rc2:
-        max_coins = st.select_slider(
-            "Coins to scan",
-            options=[50, 100, 150, 200, 300],
-            value=150,
-            format_func=lambda x: f"Top {x} by volume",
-            key="mscanner_coins",
-        )
-
-    with rc3:
         scan_tfs = st.multiselect(
             "Timeframes",
             ["1H", "4H", "1D"],
             default=["1H", "4H", "1D"],
             key="mscanner_tfs",
         )
-
-    sc1, sc2, sc3 = st.columns(3)
-    with sc1:
-        min_body_pct = st.slider(
-            "Min body %", 50, 90, 65, 5, key="mscanner_body",
-            help="Candle body as % of total range. 65% = solid momentum, 80% = very strong.",
-        ) / 100
-    with sc2:
-        min_vol_mult = st.slider(
-            "Min volume ×", 1.0, 5.0, 1.5, 0.5, key="mscanner_volmult",
-            help="Volume multiplier vs 7-bar average. 1.5× = elevated, 3.0× = exceptional.",
-        )
-    with sc3:
+    with rc2:
         scan_dirs = st.multiselect(
             "Direction",
             ["long", "short"],
             default=["long"],
             key="mscanner_dir",
         )
+
+    sc1, sc2, sc3 = st.columns(3)
+    with sc1:
+        body_range = st.slider(
+            "Body % range",
+            min_value=0, max_value=100,
+            value=(50, 100), step=5,
+            key="mscanner_body_range",
+            help="Only show signals whose candle body falls in this percentage range.",
+        )
+    with sc2:
+        _vol_no_limit = st.checkbox(
+            "No upper limit",
+            key="mscanner_vol_no_limit",
+            help="When ticked, the volume upper bound is removed (any vol_mult ≥ lower bound passes).",
+        )
+        _vol_slider = st.slider(
+            "Volume × range",
+            min_value=1.0, max_value=30.0,
+            value=(1.5, 5.0), step=0.5,
+            key="mscanner_vol_range",
+            help="Volume multiple vs 7-bar average. Max slider is 30×; tick 'No upper limit' to remove the ceiling entirely.",
+            disabled=_vol_no_limit,
+        )
+        vol_range = (_vol_slider[0], 9999.0) if _vol_no_limit else _vol_slider
+    with sc3:
+        _adx_no_limit = st.checkbox(
+            "No upper limit",
+            key="mscanner_adx_no_limit",
+            help="When ticked, the ADX upper bound is removed (any ADX ≥ lower bound passes).",
+        )
+        _adx_slider = st.slider(
+            "ADX range",
+            min_value=0, max_value=100,
+            value=(20, 60), step=1,
+            key="mscanner_adx_range",
+            help="ADX(14) trend strength. Tick 'No upper limit' to remove the ceiling.",
+            disabled=_adx_no_limit,
+        )
+        adx_range = (_adx_slider[0], 9999) if _adx_no_limit else _adx_slider
 
     # ── Signal age filter (post-scan — no rescan needed) ───────────────────
     # bar_offset=1 means the most recently closed candle, 2 = one candle ago,
@@ -6549,53 +7117,32 @@ def render_auto_analyzer(ticker: str, df_full_1d: pd.DataFrame, tc: float,
     # Map labels back to bar_offset integers
     _allowed_offsets = {off for lbl, off in _age_options if lbl in sel_age_labels}
 
-    # ── QuantFlow Combo Filter (post-scan tagging by backtest-validated combos) ──
-    # The 5 combos are pre-registered (body × vol × ADX × regime) filter sets
-    # that each have been validated by oos_audit_v3a/v3c/v3d on 134 coins,
-    # 107,682 filled trades, 4.5-year window. Ticking a combo:
-    #  - Filters the scanner results to ONLY signals that match its criteria
-    #    (and respects the combo's eligible timeframe — e.g. C1A-A is
-    #    1D-dominant so a 4H signal won't match it even if body/vol/adx do).
-    #  - Each matching signal card shows a panel with the combo's rollup PF,
-    #    mean R per trade, recommended trade plan, and recent-period
-    #    verification — so the user (and the AI verdict) can decide trade /
-    #    no-trade with full historical evidence.
-    #  - When a signal matches multiple combos, the card is rendered ONCE
-    #    under the highest-PF combo with overlap notes for the others.
-    # If user ticks none, scanner behaves like before (no combo filter applied).
-    enabled_combos: list[str] = []
-    # Confidence-level scope for combo classification. Defaults to STRICT-only
-    # (the legacy behavior — only audit-validated matches). User can opt into
-    # RELAXED (small boundary widening, ~92% of audit PF) or LOOSE (more
-    # widening, ~80% of audit PF) when STRICT yields no setups. The chosen
-    # scope is threaded down to get_matching_combos AND attached to each sig
-    # so _scanner_ai_verdict reuses the same scope on its fallback classification.
+    # ── Unified Tier Filter (Phase 4 May 2026) ──────────────────────────────
+    # Replaces the 17-combo grid. Three tier checkboxes consolidate the
+    # individual combos into wider bands. The 17 combos still live in
+    # quantflow_combos.py as reference for the "similar to" annotation
+    # on each scanner card.
+    enabled_tiers: list = []
     _allowed_levels: tuple = ("STRICT",)
-    if _QFCOMBOS_OK:
+
+    if _QFCOMBOS_OK and hasattr(_qfcombos, "UNIFIED_TIERS"):
         with st.expander(
-            f"🎯 QuantFlow Combo Filter — backtest-validated setups "
-            f"({len(_qfcombos.COMBOS)} combos: Tier 1/2 trend + Tier 3 countertrend)",
+            "🎯 QuantFlow Tier Filter — backtest-validated unified bands",
             expanded=False,
         ):
-            # ── Confidence-level radio (Apr 29, 2026) ──────────────────────
-            # The level system is bundled in app.py (_qf_get_matching_combos)
-            # so this radio is always available regardless of which version of
-            # quantflow_combos.py is deployed.
             st.markdown(
                 f'<div style="background:#0d1f2d;border:1px solid #58a6ff;'
                 f'border-radius:6px;padding:8px 12px;font-size:11px;color:#ccd6f6;'
                 f'margin-bottom:10px;line-height:1.6;">'
-                f'<b style="color:#58a6ff;">{len(_qfcombos.COMBOS)} backtest-validated combos.</b> '
-                f'Each is a (body × volume × ADX × regime) filter set with full '
-                f'audit metrics. Ticking a combo restricts scanner output to '
-                f'signals matching its criteria, and shows historical PF / mean R '
-                f'/ recent verification on each card.<br>'
+                f'<b style="color:#58a6ff;">Unified bands across 3 tiers.</b> '
+                f'Each tier is a (body × volume × ADX) range that consolidates '
+                f'multiple audit-validated combos. Hard caps still apply: body '
+                f'0.60-0.70 dead zone (trend) and ADX > 50 are NEVER allowed.<br>'
                 f'<span style="color:#8892b0;">Audit window: '
                 f'{_qfcombos.AUDIT_DATA_START} → {_qfcombos.AUDIT_DATA_END} '
                 f'({_qfcombos.AUDIT_TIMESPAN_YEARS:.1f} yrs · '
                 f'{_qfcombos.AUDIT_TOTAL_COINS} coins · '
-                f'{_qfcombos.AUDIT_TOTAL_FILLED_TRADES:,} filled trades · '
-                f'{_qfcombos.AUDIT_VERSION})</span>'
+                f'{_qfcombos.AUDIT_TOTAL_FILLED_TRADES:,} filled trades)</span>'
                 f'</div>',
                 unsafe_allow_html=True,
             )
@@ -6607,21 +7154,7 @@ def render_auto_analyzer(ticker: str, df_full_1d: pd.DataFrame, tc: float,
                     "STRICT + RELAXED (small boundary widening, 75% sizing)",
                     "STRICT + RELAXED + LOOSE (more setups, 50% sizing)",
                 ],
-                index=0,
-                horizontal=False,
-                key="mscanner_level_scope",
-                help=(
-                    "STRICT = audit-validated criteria, full sizing, expected PF "
-                    "matches the combo's stated rollup PF.\n"
-                    "RELAXED = signal one-pad outside the strict band but inside "
-                    "safe regions (no 0.60-0.70 dead zone for trend, no ADX > 50, "
-                    "no CT body < 0.78). Sized at 0.75× and expected to deliver "
-                    "~92% of strict PF.\n"
-                    "LOOSE = wider widening (sized 0.50×, ~80% PF). Use sparingly "
-                    "and paper-trade first.\n\n"
-                    "Hard caps: body 0.60-0.70 dead zone, ADX > 50 cap, "
-                    "CT body 0.78 floor — enforced at ALL levels."
-                ),
+                index=0, horizontal=False, key="mscanner_level_scope",
             )
             if _level_choice.startswith("STRICT only"):
                 _allowed_levels = ("STRICT",)
@@ -6630,198 +7163,64 @@ def render_auto_analyzer(ticker: str, df_full_1d: pd.DataFrame, tc: float,
             else:
                 _allowed_levels = ("STRICT", "RELAXED", "LOOSE")
 
-            cb_cols = st.columns(1)
+            # Three tier checkboxes
+            for tier_key, tier in _qfcombos.UNIFIED_TIERS.items():
+                crit = tier["criteria"]
+                rollup = tier["rollup"]
+                pf_str = f"PF {rollup['pf']:.2f}" if rollup.get("pf", 0) > 0 else "PF (audit pending)"
+                n_str  = f"n={rollup['n']:,}" if rollup.get("n", 0) > 0 else "n=(audit pending)"
 
-            # Group combos: Tier 1 = ranks 1-5 (PF ≥ 1.30), Tier 2 = ranks 6-10
-            # (PF 1.14-1.23). Tier 1 is the primary set — strongest evidence,
-            # most stable in recent data. Tier 2 is the fallback — weaker edge
-            # AND most have weakened in 2025 recent verification (only C1A-N
-            # held up). Use Tier 2 for opportunistic coverage when no Tier 1
-            # signal is available. They render with separate headers and
-            # distinct visual styling so users don't conflate them.
-            #
-            # Tier 3 (countertrend) added Apr 28: 7 combos that detect
-            # strong-momentum candles and recommend the OPPOSITE trade
-            # (fade the exhaustion). Different combo_type, different fields
-            # (entry_retrace + sl_method instead of entry_zone), but same
-            # checkbox UX. Most STRENGTHENED in recent period — opposite to
-            # Tier 1/2 which mostly weakened.
-            _tier1_combos = [c for c in _qfcombos.COMBOS if c["tier"] <= 5]
-            _tier2_combos = [c for c in _qfcombos.COMBOS
-                             if 6 <= c["tier"] <= 10
-                             and c.get("combo_type", "trend_following") == "trend_following"]
-            _tier3_combos = [c for c in _qfcombos.COMBOS
-                             if c.get("combo_type") == "countertrend"]
-
-            # ── Per-tier "Select all" / "Clear" buttons (Apr 29, 2026) ─────
-            # Sets/clears all checkboxes in one tier with a single click.
-            # Mechanism: button click sets st.session_state[f"mscanner_combo_{name}"]
-            # for each combo in the tier, then triggers a rerun so the
-            # checkboxes (rendered AFTER these buttons in script order) pick
-            # up the new state. Without st.rerun() the change would only take
-            # effect after the next user interaction.
-            def _bulk_select_tier(tier_combos, value: bool):
-                for c in tier_combos:
-                    st.session_state[f"mscanner_combo_{c['name']}"] = value
-                st.rerun()
-
-            def _render_tier_select_buttons(tier_combos, tier_label: str):
-                """Two compact buttons: select-all / clear, per tier."""
-                bcol1, bcol2, _spacer = st.columns([1, 1, 4])
-                with bcol1:
-                    if st.button(f"✓ All {tier_label}",
-                                 key=f"mscanner_select_all_{tier_label}",
-                                 use_container_width=True,
-                                 help=f"Tick every combo in this tier"):
-                        _bulk_select_tier(tier_combos, True)
-                with bcol2:
-                    if st.button(f"✗ Clear {tier_label}",
-                                 key=f"mscanner_clear_all_{tier_label}",
-                                 use_container_width=True,
-                                 help=f"Untick every combo in this tier"):
-                        _bulk_select_tier(tier_combos, False)
-
-            def _render_combo_row(combo):
-                pf = combo["rollup"]["pf"]
-                mr = combo["rollup"]["mean_r"]
-                pp = combo["primary"]
-                crit = combo["criteria"]
-                is_ct = (combo.get("combo_type") == "countertrend")
-                # Criteria string differs by type (no ADX filter for countertrend)
+                # CT differs (no ADX filter, opposite-direction warning)
+                is_ct = tier["combo_type"] == "countertrend"
                 if is_ct:
-                    setup_dir = "BULL" if pp["direction"] == "short" else "BEAR"
-                    criteria_str = (
-                        f"strong {setup_dir} candle: "
-                        f"body {crit['body_min']:.2f}-{crit['body_max']:.2f} · "
-                        f"vol {crit['vol_min']:.0f}-{crit['vol_max']:.0f}× · "
-                        f"ADX not filtered"
-                    )
+                    crit_text = (f"Body {crit['body_min']:.2f}-{crit['body_max']:.2f} · "
+                                 f"Vol {crit['vol_min']:.1f}+× · No ADX filter")
+                    warn = "<br>⚠ Trade direction is OPPOSITE the candle (fade the move)"
                 else:
-                    criteria_str = (
-                        f"body {crit['body_min']:.1f}-{crit['body_max']:.1f} · "
-                        f"vol {crit['vol_min']:.1f}-{crit['vol_max']:.1f}× · "
-                        f"ADX {int(crit['adx_min'])}-{int(crit['adx_max'])} · "
-                        f"regime {'aligned' if crit['regime_mode']=='A' else 'no filter'}"
-                    )
-                # Recent-period verdict tag (visual cue: ✓ stable, ⚠ weaker, 🔥 stronger)
-                rc_verdict = combo.get("recent_check", {}).get("verdict", "")
-                vu = rc_verdict.upper()
-                if "STRONGER" in vu or "MUCH STRONGER" in vu:
-                    rec_tag = "🔥 recent stronger"
-                elif "STABLE" in vu or "STRONG" in vu:
-                    rec_tag = "✓ recent stable"
-                elif "WEAKER" in vu:
-                    rec_tag = "⚠ recent weaker"
-                elif "FLIPPED POSITIVE" in vu or "TURNED POSITIVE" in vu:
-                    rec_tag = "🔥 turned positive"
-                else:
-                    rec_tag = ""
-                tag_str = f" · {rec_tag}" if rec_tag else ""
-                # Plan string differs by type
-                if is_ct:
-                    setup_dir = "BULL" if pp["direction"] == "short" else "BEAR"
-                    plan_str = (f"FADE strong {setup_dir} → {pp['tf'].upper()} "
-                                f"{pp['direction']}, retrace {pp['entry_retrace']:+.2f}, "
-                                f"{pp['sl_method']}, TP{pp['tp_R']}R")
-                else:
-                    plan_str = (f"{pp['tf'].upper()} {pp['direction']} "
-                                f"{pp['entry_zone']} TP{pp['tp_R']}R")
+                    crit_text = (f"Body {crit['body_min']:.2f}-{crit['body_max']:.2f} · "
+                                 f"Vol {crit['vol_min']:.1f}-{crit['vol_max']:.1f}× · "
+                                 f"ADX {int(crit['adx_min'])}-{int(crit['adx_max'])}")
+                    warn = ""
+
+                similar = ", ".join(tier["constituent_combos"])
                 checked = st.checkbox(
-                    f"**{combo['name']}** (Tier {combo['tier']}) — {criteria_str}\n\n"
-                    f"&nbsp;&nbsp;PF {pf:.2f} · mean R {mr:+.3f}{tag_str} · "
-                    f"best plan: {plan_str} "
-                    f"(mean {pp['mean_r']:+.3f}, n={pp['n']})",
-                    key=f"mscanner_combo_{combo['name']}",
+                    f"{tier['name']} — {tier['label']}",
+                    key=f"mscanner_unified_{tier_key}",
                     value=False,
-                    help=combo["label_short"],
                 )
-                if checked:
-                    enabled_combos.append(combo["name"])
-
-            # Tier 1 header
-            st.markdown(
-                '<div style="margin-top:8px;padding:6px 10px;background:#0d2818;'
-                'border-left:3px solid #3fb950;border-radius:4px;'
-                'font-size:11px;color:#3fb950;font-weight:700;letter-spacing:0.6px;">'
-                '🥇 TIER 1 — TOP 5 TREND-FOLLOWING (PF ≥ 1.30, primary deployment)'
-                '</div>',
-                unsafe_allow_html=True,
-            )
-            _render_tier_select_buttons(_tier1_combos, "Tier 1")
-            for combo in _tier1_combos:
-                _render_combo_row(combo)
-
-            # Tier 2 header — separated visually so users know these are weaker
-            st.markdown(
-                '<div style="margin-top:14px;padding:6px 10px;background:#3a2e0d;'
-                'border-left:3px solid #e3b341;border-radius:4px;'
-                'font-size:11px;color:#e3b341;font-weight:700;letter-spacing:0.6px;">'
-                '🥈 TIER 2 — TREND-FOLLOWING RANK 6-10 (PF 1.14-1.23). Most '
-                'weakened in recent period — only C1A-N held up. Opportunistic only.'
-                '</div>',
-                unsafe_allow_html=True,
-            )
-            _render_tier_select_buttons(_tier2_combos, "Tier 2")
-            for combo in _tier2_combos:
-                _render_combo_row(combo)
-
-            # Tier 3 header — countertrend, distinct color (orange)
-            if _tier3_combos:
                 st.markdown(
-                    '<div style="margin-top:14px;padding:6px 10px;background:#3a1d0d;'
-                    'border-left:3px solid #fb8500;border-radius:4px;'
-                    'font-size:11px;color:#fb8500;font-weight:700;letter-spacing:0.6px;">'
-                    '🔄 TIER 3 — COUNTERTREND / MEAN-REVERSION (7 combos, v3f audit). '
-                    'Detect strong-momentum exhaustion candles, then trade the '
-                    'OPPOSITE direction. Most STRENGTHENED in recent data — '
-                    'opposite of Tier 1/2 trend-following decay. ⚠️ Trade direction '
-                    'is OPPOSITE the scanner direction by design.'
-                    '</div>',
+                    f'<div style="margin-left:24px;margin-top:-4px;margin-bottom:8px;'
+                    f'font-size:11px;color:#8892b0;line-height:1.5;">'
+                    f'{crit_text}<br>'
+                    f'{pf_str} · {n_str} (rolled-up across constituents){warn}<br>'
+                    f'<span style="opacity:0.7;">Similar to: {similar}</span>'
+                    f'</div>',
                     unsafe_allow_html=True,
                 )
-                _render_tier_select_buttons(_tier3_combos, "Tier 3")
-                for combo in _tier3_combos:
-                    _render_combo_row(combo)
 
-            if enabled_combos:
-                _t1_active = [c for c in enabled_combos
-                              if _qfcombos.COMBOS_BY_NAME[c]["tier"] <= 5]
-                _t2_active = [c for c in enabled_combos
-                              if 6 <= _qfcombos.COMBOS_BY_NAME[c]["tier"] <= 10
-                              and _qfcombos.COMBOS_BY_NAME[c].get("combo_type",
-                                  "trend_following") == "trend_following"]
-                _t3_active = [c for c in enabled_combos
-                              if _qfcombos.COMBOS_BY_NAME[c].get("combo_type") == "countertrend"]
-                _t1_str = (f"Tier 1 ({len(_t1_active)}): {', '.join(_t1_active)}"
-                           if _t1_active else "Tier 1: none")
-                _t2_str = (f"Tier 2 ({len(_t2_active)}): {', '.join(_t2_active)}"
-                           if _t2_active else "Tier 2: none")
-                _t3_str = (f"Tier 3 ({len(_t3_active)}): {', '.join(_t3_active)}"
-                           if _t3_active else "Tier 3: none")
-                # Level scope summary — short label so it fits on the same line
-                _level_summary = (
-                    "STRICT only" if _allowed_levels == ("STRICT",)
-                    else "STRICT + RELAXED" if _allowed_levels == ("STRICT", "RELAXED")
-                    else "STRICT + RELAXED + LOOSE"
-                )
+                if checked:
+                    enabled_tiers.append(tier_key)
+
+            if enabled_tiers:
                 st.caption(
-                    f"✅ {len(enabled_combos)} combo(s) active · level scope: "
-                    f"**{_level_summary}**. "
-                    f"{_t1_str} · {_t2_str} · {_t3_str}. "
-                    f"Only matching signals will appear; others are hidden."
+                    f"✅ {len(enabled_tiers)} tier(s) active "
+                    f"({', '.join(enabled_tiers)}). "
+                    f"Confidence: {_level_choice.split(' ')[0]}. "
+                    f"Hard caps (body 0.60-0.70 dead zone, ADX > 50, CT body 0.78 floor) "
+                    f"are enforced at all confidence levels."
                 )
             else:
                 st.caption(
-                    "No combos ticked — scanner shows all signals normally. "
-                    "Tick one or more above (or use the 'All Tier N' buttons) "
-                    "to filter to backtest-validated setups."
+                    "No tier ticked — scanner shows all signals normally. "
+                    "Tick a tier to filter to backtest-validated bands."
                 )
 
     # ── Custom Combo Builder (user-defined bands, no audit PF) ────────────────
-    # Lives BESIDE the 17 audited combos — never replaces or mutates them.
+    # Lives BESIDE the unified tiers — never replaces or mutates them.
     # All hard caps (_qf_widen_criteria: dead zone, ADX cap, CT floor) still
     # apply because the custom combo goes through _qf_classify_signal_level.
-    _custom_combo: dict = None   # will hold the synthetic dict if enabled
+    # enabled_combos here is ONLY for the custom combo path ("CUSTOM-1").
+    enabled_combos: list[str] = []
     if _QFCOMBOS_OK:
         with st.expander(
             "🛠 Custom Combo Builder — define your own bands (no audit PF)",
@@ -6983,13 +7382,15 @@ def render_auto_analyzer(ticker: str, df_full_1d: pd.DataFrame, tc: float,
         return
 
     # ── Scan button ────────────────────────────────────────────────────────────
-    # Note: enabled_combos is included in scan_key so toggling combo checkboxes
-    # marks results stale (user prompted to rescan to apply). This is conservative
-    # — combo filtering is applied post-scan, but BTC regime fetched at scan time
-    # affects -A combo classification, so a fresh scan is the safest behavior.
-    scan_key = (f"mscanner_{min_vol_usdt}_{max_coins}_{'_'.join(sorted(scan_tfs))}"
-                f"_{'_'.join(sorted(scan_dirs))}_{min_body_pct}_{min_vol_mult}"
-                f"_combos:{'_'.join(sorted(enabled_combos)) if enabled_combos else 'none'}")
+    # scan_key includes body/vol/adx ranges and tier selections so toggling
+    # any pre-filter marks results stale (user prompted to rescan).
+    scan_key = (f"mscanner_all_{'_'.join(sorted(scan_tfs))}"
+                f"_{'_'.join(sorted(scan_dirs))}"
+                f"_body{body_range[0]}-{body_range[1]}"
+                f"_vol{vol_range[0]:.1f}-{vol_range[1]:.1f}"
+                f"_adx{adx_range[0]}-{adx_range[1]}"
+                f"_tiers:{'_'.join(sorted(enabled_tiers)) if enabled_tiers else 'none'}"
+                f"_custom:{'_'.join(sorted(enabled_combos)) if enabled_combos else 'none'}")
     _prev_key     = st.session_state.get("mscanner_key", "")
     _has_results  = "mscanner_results" in st.session_state
 
@@ -7005,24 +7406,26 @@ def render_auto_analyzer(ticker: str, df_full_1d: pd.DataFrame, tc: float,
 
     if not scan_btn and not _has_results:
         st.info("Configure settings above then click **Scan Market Now**. "
-                "A scan of 150 coins × 3 timeframes takes ~60–90 seconds.")
+                "A scan of all USDT perpetuals (~340 symbols) × 3 timeframes takes ~90–120 seconds.")
         return
 
     # ── Run scan ───────────────────────────────────────────────────────────────
     if scan_btn:
-        # Step 1: Universe
+        # Step 1: Universe — scan ALL USDT perpetuals, no volume gate, no top-N cap
         fetch_placeholder = st.empty()
-        fetch_placeholder.info("📡 Fetching Binance universe…")
-        universe = _scanner_get_universe(min_vol_usdt)
+        fetch_placeholder.info("📡 Fetching Binance universe (all USDT perpetuals)…")
+        # OLD: universe = _scanner_get_universe(min_vol_usdt)[:max_coins]
+        # NEW: scan all USDT-perpetuals (no top-N cap, no min-volume gate)
+        universe = _scanner_get_universe_all()
 
         if not universe:
             fetch_placeholder.error(
                 "❌ Could not fetch Binance universe. Check internet connection.")
             return
 
-        coins = [u["symbol"] for u in universe[:max_coins]]
+        coins = [u["symbol"] for u in universe]
         fetch_placeholder.success(
-            f"✅ Universe: {len(coins)} coins with 24h volume ≥ {_vol_labels[_vol_idx]}")
+            f"✅ Universe: {len(coins)} USDT perpetuals (no volume gate)")
 
         # Estimate
         total_tasks = len(coins)   # one task per symbol, all TFs inside
@@ -7036,8 +7439,13 @@ def render_auto_analyzer(ticker: str, df_full_1d: pd.DataFrame, tc: float,
         all_signals: list = []
         done_count   = 0
 
+        # Pass body_range / vol_range / adx_range as floored minimums for the
+        # per-symbol scan. The exact range filter is applied post-dedup (below).
+        # Using body_range[0]/100 as the floor avoids scanning obvious noise signals.
+        _scan_body_min = body_range[0] / 100.0
+        _scan_vol_min  = vol_range[0]
         task_args = [
-            (sym, scan_tfs, min_body_pct, min_vol_mult, scan_dirs)
+            (sym, scan_tfs, _scan_body_min, _scan_vol_min, scan_dirs)
             for sym in coins
         ]
 
@@ -7089,8 +7497,34 @@ def render_auto_analyzer(ticker: str, df_full_1d: pd.DataFrame, tc: float,
     if not all_signals_deduped:
         st.warning(
             "No qualifying signals found with current settings. "
-            "Try lowering Min Body % or Min Volume ×, "
-            "or expand the coin universe.")
+            "Try widening the Body %, Volume ×, or ADX range sliders.")
+        return
+
+    # ── Apply body/vol/adx range filter (post-scan, instant toggle) ──────────
+    # These range filters narrow from the scan's minimum floor to an exact band.
+    # body_pct may be stored as 0-100 (percent) or 0-1 (fraction) — normalize.
+    _n_before_range_filter = len(all_signals_deduped)
+    _range_filtered = []
+    for s in all_signals_deduped:
+        body_disp = abs(s.get("body_pct", 0))
+        if body_disp > 1.5:
+            body_disp = body_disp / 100.0   # normalize to fraction
+        body_pct_pct = body_disp * 100       # percent for UI comparison
+        if not (body_range[0] <= body_pct_pct <= body_range[1]):
+            continue
+        if not (vol_range[0] <= s.get("vol_mult", 0) <= vol_range[1]):
+            continue
+        adx_val = s.get("adx", 0)
+        if not (adx_range[0] <= adx_val <= adx_range[1]):
+            continue
+        _range_filtered.append(s)
+    all_signals_deduped = _range_filtered
+    if not all_signals_deduped:
+        st.warning(
+            f"No signals match the current Body/Vol/ADX range filters "
+            f"({_n_before_range_filter} signals before range filter). "
+            f"Try widening the range sliders above."
+        )
         return
 
     # ── Apply signal-age filter (post-scan, user can toggle instantly) ──────
@@ -7109,29 +7543,117 @@ def render_auto_analyzer(ticker: str, df_full_1d: pd.DataFrame, tc: float,
         )
         return
 
-    # ── Apply QuantFlow Combo filter (post-age-filter) ──────────────────────
-    # If user ticked one or more combo checkboxes, restrict scanner output to
-    # signals matching at least one of those combos. Each kept signal gets a
-    # `_qf_matches` field (list of matching combo dicts, sorted by tier asc =
-    # PF desc) used downstream by the card renderer + AI prompt builder.
-    # If no combos ticked, every signal gets `_qf_matches = []` (no panel,
-    # no AI context — scanner behaves like before).
-    # BTC regime is fetched ALWAYS (not just when combos are ticked) so we
-    # can display it in the scanner banner and individual cards regardless
-    # of whether combo filtering is active. Cached 10 min so cost is trivial.
+    # ── Apply QuantFlow Unified Tier filter + Custom Combo filter ────────────
+    # BTC regime is fetched ALWAYS so we can display it in the scanner banner
+    # and individual cards regardless of whether tier filtering is active.
     _btc_regime_for_combos = (_scanner_btc_regime_for_combos()
                               if _QFCOMBOS_OK else "UNKNOWN")
     _n_before_combo_filter = len(all_signals_deduped)
-    # Snapshot raw signals before combo filter — used by the "Why no matches?"
-    # diagnostic if the filter produces zero results.
     _raw_signals_for_diag = list(all_signals_deduped)
+
     if _QFCOMBOS_OK:
         _filtered_with_matches = []
         for s in all_signals_deduped:
-            # Use the LOCAL level-aware classifier (_qf_get_matching_combos),
-            # which is bundled at the top of this file and uses _qfcombos.COMBOS
-            # purely as a data source. This means: regardless of what version
-            # of quantflow_combos.py is deployed, the level system here works.
+            s["_qf_btc_regime"]     = _btc_regime_for_combos
+            s["_qf_allowed_levels"] = _allowed_levels
+
+            # ── Unified tier path ───────────────────────────────────────────
+            if enabled_tiers and hasattr(_qfcombos, "UNIFIED_TIERS"):
+                _tier_matched = False
+                for tier_key in enabled_tiers:
+                    td = _qfcombos.UNIFIED_TIERS.get(tier_key)
+                    if td is None:
+                        continue
+                    # Build a synthetic combo-shaped dict so the existing
+                    # level-aware classifier (_qf_classify_signal_level) can
+                    # apply hard caps (dead zone, ADX > 50, CT body floor).
+                    synth_combo = {
+                        "name":          tier_key,
+                        "tier":          int(tier_key.split("_")[1]),
+                        "combo_type":    td["combo_type"],
+                        "criteria":      td["criteria"],
+                        "tf_eligible":   td["tf_eligible"],
+                        "rollup":        td["rollup"],
+                        "primary":       td["primary"],
+                        "_unified_tier": tier_key,
+                    }
+                    lvl = _qf_classify_signal_level(
+                        s, synth_combo,
+                        btc_regime=_btc_regime_for_combos,
+                        allowed_levels=_allowed_levels,
+                    )
+                    if lvl is not None:
+                        similar = _qfcombos.find_similar_combo(s, td)
+                        matched = dict(synth_combo)
+                        matched["_matched_level"] = lvl
+                        matched["_size_factor"]   = _QF_LEVEL_SETTINGS[lvl]["size_factor"]
+                        matched["_pf_haircut"]    = _QF_LEVEL_SETTINGS[lvl]["pf_haircut"]
+                        matched["_similar_to"]    = similar    # may be None
+                        s["_qf_matches"]          = [matched]
+
+                        # ── Tier 3 direction flip ─────────────────────────────
+                        # Up to this point sig["direction"] holds the CANDLE
+                        # direction (bullish=long / bearish=short). For TIER_3
+                        # countertrend the trade is the OPPOSITE of the candle
+                        # (fade bull euphoria → SHORT;  fade bear capitulation
+                        # → LONG, and audit shows LONG is the strong side at
+                        # PF 1.33 vs SHORT at marginal 1.08).
+                        #
+                        # We mutate sig in place so EVERY downstream consumer —
+                        # the summary dataframe, the card header, the CT trade
+                        # plan card, the inline render block — sees the trade
+                        # direction, not the candle direction. The original
+                        # candle direction is preserved in _candle_direction
+                        # for any UI element that wants to label "fade-the-
+                        # bull" vs "fade-the-bear" context.
+                        if tier_key == "TIER_3":
+                            _orig_candle_dir = s["direction"]
+                            s["_candle_direction"] = _orig_candle_dir
+                            s["direction"] = (
+                                "short" if _orig_candle_dir == "long" else "long"
+                            )
+                            # Recompute the enhanced trade plan for the
+                            # flipped (trade) direction so entry/SL/TP prices
+                            # in the summary table and any zone display match
+                            # the actual trade. Falls back gracefully if any
+                            # OHLC field is missing on legacy sigs.
+                            try:
+                                _bp_raw = abs(float(s.get("body_pct", 0) or 0))
+                                _bp_frac = (_bp_raw / 100.0) if _bp_raw > 1.5 else _bp_raw
+                                _new_etp = _compute_enhanced_trade_plan(
+                                    direction=s["direction"],
+                                    close_px=float(s.get("close", 0) or 0),
+                                    open_px=float(s.get("open",  s.get("close", 0)) or 0),
+                                    high_px=float(s.get("high",  s.get("close", 0)) or 0),
+                                    low_px=float(s.get("low",   s.get("close", 0)) or 0),
+                                    atr14=float(s.get("atr14",  s.get("close", 0) * 0.02) or 0),
+                                    body_pct=_bp_frac,
+                                )
+                                if _new_etp:
+                                    s["_trade_plan"] = _new_etp
+                                    _close_fb = float(s.get("close", 0) or 0)
+                                    s["entry"] = _new_etp.get("agg_entry", _close_fb)
+                                    s["sl"]    = _new_etp.get("agg_sl",    s["entry"])
+                                    s["tp2r"]  = _new_etp.get("agg_tp2",   s["entry"])
+                                    s["tp3r"]  = _new_etp.get("agg_tp3",   s["entry"])
+                            except Exception:
+                                # If recompute fails, keep flipped direction
+                                # but leave old plan — at least the header
+                                # label is correct.
+                                pass
+
+                        _filtered_with_matches.append(s)
+                        _tier_matched = True
+                        break    # one tier match per signal is enough
+                if _tier_matched:
+                    continue
+                # Not matched by any tier — still check custom combo below
+                if not enabled_combos:
+                    # Tier filter active, this signal didn't match — skip it
+                    s["_qf_matches"] = []
+                    continue
+
+            # ── Custom combo path (and fallback when no tier active) ────────
             if enabled_combos:
                 matches = _qf_get_matching_combos_with_custom(
                     s, enabled_combos,
@@ -7139,111 +7661,45 @@ def render_auto_analyzer(ticker: str, df_full_1d: pd.DataFrame, tc: float,
                     allowed_levels=_allowed_levels,
                     custom_combo=_custom_combo,
                 )
-            else:
-                matches = []
-            s["_qf_matches"]   = matches
-            s["_qf_btc_regime"] = _btc_regime_for_combos
-            # Attach the level scope to the sig so _scanner_ai_verdict's
-            # fallback classification reuses the SAME scope (otherwise the AI
-            # would see a different match-set than the scanner card does).
-            s["_qf_allowed_levels"] = _allowed_levels
-            if enabled_combos:
+                s["_qf_matches"] = matches
                 if matches:
                     _filtered_with_matches.append(s)
             else:
+                # No tier and no custom — pass all signals through unmarked
+                s["_qf_matches"] = []
                 _filtered_with_matches.append(s)
+
         all_signals_deduped = _filtered_with_matches
 
-        if enabled_combos and not all_signals_deduped:
-            # Diagnose why nothing matched. Common causes:
-            # 1) scanner min_vol_mult is too low — combos require vol >= 1.5
-            #    but user-set min was 1.0, so vol-1.0-to-1.5 noise floods scan
-            # 2) scanner min_body_pct is too low — same effect
-            # 3) BTC regime UNKNOWN and only -A combos ticked
-            # 4) ADX > 50 universal exclusion in combos
-            # 5) Strict-mode setup just isn't there today (boundary noise) —
-            #    suggest enabling RELAXED or LOOSE if user is on STRICT only.
-            # We surface these as actionable hints.
-            # ── "Why no matches?" diagnostic ────────────────────────────────
-            # Attempt the rich histogram diagnostic first.  If it renders
-            # successfully it returns True and we are done.  On any failure
-            # (missing data, exception) it returns False and we fall through
-            # to the original text warning so the user always sees *something*.
-            _diag_rendered = _qf_zero_match_diagnostic(
-                raw_signals    = _raw_signals_for_diag,
-                enabled_combos = enabled_combos,
-                btc_regime     = _btc_regime_for_combos,
-                allowed_levels = _allowed_levels,
+        if (enabled_tiers or enabled_combos) and not all_signals_deduped:
+            _level_summary = (
+                "STRICT only" if _allowed_levels == ("STRICT",)
+                else "STRICT + RELAXED" if _allowed_levels == ("STRICT", "RELAXED")
+                else "STRICT + RELAXED + LOOSE"
             )
-            if not _diag_rendered:
-                # ── Fallback: original text-only warning ─────────────────────
-                _hints = []
-                if min_vol_mult < 1.5:
-                    _hints.append(
-                        f"⚠️ Scanner Min volume × is {min_vol_mult:.1f}× but every "
-                        f"combo requires ≥1.5×. Most of your {_n_before_combo_filter} "
-                        f"signals may have vol_mult between 1.0-1.5 → can never "
-                        f"match. Raise Min volume × to 1.5."
-                    )
-                if min_body_pct * 100 < 50:
-                    _hints.append(
-                        f"⚠️ Scanner Min body % is {min_body_pct*100:.0f}% but every "
-                        f"combo requires ≥50%. Raise Min body % to 50."
-                    )
-                if (_btc_regime_for_combos == "UNKNOWN"
-                    and any(c.endswith("-A") for c in enabled_combos)):
-                    _hints.append(
-                        f"⚠️ BTC regime fetch failed (UNKNOWN). Aligned combos "
-                        f"(-A) cannot classify without it. Try -N variants only "
-                        f"or check Binance API connectivity."
-                    )
-                # Loose-mode remediation — only suggest if user is on STRICT only.
-                # When already on RELAXED/LOOSE, more widening won't help (hard
-                # caps still bind). Phrase carefully so user understands the
-                # tradeoff: more setups but lower confidence, sized down.
-                if _allowed_levels == ("STRICT",):
-                    _hints.append(
-                        "💡 Currently on <b>STRICT only</b>. If you've been seeing "
-                        "zero setups for multiple days, switch the Confidence level "
-                        "(top of the combo filter expander) to <b>STRICT + RELAXED</b> "
-                        "(small boundary widening, sized 0.75×) or <b>+ LOOSE</b> "
-                        "(more widening, sized 0.50×). Hard caps (body 0.60-0.70 "
-                        "dead zone, ADX > 50, CT body 0.78 floor) stay enforced "
-                        "at every level."
-                    )
-                elif _allowed_levels == ("STRICT", "RELAXED"):
-                    _hints.append(
-                        "💡 Currently on <b>STRICT + RELAXED</b>. To pull in more "
-                        "boundary signals, switch to <b>STRICT + RELAXED + LOOSE</b> "
-                        "(sized 0.50×). If even LOOSE yields nothing, the dead-zone "
-                        "caps are likely binding — there genuinely is no audit-safe "
-                        "setup right now."
-                    )
-                else:
-                    _hints.append(
-                        "ℹ️ All confidence levels (STRICT + RELAXED + LOOSE) are "
-                        "active. The hard caps (body 0.60-0.70 dead zone, ADX > 50, "
-                        "CT body 0.78 floor) are likely binding — there genuinely "
-                        "is no audit-safe setup matching the ticked combos right now."
-                    )
-                _hints.append(
-                    "Note: combos require ADX 30-50 (combos with ADX 50-60 were "
-                    "audit losers and excluded). High-ADX signals won't match."
+            _active_desc = (
+                f"{len(enabled_tiers)} tier(s): {', '.join(enabled_tiers)}"
+                if enabled_tiers else
+                f"custom combo: {', '.join(enabled_combos)}"
+            )
+            if _allowed_levels == ("STRICT",):
+                _level_hint = (
+                    "💡 On <b>STRICT only</b> — try <b>STRICT + RELAXED</b> "
+                    "(0.75× sizing) or <b>+ LOOSE</b> (0.50× sizing) to widen "
+                    "the band. Hard caps (body 0.60-0.70 dead zone, ADX > 50, "
+                    "CT body 0.78 floor) are enforced at every level."
                 )
-                hints_html = "<br>".join(_hints)
-                _level_summary = (
-                    "STRICT only" if _allowed_levels == ("STRICT",)
-                    else "STRICT + RELAXED" if _allowed_levels == ("STRICT", "RELAXED")
-                    else "STRICT + RELAXED + LOOSE"
+            else:
+                _level_hint = (
+                    "ℹ️ Hard caps (body 0.60-0.70 dead zone, ADX > 50, CT body "
+                    "0.78 floor) are likely binding — no audit-safe setup right now."
                 )
-                st.warning(
-                    f"No signals match the active combo filter "
-                    f"({len(enabled_combos)} combo(s) at level scope **{_level_summary}**: "
-                    f"{', '.join(enabled_combos)}). "
-                    f"Scan + age filter produced {_n_before_combo_filter} signals; "
-                    f"none satisfied any of the ticked combos' criteria.\n\n"
-                    f"{hints_html}"
-                )
+            st.warning(
+                f"No signals match the active filter ({_active_desc}, "
+                f"level scope **{_level_summary}**). "
+                f"{_n_before_combo_filter} signals passed range + age filters; "
+                f"none satisfied the tier criteria.\n\n{_level_hint}"
+            )
             return
 
     # Summary banner
@@ -7289,12 +7745,14 @@ def render_auto_analyzer(ticker: str, df_full_1d: pd.DataFrame, tc: float,
         f"</span>"
     )
 
-    # Combo-filter suffix for banner (shown when user ticked any combo)
+    # Tier-filter suffix for banner (shown when any tier or custom combo is active)
     _combo_filter_suffix = ""
-    if _QFCOMBOS_OK and enabled_combos:
+    if _QFCOMBOS_OK and (enabled_tiers or enabled_combos):
+        _active_names = ([f"Tier:{t}" for t in enabled_tiers]
+                         + ([f"Custom:{c}" for c in enabled_combos] if enabled_combos else []))
         _combo_filter_suffix = (
             f" &nbsp;|&nbsp; <span style='color:#58a6ff;font-weight:700;'>"
-            f"🎯 Combos: {', '.join(enabled_combos)}"
+            f"🎯 {', '.join(_active_names)}"
             f"</span>"
         )
 
@@ -7309,2476 +7767,2637 @@ def render_auto_analyzer(ticker: str, df_full_1d: pd.DataFrame, tc: float,
         unsafe_allow_html=True,
     )
 
-    # Quick summary table
-    _dir_icon = {"long": "📈", "short": "📉"}
+    # ─────────────────────────────────────────────────────────────────────
+    # Tab split: Trend-Following (T1/T2) vs Countertrend (T3)
+    # Sidebar tier checkboxes still control what's SCANNED. Tabs split the
+    # DISPLAY only — one scan, two filtered views.
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _is_t3_signal(sig: dict) -> bool:
+        """A signal is T3 if its first match is the unified TIER_3 synth combo."""
+        matches = sig.get("_qf_matches") or [{}]
+        return matches[0].get("_unified_tier") == "TIER_3"
+
+    _tf_signals = [s for s in all_signals_deduped if not _is_t3_signal(s)]
+    _ct_signals = [s for s in all_signals_deduped if     _is_t3_signal(s)]
+
+    # ── Shared lookups captured by all helpers via closure ─────────────────
+    _dir_icon  = {"long": "📈", "short": "📉"}
     _reg_color = {"GREEN": "#3fb950", "YELLOW": "#e3b341", "RED": "#f85149"}
 
-    summary_rows = []
-    for i, s in enumerate(all_signals_deduped):
-        _etp_s = s.get("_trade_plan", {})
-        _sc = s.get("score") or 0
-        _sc = float(_sc) if _sc == _sc else 0.0   # NaN guard
-        _entry = s.get("entry") or 0
-        _entry = float(_entry) if _entry == _entry else 0.0
-        summary_rows.append({
-            "Rank":         f"#{i+1}",
-            "Coin":         s["symbol"].replace("USDT", ""),
-            "TF":           s["timeframe"],
-            "Dir":          ("LONG" if s["direction"] == "long" else "SHORT"),
-            "Score":        _sc,
-            "Regime":       s["regime"],
-            "Body%":        s["body_pct"],
-            "Vol×":         s["vol_mult"],
-            "ADX":          s["adx"],
-            "Agg Entry":    _entry,
-            "Std Entry":    _etp_s.get("std_entry", _entry),
-            "Sniper Entry": _etp_s.get("sniper_entry", _entry),
-            "SL%":          _etp_s.get("sl_dist_pct", 1.5),
-            "TP2 (Std)":    _etp_s.get("std_tp2", s["tp2r"]),
-        })
+    def _ct_entry_price(sig: dict, retrace: float) -> float:
+        """Compute CT extension entry price. Same formula as _render_ct_tier3_trade_plan_html."""
+        direction  = sig.get("direction", "short")
+        body_raw   = abs(float(sig.get("body_pct", 0) or 0))
+        body_frac  = body_raw / 100.0 if body_raw > 1.5 else body_raw
+        close_v    = float(sig.get("close", 0) or 0)
+        if close_v <= 0:
+            return 0.0
+        body_price = float(sig.get("body_abs_price", 0) or 0)
+        if body_price <= 0:
+            body_price = close_v * 0.02 * body_frac
+        if body_price <= 0:
+            body_price = close_v * 0.005
+        if direction == "long":
+            entry = close_v + body_price * retrace
+            return max(entry, close_v * 0.85)
+        else:
+            entry = close_v - body_price * retrace
+            return min(entry, close_v * 1.15)
 
-    summary_df = pd.DataFrame(summary_rows)
-    st.dataframe(
-        summary_df,
-        use_container_width=True,
-        hide_index=True,
-        height=min(40 + len(all_signals_deduped) * 35, 750),
-        column_config={
-            "Score":        st.column_config.NumberColumn(width=60,  format="%.1f"),
-            "Body%":        st.column_config.NumberColumn(width=65,  format="%.1f"),
-            "Vol×":         st.column_config.NumberColumn(width=55,  format="%.2f"),
-            "ADX":          st.column_config.NumberColumn(width=55,  format="%.1f"),
-            "Agg Entry":    st.column_config.NumberColumn(width=95,  format="%.6g"),
-            "Std Entry":    st.column_config.NumberColumn(width=95,  format="%.6g"),
-            "Sniper Entry": st.column_config.NumberColumn(width=100, format="%.6g"),
-            "SL%":          st.column_config.NumberColumn(width=60,  format="%.2f%%"),
-            "TP2 (Std)":    st.column_config.NumberColumn(width=100, format="%.6g"),
-        },
-    )
+    def _render_cards_loop(signals):
+        """Shared detailed signal cards loop — used by both TF and CT tabs.
+        Contains the single call site for _render_ct_tier3_trade_plan_html
+        (routing is preserved: T3 signals get CT card, others get trend card)."""
+        # Detailed cards
+        for i, sig in enumerate(signals):
+            dir_color   = "#64ffda" if sig["direction"] == "long"  else "#ff6b6b"
+            dir_icon    = "📈"      if sig["direction"] == "long"  else "📉"
+            reg_color   = _reg_color.get(sig["regime"], "#8b949e")
+            ema_str     = "✅ Full" if sig["ema_full"] else ("⚠️ Partial" if sig["ema_partial"] else "❌ Not aligned")
+            recency_map = {1: "🟢 Current candle (freshest)", 2: "🟡 1 candle ago", 3: "🟠 2 candles ago"}
+            recency_str = recency_map.get(sig.get("bar_offset", 1), "")
 
-    st.markdown("---")
-    st.markdown("### 📋 Detailed Signal Cards — Point-by-Point Analysis")
+            # Score bar (visual) — guard against None/NaN scores
+            try:
+                score_pct = min(int(sig.get("score") or 0), 100)
+            except (TypeError, ValueError):
+                score_pct = 0
+            bar_filled = "█" * (score_pct // 5)
+            bar_empty  = "░" * (20 - score_pct // 5)
 
-    # Detailed cards
-    for i, sig in enumerate(all_signals_deduped):
-        dir_color   = "#64ffda" if sig["direction"] == "long"  else "#ff6b6b"
-        dir_icon    = "📈"      if sig["direction"] == "long"  else "📉"
-        reg_color   = _reg_color.get(sig["regime"], "#8b949e")
-        ema_str     = "✅ Full" if sig["ema_full"] else ("⚠️ Partial" if sig["ema_partial"] else "❌ Not aligned")
-        recency_map = {1: "🟢 Current candle (freshest)", 2: "🟡 1 candle ago", 3: "🟠 2 candles ago"}
-        recency_str = recency_map.get(sig.get("bar_offset", 1), "")
+            _score_display = score_pct  # already safe int from above
+            header = (
+                f"#{i+1} — {sig['symbol']} ({sig['timeframe']}) "
+                f"| {dir_icon} {sig['direction'].upper()} "
+                f"| Score {_score_display}/100 "
+                f"| {sig['regime']}"
+            )
 
-        # Score bar (visual) — guard against None/NaN scores
-        try:
-            score_pct = min(int(sig.get("score") or 0), 100)
-        except (TypeError, ValueError):
-            score_pct = 0
-        bar_filled = "█" * (score_pct // 5)
-        bar_empty  = "░" * (20 - score_pct // 5)
+            with st.expander(header, expanded=(i < 5)):
+                col_l, col_r = st.columns([1.4, 1])
 
-        _score_display = score_pct  # already safe int from above
-        header = (
-            f"#{i+1} — {sig['symbol']} ({sig['timeframe']}) "
-            f"| {dir_icon} {sig['direction'].upper()} "
-            f"| Score {_score_display}/100 "
-            f"| {sig['regime']}"
-        )
-
-        with st.expander(header, expanded=(i < 5)):
-            col_l, col_r = st.columns([1.4, 1])
-
-            with col_l:
-                # Coin header
-                coin_base = sig["symbol"].replace("USDT", "")
-                # BTC regime badge (small, after candle date) — gives macro
-                # context inline. The combo panel shows it more prominently
-                # but this is for cards without combo matches too.
-                _card_btc_regime = sig.get("_qf_btc_regime", "UNKNOWN")
-                _btc_card_color = {
-                    "BULL": "#3fb950", "BEAR": "#f85149",
-                    "CHOP": "#e3b341", "UNKNOWN": "#8892b0",
-                }.get(_card_btc_regime, "#8892b0")
-                _btc_card_emoji = {
-                    "BULL": "🟢", "BEAR": "🔴",
-                    "CHOP": "🟡", "UNKNOWN": "⚪",
-                }.get(_card_btc_regime, "⚪")
-                # For SHORT signals during BULL, or LONG signals during BEAR,
-                # add a "fights regime" warning to the badge so user immediately
-                # sees the macro mismatch even before reading any combo data.
-                _card_dir = sig.get("direction", "")
-                _fights_regime = (
-                    (_card_dir == "long"  and _card_btc_regime == "BEAR") or
-                    (_card_dir == "short" and _card_btc_regime == "BULL")
-                )
-                _btc_warn_str = (" ⚠️ fights macro" if _fights_regime else "")
-                st.markdown(
-                    f'<div style="font-size:20px;font-weight:800;color:{dir_color};">'
-                    f'{dir_icon} {coin_base}/USDT &nbsp;'
-                    f'<span style="font-size:13px;color:#8892b0;font-weight:400;">'
-                    f'{sig["timeframe"]} | Candle: {sig.get("candle_date","")}'
-                    f'</span>'
-                    f' &nbsp;<span style="font-size:11px;color:{_btc_card_color};'
-                    f'font-weight:700;background:#161b22;padding:2px 8px;'
-                    f'border-radius:10px;">'
-                    f'{_btc_card_emoji} BTC {_card_btc_regime}{_btc_warn_str}'
-                    f'</span></div>',
-                    unsafe_allow_html=True,
-                )
-
-                # ── QuantFlow Combo Match panel (only when combos active) ──────
-                # Renders rollup PF / mean R / recommended trade plan / recent
-                # verification for each combo this signal matches. Sorted by
-                # tier asc (highest PF first). Empty if user ticked no combos.
-                if _QFCOMBOS_OK:
-                    _qf_matches_card = sig.get("_qf_matches") or []
-                    if _qf_matches_card:
-                        # Separate audited combos from user-defined custom combo
-                        _audited_matches = [m for m in _qf_matches_card
-                                           if not m.get("_is_custom")]
-                        _custom_matches  = [m for m in _qf_matches_card
-                                           if m.get("_is_custom")]
-
-                        # ── Audited combo panel (unchanged path) ──────────────
-                        if _audited_matches:
-                            # Level summary banner FIRST — belt-and-suspenders so
-                            # the user sees the level even if the imported
-                            # render_combo_panel_html is from an older version
-                            # of quantflow_combos.py that doesn't display badges.
-                            _level_banner = _qf_render_level_summary_html(_audited_matches)
-                            if _level_banner:
-                                st.markdown(_level_banner, unsafe_allow_html=True)
-                            # Imported panel render. Wrap in try/except — if the
-                            # imported render is incompatible with the level
-                            # metadata we attach, fall through gracefully (the
-                            # banner above already conveyed the level info).
-                            try:
-                                _qf_panel_html = _qfcombos.render_combo_panel_html(
-                                    _audited_matches, sig
-                                )
-                                if _qf_panel_html:
-                                    # Streamlit's markdown parser treats lines with
-                                    # 4+ leading spaces as <pre><code> blocks even
-                                    # with unsafe_allow_html=True. The HTML returned
-                                    # by render_combo_panel_html in quantflow_combos.py
-                                    # is built from a triple-quoted f-string inside a
-                                    # function body, so every line starts with 8 spaces
-                                    # of Python indentation — which Streamlit then
-                                    # renders as literal <div> code.
-                                    # Fix: strip leading whitespace from each line.
-                                    # Safe here because the panel HTML contains no
-                                    # <pre>, <code>, or <textarea> tags that depend
-                                    # on whitespace preservation.
-                                    _qf_panel_html_clean = "\n".join(
-                                        ln.lstrip() for ln in _qf_panel_html.splitlines()
-                                    )
-                                    st.markdown(_qf_panel_html_clean, unsafe_allow_html=True)
-                            except Exception:
-                                # Render failed (incompatible old version of
-                                # quantflow_combos.py). The level banner above
-                                # already showed the essentials; show a short
-                                # combo-name list as fallback so the user still
-                                # sees which combo(s) matched.
-                                _names = ", ".join(
-                                    f"{m['name']} (Tier {m.get('tier','?')}, "
-                                    f"{m.get('_matched_level','STRICT')})"
-                                    for m in _audited_matches
-                                )
-                                st.caption(f"Combo matches: {_names}")
-
-                        # ── Custom combo panel (distinct purple style) ─────────
-                        # Never uses audited PF stats. Sized as SMALL always.
-                        for _cm in _custom_matches:
-                            _cm_level = _cm.get("_matched_level", "STRICT")
-                            _cm_crit  = _cm.get("criteria", {})
-                            _cm_tf    = ", ".join(_cm.get("tf_eligible", ["?"]))
-                            _cm_dirs  = ", ".join(_cm_crit.get("directions", ["?"]))
-                            st.markdown(
-                                f'<div style="border:2px solid #a78bfa;border-radius:8px;'
-                                f'padding:10px 14px;margin-top:8px;background:#1a0d2e;">'
-                                f'<div style="display:flex;align-items:center;gap:8px;'
-                                f'margin-bottom:6px;">'
-                                f'<span style="background:#4c1d95;color:#c4b5fd;'
-                                f'padding:2px 8px;border-radius:10px;font-size:11px;'
-                                f'font-weight:700;">🛠 CUSTOM-1</span>'
-                                f'<span style="color:#ef4444;font-size:11px;font-weight:700;">'
-                                f'USER-DEFINED — NO AUDIT PF</span>'
-                                f'<span style="margin-left:auto;background:#1e1b4b;'
-                                f'color:#a78bfa;padding:2px 8px;border-radius:10px;'
-                                f'font-size:10px;">{_cm_level}</span>'
-                                f'</div>'
-                                f'<div style="font-size:11px;color:#ccd6f6;line-height:1.8;">'
-                                f'body {_cm_crit.get("body_min",0):.2f}–{_cm_crit.get("body_max",1):.2f} · '
-                                f'vol {_cm_crit.get("vol_min",0):.1f}–{_cm_crit.get("vol_max",0):.1f}× · '
-                                f'ADX {int(_cm_crit.get("adx_min",0))}–{int(_cm_crit.get("adx_max",50))} · '
-                                f'tf {_cm_tf} · dir {_cm_dirs} · '
-                                f'regime {"aligned" if _cm_crit.get("regime_mode")=="A" else "no filter"}'
-                                f'<br>'
-                                f'<b style="color:#fca5a5;">Sizing: SMALL · 0.15% risk '
-                                f'(exploratory — paper-trade first)</b>'
-                                f'</div>'
-                                f'</div>',
-                                unsafe_allow_html=True,
-                            )
-
-                # ── Entry method explanation ──────────────────────────────────
-                # The scanner uses 0% retracement (immediate entry at candle close) as
-                # the aggressive baseline. The enhanced plan adds 2 better entry zones.
-                _bar_off  = sig.get("bar_offset", 1)
-                _etp      = sig.get("_trade_plan", {})
-                _is_fresh = _bar_off == 1
-
-                if _is_fresh:
-                    _freshness_html = (
-                        "<span style='color:#3fb950;font-weight:700;'>🟢 FRESH — candle just closed.</span> "
-                        "All four entry zones are valid. Prefer Standard, Golden Fibo or Sniper for better R:R."
+                with col_l:
+                    # Coin header
+                    coin_base = sig["symbol"].replace("USDT", "")
+                    # BTC regime badge (small, after candle date) — gives macro
+                    # context inline. The combo panel shows it more prominently
+                    # but this is for cards without combo matches too.
+                    _card_btc_regime = sig.get("_qf_btc_regime", "UNKNOWN")
+                    _btc_card_color = {
+                        "BULL": "#3fb950", "BEAR": "#f85149",
+                        "CHOP": "#e3b341", "UNKNOWN": "#8892b0",
+                    }.get(_card_btc_regime, "#8892b0")
+                    _btc_card_emoji = {
+                        "BULL": "🟢", "BEAR": "🔴",
+                        "CHOP": "🟡", "UNKNOWN": "⚪",
+                    }.get(_card_btc_regime, "⚪")
+                    # For SHORT signals during BULL, or LONG signals during BEAR,
+                    # add a "fights regime" warning to the badge so user immediately
+                    # sees the macro mismatch even before reading any combo data.
+                    _card_dir = sig.get("direction", "")
+                    _fights_regime = (
+                        (_card_dir == "long"  and _card_btc_regime == "BEAR") or
+                        (_card_dir == "short" and _card_btc_regime == "BULL")
                     )
-                else:
-                    _freshness_html = (
-                        f"<span style='color:#e3b341;font-weight:700;'>⚠️ Signal is {_bar_off-1} candle(s) old.</span> "
-                        "Aggressive entry may already be missed. Use Standard, Golden Fibo or Sniper zone only, "
-                        "or skip if price is >1R away."
-                    )
-
-                # ── Build the enhanced trade plan card ─────────────────────────
-                if _etp:
-                    _sl_pct   = _etp.get("sl_dist_pct", 1.5)
-                    _atr_pct  = _etp.get("atr_pct", 0)
-                    _dir      = sig["direction"]
-                    _std_valid    = _etp.get("std_valid",    True)
-                    _golden_valid = _etp.get("golden_valid", True)
-                    _sniper_valid = _etp.get("sniper_valid", True)
-
-                    def _fmt(v):
-                        return f"{v:.6g}" if v else "—"
-
-                    # Update freshness note if any zone is invalid
-                    if not _std_valid or not _golden_valid or not _sniper_valid:
-                        _invalid_names = []
-                        if not _std_valid:    _invalid_names.append("Standard")
-                        if not _golden_valid: _invalid_names.append("Golden Fibo")
-                        if not _sniper_valid: _invalid_names.append("Sniper")
-                        _zone_warn = (
-                            f" <span style='color:#ff6b6b;font-weight:700;'>⚠️ "
-                            f"{' & '.join(_invalid_names)} zone(s) unavailable — "
-                            f"candle body too large for SL distance.</span>"
-                        )
-                        _freshness_html += _zone_warn
-
-                    # Aggressive zone (enter at close)
-                    _agg_rr1  = abs(_etp['agg_tp1'] - _etp['agg_entry']) / max(abs(_etp['agg_entry'] - _etp['agg_sl']), 1e-10)
-                    _std_rr2  = 2.0  # always 2R by construction
-                    _snp_rr3  = 3.0
-
-                    # ── Standard zone HTML ────────────────────────────────────
-                    if _std_valid:
-                        _std_zone_html = f"""
-  <div style="background:#091a1a;border:1px solid #1a4a3a;border-radius:6px;padding:10px;">
-    <div style="color:#3fb950;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;">
-      ✅ Standard Entry (38.2%)</div>
-    <div style="color:#aab;font-size:10px;margin-bottom:8px;">Wait for 38.2% retrace into candle body. Recommended default.</div>
-    <div style="color:#8892b0;font-size:10px;">ENTRY</div>
-    <div style="color:#ccd6f6;font-weight:700;font-size:13px;">{_fmt(_etp['std_entry'])}</div>
-    <div style="color:#8892b0;font-size:10px;margin-top:5px;">STOP LOSS</div>
-    <div style="color:#ff6b6b;font-weight:700;font-size:13px;">{_fmt(_etp['std_sl'])}</div>
-    <div style="color:#8892b0;font-size:10px;margin-top:5px;">TP1 / TP2 / TP3</div>
-    <div style="color:#64ffda;font-size:12px;">{_fmt(_etp['std_tp1'])} / {_fmt(_etp['std_tp2'])} / {_fmt(_etp['std_tp3'])}</div>
-  </div>"""
-                    else:
-                        _sl_pct_used = _etp.get("sl_dist_pct", 0)
-                        _std_zone_html = f"""
-  <div style="background:#1a0a0a;border:2px solid #6b2222;border-radius:6px;padding:10px;opacity:0.75;">
-    <div style="color:#ff6b6b;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;">
-      ❌ Standard Entry — UNAVAILABLE</div>
-    <div style="color:#cc8888;font-size:11px;line-height:1.4;">
-      Candle body is too large relative to the structural SL distance
-      ({_sl_pct_used:.1f}%). The 38.2% retrace zone falls at or beyond the
-      stop-loss level — entering here would mean your SL is already hit.
-      <br><br><strong style="color:#ffaa88;">Use Aggressive zone only.</strong>
-    </div>
-  </div>"""
-
-                    # ── Golden Fibo zone HTML (Apr 25 — 61.8%) ────────────────
-                    if _golden_valid:
-                        _golden_zone_html = f"""
-  <div style="background:#1a1208;border:1px solid #5a4015;border-radius:6px;padding:10px;">
-    <div style="color:#e3b341;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;">
-      🥇 Golden Fibo Entry (61.8%)</div>
-    <div style="color:#aab;font-size:10px;margin-bottom:8px;">Wait for 61.8% golden ratio retrace. Balanced R:R + fill rate.</div>
-    <div style="color:#8892b0;font-size:10px;">ENTRY</div>
-    <div style="color:#ccd6f6;font-weight:700;font-size:13px;">{_fmt(_etp['golden_entry'])}</div>
-    <div style="color:#8892b0;font-size:10px;margin-top:5px;">STOP LOSS</div>
-    <div style="color:#ff6b6b;font-weight:700;font-size:13px;">{_fmt(_etp['golden_sl'])}</div>
-    <div style="color:#8892b0;font-size:10px;margin-top:5px;">TP1 / TP2 / TP3</div>
-    <div style="color:#64ffda;font-size:12px;">{_fmt(_etp['golden_tp1'])} / {_fmt(_etp['golden_tp2'])} / {_fmt(_etp['golden_tp3'])}</div>
-  </div>"""
-                    else:
-                        _sl_pct_used = _etp.get("sl_dist_pct", 0)
-                        _golden_zone_html = f"""
-  <div style="background:#1a0a0a;border:2px solid #6b2222;border-radius:6px;padding:10px;opacity:0.75;">
-    <div style="color:#ff6b6b;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;">
-      ❌ Golden Fibo Entry — UNAVAILABLE</div>
-    <div style="color:#cc8888;font-size:11px;line-height:1.4;">
-      Candle body is too large relative to the structural SL distance
-      ({_sl_pct_used:.1f}%). The 61.8% retrace zone falls at or beyond the
-      stop-loss level — entering here would mean your SL is already hit.
-      <br><br><strong style="color:#ffaa88;">Use Aggressive or Standard zone only.</strong>
-    </div>
-  </div>"""
-
-                    # ── Sniper zone HTML (Apr 25 — moved to 78.6%) ────────────
-                    if _sniper_valid:
-                        _sniper_zone_html = f"""
-  <div style="background:#14100a;border:1px solid #4a3a1a;border-radius:6px;padding:10px;">
-    <div style="color:#e3b341;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;">
-      🎯 Sniper Entry (78.6%)</div>
-    <div style="color:#aab;font-size:10px;margin-bottom:8px;">Wait for 78.6% Fib retrace. Best R:R, lowest fill probability.</div>
-    <div style="color:#8892b0;font-size:10px;">ENTRY</div>
-    <div style="color:#ccd6f6;font-weight:700;font-size:13px;">{_fmt(_etp['sniper_entry'])}</div>
-    <div style="color:#8892b0;font-size:10px;margin-top:5px;">STOP LOSS</div>
-    <div style="color:#ff6b6b;font-weight:700;font-size:13px;">{_fmt(_etp['sniper_sl'])}</div>
-    <div style="color:#8892b0;font-size:10px;margin-top:5px;">TP1 / TP2 / TP3</div>
-    <div style="color:#64ffda;font-size:12px;">{_fmt(_etp['sniper_tp1'])} / {_fmt(_etp['sniper_tp2'])} / {_fmt(_etp['sniper_tp3'])}</div>
-  </div>"""
-                    else:
-                        _sl_pct_used = _etp.get("sl_dist_pct", 0)
-                        _sniper_zone_html = f"""
-  <div style="background:#1a0a0a;border:2px solid #6b2222;border-radius:6px;padding:10px;opacity:0.75;">
-    <div style="color:#ff6b6b;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;">
-      ❌ Sniper Entry — UNAVAILABLE</div>
-    <div style="color:#cc8888;font-size:11px;line-height:1.4;">
-      Candle body is too large relative to the structural SL distance
-      ({_sl_pct_used:.1f}%). The 78.6% retrace zone falls at or beyond the
-      stop-loss level — entering here would mean your SL is already hit.
-      <br><br><strong style="color:#ffaa88;">Use Aggressive or Standard zone only.</strong>
-    </div>
-  </div>"""
-
-                    _zone_rows = f"""
-<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:6px;margin:10px 0;">
-
-  <div style="background:#0a1628;border:1px solid #1f3a5f;border-radius:6px;padding:10px;">
-    <div style="color:#8892b0;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;">
-      ⚡ Aggressive Entry</div>
-    <div style="color:#aab;font-size:10px;margin-bottom:8px;">Enter at candle close. Highest fill chance, lowest R:R.</div>
-    <div style="color:#8892b0;font-size:10px;">ENTRY</div>
-    <div style="color:#ccd6f6;font-weight:700;font-size:13px;">{_fmt(_etp['agg_entry'])}</div>
-    <div style="color:#8892b0;font-size:10px;margin-top:5px;">STOP LOSS</div>
-    <div style="color:#ff6b6b;font-weight:700;font-size:13px;">{_fmt(_etp['agg_sl'])}</div>
-    <div style="color:#8892b0;font-size:10px;margin-top:5px;">TP1 / TP2 / TP3</div>
-    <div style="color:#64ffda;font-size:12px;">{_fmt(_etp['agg_tp1'])} / {_fmt(_etp['agg_tp2'])} / {_fmt(_etp['agg_tp3'])}</div>
-  </div>
-
-  {_std_zone_html}
-
-  {_golden_zone_html}
-
-  {_sniper_zone_html}
-
-</div>"""
-
-                    _mgmt_html = f"""
-<div style="background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:10px 14px;margin-top:8px;">
-  <div style="color:#58a6ff;font-size:11px;text-transform:uppercase;letter-spacing:1px;font-weight:700;margin-bottom:8px;">
-    📋 Trade Management Plan</div>
-  <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:12px;">
-    <div>
-      <div style="color:#8892b0;">SL Method</div>
-      <div style="color:#ccd6f6;">ATR-adaptive — {_sl_pct:.1f}% (ATR = {_atr_pct:.1f}%)</div>
-    </div>
-    <div>
-      <div style="color:#8892b0;">Invalidation Anchor</div>
-      <div style="color:#ccd6f6;">{'Below candle low' if _dir=='long' else 'Above candle high'} + 0.5× ATR buffer</div>
-    </div>
-    <div style="margin-top:6px;">
-      <div style="color:#8892b0;">At TP1</div>
-      <div style="color:#ccd6f6;">Close 30–50% of position → move SL to breakeven</div>
-    </div>
-    <div style="margin-top:6px;">
-      <div style="color:#8892b0;">At TP2</div>
-      <div style="color:#ccd6f6;">Close another 30% → trail SL below last swing</div>
-    </div>
-    <div style="margin-top:6px;">
-      <div style="color:#8892b0;">At TP3 / Let Run</div>
-      <div style="color:#ccd6f6;">Hold remaining 20–40% with trailing SL for extended move</div>
-    </div>
-    <div style="margin-top:6px;">
-      <div style="color:#8892b0;">Skip Signal If</div>
-      <div style="color:#ccd6f6;">Price already &gt;1R from aggressive entry without a retrace</div>
-    </div>
-  </div>
-  <div style="margin-top:10px;padding-top:8px;border-top:1px solid #21262d;color:#8892b0;font-size:10px;line-height:1.5;">
-    <b style="color:#58a6ff;">Mgmt modes the backtest tests (4):</b><br>
-    • <b style="color:#ccd6f6;">Simple</b> — full size, hold to TP2 or original SL<br>
-    • <b style="color:#ccd6f6;">Partial</b> — TP 50% at 1R + auto-move SL to breakeven on remaining (lower risk after 1R, capped upside)<br>
-    • <b style="color:#ccd6f6;">Partial-NoBE</b> — TP 50% at 1R, KEEP original SL on remaining (real downside but full upside if it works)<br>
-    • <b style="color:#ccd6f6;">Trailing</b> — full size, BE at 1R, then trail 0.5×ATR until SL or TP
-  </div>
-</div>"""
-
+                    _btc_warn_str = (" ⚠️ fights macro" if _fights_regime else "")
                     st.markdown(
-                        f'<div style="background:#0d1f2d;border:1px solid #1f6feb;'
-                        f'border-radius:8px;padding:12px 16px;margin:8px 0;font-size:13px;">'
-                        f'<div style="color:#58a6ff;font-weight:700;font-size:14px;margin-bottom:6px;">🎯 Enhanced Trade Plan</div>'
-                        f'<div style="font-size:12px;line-height:1.5;margin-bottom:4px;">{_freshness_html}</div>'
-                        f'{_zone_rows}'
-                        f'{_mgmt_html}'
-                        f'</div>',
+                        f'<div style="font-size:20px;font-weight:800;color:{dir_color};">'
+                        f'{dir_icon} {coin_base}/USDT &nbsp;'
+                        f'<span style="font-size:13px;color:#8892b0;font-weight:400;">'
+                        f'{sig["timeframe"]} | Candle: {sig.get("candle_date","")}'
+                        f'</span>'
+                        f' &nbsp;<span style="font-size:11px;color:{_btc_card_color};'
+                        f'font-weight:700;background:#161b22;padding:2px 8px;'
+                        f'border-radius:10px;">'
+                        f'{_btc_card_emoji} BTC {_card_btc_regime}{_btc_warn_str}'
+                        f'</span></div>',
                         unsafe_allow_html=True,
                     )
-                else:
-                    # Fallback to old simple display if _trade_plan missing
+
+                    # ── QuantFlow Combo Match panel (only when combos active) ──────
+                    # Renders rollup PF / mean R / recommended trade plan / recent
+                    # verification for each combo this signal matches. Sorted by
+                    # tier asc (highest PF first). Empty if user ticked no combos.
+                    if _QFCOMBOS_OK:
+                        _qf_matches_card = sig.get("_qf_matches") or []
+                        if _qf_matches_card:
+                            # Separate audited combos from user-defined custom combo
+                            _audited_matches = [m for m in _qf_matches_card
+                                               if not m.get("_is_custom")]
+                            _custom_matches  = [m for m in _qf_matches_card
+                                               if m.get("_is_custom")]
+
+                            # ── Audited combo panel (unchanged path) ──────────────
+                            if _audited_matches:
+                                # "Similar to" banner for unified-tier matches (Phase 4).
+                                # Shows which individual audit combo the signal is closest
+                                # to, as a contextual hint. Silently skipped if no
+                                # _similar_to is set (i.e. custom combo or no inner match).
+                                _similar_banner = _qf_render_similar_to_banner(_audited_matches)
+                                if _similar_banner:
+                                    st.markdown(_similar_banner, unsafe_allow_html=True)
+                                # Level summary banner FIRST — belt-and-suspenders so
+                                # the user sees the level even if the imported
+                                # render_combo_panel_html is from an older version
+                                # of quantflow_combos.py that doesn't display badges.
+                                _level_banner = _qf_render_level_summary_html(_audited_matches)
+                                if _level_banner:
+                                    st.markdown(_level_banner, unsafe_allow_html=True)
+                                # Imported panel render. Wrap in try/except — if the
+                                # imported render is incompatible with the level
+                                # metadata we attach, fall through gracefully (the
+                                # banner above already conveyed the level info).
+                                try:
+                                    _qf_panel_html = _qfcombos.render_combo_panel_html(
+                                        _audited_matches, sig
+                                    )
+                                    if _qf_panel_html:
+                                        # Streamlit's markdown parser treats lines with
+                                        # 4+ leading spaces as <pre><code> blocks even
+                                        # with unsafe_allow_html=True. The HTML returned
+                                        # by render_combo_panel_html in quantflow_combos.py
+                                        # is built from a triple-quoted f-string inside a
+                                        # function body, so every line starts with 8 spaces
+                                        # of Python indentation — which Streamlit then
+                                        # renders as literal <div> code.
+                                        # Fix: strip leading whitespace from each line.
+                                        # Safe here because the panel HTML contains no
+                                        # <pre>, <code>, or <textarea> tags that depend
+                                        # on whitespace preservation.
+                                        _qf_panel_html_clean = "\n".join(
+                                            ln.lstrip() for ln in _qf_panel_html.splitlines()
+                                        )
+                                        st.markdown(_qf_panel_html_clean, unsafe_allow_html=True)
+                                except Exception:
+                                    # Render failed (incompatible old version of
+                                    # quantflow_combos.py). The level banner above
+                                    # already showed the essentials; show a short
+                                    # combo-name list as fallback so the user still
+                                    # sees which combo(s) matched.
+                                    _names = ", ".join(
+                                        f"{m['name']} (Tier {m.get('tier','?')}, "
+                                        f"{m.get('_matched_level','STRICT')})"
+                                        for m in _audited_matches
+                                    )
+                                    st.caption(f"Combo matches: {_names}")
+
+                            # ── Custom combo panel (distinct purple style) ─────────
+                            # Never uses audited PF stats. Sized as SMALL always.
+                            for _cm in _custom_matches:
+                                _cm_level = _cm.get("_matched_level", "STRICT")
+                                _cm_crit  = _cm.get("criteria", {})
+                                _cm_tf    = ", ".join(_cm.get("tf_eligible", ["?"]))
+                                _cm_dirs  = ", ".join(_cm_crit.get("directions", ["?"]))
+                                st.markdown(
+                                    f'<div style="border:2px solid #a78bfa;border-radius:8px;'
+                                    f'padding:10px 14px;margin-top:8px;background:#1a0d2e;">'
+                                    f'<div style="display:flex;align-items:center;gap:8px;'
+                                    f'margin-bottom:6px;">'
+                                    f'<span style="background:#4c1d95;color:#c4b5fd;'
+                                    f'padding:2px 8px;border-radius:10px;font-size:11px;'
+                                    f'font-weight:700;">🛠 CUSTOM-1</span>'
+                                    f'<span style="color:#ef4444;font-size:11px;font-weight:700;">'
+                                    f'USER-DEFINED — NO AUDIT PF</span>'
+                                    f'<span style="margin-left:auto;background:#1e1b4b;'
+                                    f'color:#a78bfa;padding:2px 8px;border-radius:10px;'
+                                    f'font-size:10px;">{_cm_level}</span>'
+                                    f'</div>'
+                                    f'<div style="font-size:11px;color:#ccd6f6;line-height:1.8;">'
+                                    f'body {_cm_crit.get("body_min",0):.2f}–{_cm_crit.get("body_max",1):.2f} · '
+                                    f'vol {_cm_crit.get("vol_min",0):.1f}–{_cm_crit.get("vol_max",0):.1f}× · '
+                                    f'ADX {int(_cm_crit.get("adx_min",0))}–{int(_cm_crit.get("adx_max",50))} · '
+                                    f'tf {_cm_tf} · dir {_cm_dirs} · '
+                                    f'regime {"aligned" if _cm_crit.get("regime_mode")=="A" else "no filter"}'
+                                    f'<br>'
+                                    f'<b style="color:#fca5a5;">Sizing: SMALL · 0.15% risk '
+                                    f'(exploratory — paper-trade first)</b>'
+                                    f'</div>'
+                                    f'</div>',
+                                    unsafe_allow_html=True,
+                                )
+
+                    # ── Entry method explanation ──────────────────────────────────
+                    # The scanner uses 0% retracement (immediate entry at candle close) as
+                    # the aggressive baseline. The enhanced plan adds 2 better entry zones.
+                    _bar_off  = sig.get("bar_offset", 1)
+                    _etp      = sig.get("_trade_plan", {})
+                    _is_fresh = _bar_off == 1
+
+                    if _is_fresh:
+                        _freshness_html = (
+                            "<span style='color:#3fb950;font-weight:700;'>🟢 FRESH — candle just closed.</span> "
+                            "All four entry zones are valid. Prefer Standard, Golden Fibo or Sniper for better R:R."
+                        )
+                    else:
+                        _freshness_html = (
+                            f"<span style='color:#e3b341;font-weight:700;'>⚠️ Signal is {_bar_off-1} candle(s) old.</span> "
+                            "Aggressive entry may already be missed. Use Standard, Golden Fibo or Sniper zone only, "
+                            "or skip if price is >1R away."
+                        )
+
+                    # ── Build the enhanced trade plan card ─────────────────────────
+                    # Phase 4b: For unified TIER_3 signals, route to the CT-specialized
+                    # 4-zone card (Aggressive / Shallow / Standard CT / Deep) instead
+                    # of the trend-tier 4-zone card (Aggressive / Standard / Golden /
+                    # Sniper). Tier 1/2 and audited CT1-CT7 keep the inline render below.
+                    _primary_match_inline = (sig.get("_qf_matches") or [{}])[0]
+                    _is_unified_t3_inline = (
+                        _primary_match_inline.get("_unified_tier") == "TIER_3"
+                        or (_primary_match_inline.get("name") == "TIER_3"
+                            and _primary_match_inline.get("combo_type") == "countertrend")
+                    )
+                    if _is_unified_t3_inline:
+                        _ct_method_results_inline = sig.get("_bt_method_results") or {}
+                        _ct_card_html = _render_ct_tier3_trade_plan_html(sig, _ct_method_results_inline)
+                        if _ct_card_html:
+                            st.markdown(_ct_card_html, unsafe_allow_html=True)
+                        # Skip the inline trend-tier render below
+                        _skip_inline_trend_render = True
+                    else:
+                        _skip_inline_trend_render = False
+
+                    if (not _skip_inline_trend_render) and _etp:
+                        _sl_pct   = _etp.get("sl_dist_pct", 1.5)
+                        _atr_pct  = _etp.get("atr_pct", 0)
+                        _dir      = sig["direction"]
+                        _std_valid    = _etp.get("std_valid",    True)
+                        _golden_valid = _etp.get("golden_valid", True)
+                        _sniper_valid = _etp.get("sniper_valid", True)
+
+                        def _fmt(v):
+                            return f"{v:.6g}" if v else "—"
+
+                        # Update freshness note if any zone is invalid
+                        if not _std_valid or not _golden_valid or not _sniper_valid:
+                            _invalid_names = []
+                            if not _std_valid:    _invalid_names.append("Standard")
+                            if not _golden_valid: _invalid_names.append("Golden Fibo")
+                            if not _sniper_valid: _invalid_names.append("Sniper")
+                            _zone_warn = (
+                                f" <span style='color:#ff6b6b;font-weight:700;'>⚠️ "
+                                f"{' & '.join(_invalid_names)} zone(s) unavailable — "
+                                f"candle body too large for SL distance.</span>"
+                            )
+                            _freshness_html += _zone_warn
+
+                        # Aggressive zone (enter at close)
+                        _agg_rr1  = abs(_etp['agg_tp1'] - _etp['agg_entry']) / max(abs(_etp['agg_entry'] - _etp['agg_sl']), 1e-10)
+                        _std_rr2  = 2.0  # always 2R by construction
+                        _snp_rr3  = 3.0
+
+                        # ── Standard zone HTML ────────────────────────────────────
+                        if _std_valid:
+                            _std_zone_html = f"""
+      <div style="background:#091a1a;border:1px solid #1a4a3a;border-radius:6px;padding:10px;">
+        <div style="color:#3fb950;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;">
+          ✅ Standard Entry (38.2%)</div>
+        <div style="color:#aab;font-size:10px;margin-bottom:8px;">Wait for 38.2% retrace into candle body. Recommended default.</div>
+        <div style="color:#8892b0;font-size:10px;">ENTRY</div>
+        <div style="color:#ccd6f6;font-weight:700;font-size:13px;">{_fmt(_etp['std_entry'])}</div>
+        <div style="color:#8892b0;font-size:10px;margin-top:5px;">STOP LOSS</div>
+        <div style="color:#ff6b6b;font-weight:700;font-size:13px;">{_fmt(_etp['std_sl'])}</div>
+        <div style="color:#8892b0;font-size:10px;margin-top:5px;">TP1 / TP2 / TP3</div>
+        <div style="color:#64ffda;font-size:12px;">{_fmt(_etp['std_tp1'])} / {_fmt(_etp['std_tp2'])} / {_fmt(_etp['std_tp3'])}</div>
+      </div>"""
+                        else:
+                            _sl_pct_used = _etp.get("sl_dist_pct", 0)
+                            _std_zone_html = f"""
+      <div style="background:#1a0a0a;border:2px solid #6b2222;border-radius:6px;padding:10px;opacity:0.75;">
+        <div style="color:#ff6b6b;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;">
+          ❌ Standard Entry — UNAVAILABLE</div>
+        <div style="color:#cc8888;font-size:11px;line-height:1.4;">
+          Candle body is too large relative to the structural SL distance
+          ({_sl_pct_used:.1f}%). The 38.2% retrace zone falls at or beyond the
+          stop-loss level — entering here would mean your SL is already hit.
+          <br><br><strong style="color:#ffaa88;">Use Aggressive zone only.</strong>
+        </div>
+      </div>"""
+
+                        # ── Golden Fibo zone HTML (Apr 25 — 61.8%) ────────────────
+                        if _golden_valid:
+                            _golden_zone_html = f"""
+      <div style="background:#1a1208;border:1px solid #5a4015;border-radius:6px;padding:10px;">
+        <div style="color:#e3b341;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;">
+          🥇 Golden Fibo Entry (61.8%)</div>
+        <div style="color:#aab;font-size:10px;margin-bottom:8px;">Wait for 61.8% golden ratio retrace. Balanced R:R + fill rate.</div>
+        <div style="color:#8892b0;font-size:10px;">ENTRY</div>
+        <div style="color:#ccd6f6;font-weight:700;font-size:13px;">{_fmt(_etp['golden_entry'])}</div>
+        <div style="color:#8892b0;font-size:10px;margin-top:5px;">STOP LOSS</div>
+        <div style="color:#ff6b6b;font-weight:700;font-size:13px;">{_fmt(_etp['golden_sl'])}</div>
+        <div style="color:#8892b0;font-size:10px;margin-top:5px;">TP1 / TP2 / TP3</div>
+        <div style="color:#64ffda;font-size:12px;">{_fmt(_etp['golden_tp1'])} / {_fmt(_etp['golden_tp2'])} / {_fmt(_etp['golden_tp3'])}</div>
+      </div>"""
+                        else:
+                            _sl_pct_used = _etp.get("sl_dist_pct", 0)
+                            _golden_zone_html = f"""
+      <div style="background:#1a0a0a;border:2px solid #6b2222;border-radius:6px;padding:10px;opacity:0.75;">
+        <div style="color:#ff6b6b;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;">
+          ❌ Golden Fibo Entry — UNAVAILABLE</div>
+        <div style="color:#cc8888;font-size:11px;line-height:1.4;">
+          Candle body is too large relative to the structural SL distance
+          ({_sl_pct_used:.1f}%). The 61.8% retrace zone falls at or beyond the
+          stop-loss level — entering here would mean your SL is already hit.
+          <br><br><strong style="color:#ffaa88;">Use Aggressive or Standard zone only.</strong>
+        </div>
+      </div>"""
+
+                        # ── Sniper zone HTML (Apr 25 — moved to 78.6%) ────────────
+                        if _sniper_valid:
+                            _sniper_zone_html = f"""
+      <div style="background:#14100a;border:1px solid #4a3a1a;border-radius:6px;padding:10px;">
+        <div style="color:#e3b341;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;">
+          🎯 Sniper Entry (78.6%)</div>
+        <div style="color:#aab;font-size:10px;margin-bottom:8px;">Wait for 78.6% Fib retrace. Best R:R, lowest fill probability.</div>
+        <div style="color:#8892b0;font-size:10px;">ENTRY</div>
+        <div style="color:#ccd6f6;font-weight:700;font-size:13px;">{_fmt(_etp['sniper_entry'])}</div>
+        <div style="color:#8892b0;font-size:10px;margin-top:5px;">STOP LOSS</div>
+        <div style="color:#ff6b6b;font-weight:700;font-size:13px;">{_fmt(_etp['sniper_sl'])}</div>
+        <div style="color:#8892b0;font-size:10px;margin-top:5px;">TP1 / TP2 / TP3</div>
+        <div style="color:#64ffda;font-size:12px;">{_fmt(_etp['sniper_tp1'])} / {_fmt(_etp['sniper_tp2'])} / {_fmt(_etp['sniper_tp3'])}</div>
+      </div>"""
+                        else:
+                            _sl_pct_used = _etp.get("sl_dist_pct", 0)
+                            _sniper_zone_html = f"""
+      <div style="background:#1a0a0a;border:2px solid #6b2222;border-radius:6px;padding:10px;opacity:0.75;">
+        <div style="color:#ff6b6b;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;">
+          ❌ Sniper Entry — UNAVAILABLE</div>
+        <div style="color:#cc8888;font-size:11px;line-height:1.4;">
+          Candle body is too large relative to the structural SL distance
+          ({_sl_pct_used:.1f}%). The 78.6% retrace zone falls at or beyond the
+          stop-loss level — entering here would mean your SL is already hit.
+          <br><br><strong style="color:#ffaa88;">Use Aggressive or Standard zone only.</strong>
+        </div>
+      </div>"""
+
+                        _zone_rows = f"""
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:6px;margin:10px 0;">
+
+      <div style="background:#0a1628;border:1px solid #1f3a5f;border-radius:6px;padding:10px;">
+        <div style="color:#8892b0;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;">
+          ⚡ Aggressive Entry</div>
+        <div style="color:#aab;font-size:10px;margin-bottom:8px;">Enter at candle close. Highest fill chance, lowest R:R.</div>
+        <div style="color:#8892b0;font-size:10px;">ENTRY</div>
+        <div style="color:#ccd6f6;font-weight:700;font-size:13px;">{_fmt(_etp['agg_entry'])}</div>
+        <div style="color:#8892b0;font-size:10px;margin-top:5px;">STOP LOSS</div>
+        <div style="color:#ff6b6b;font-weight:700;font-size:13px;">{_fmt(_etp['agg_sl'])}</div>
+        <div style="color:#8892b0;font-size:10px;margin-top:5px;">TP1 / TP2 / TP3</div>
+        <div style="color:#64ffda;font-size:12px;">{_fmt(_etp['agg_tp1'])} / {_fmt(_etp['agg_tp2'])} / {_fmt(_etp['agg_tp3'])}</div>
+      </div>
+
+      {_std_zone_html}
+
+      {_golden_zone_html}
+
+      {_sniper_zone_html}
+
+    </div>"""
+
+                        _mgmt_html = f"""
+    <div style="background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:10px 14px;margin-top:8px;">
+      <div style="color:#58a6ff;font-size:11px;text-transform:uppercase;letter-spacing:1px;font-weight:700;margin-bottom:8px;">
+        📋 Trade Management Plan</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:12px;">
+        <div>
+          <div style="color:#8892b0;">SL Method</div>
+          <div style="color:#ccd6f6;">ATR-adaptive — {_sl_pct:.1f}% (ATR = {_atr_pct:.1f}%)</div>
+        </div>
+        <div>
+          <div style="color:#8892b0;">Invalidation Anchor</div>
+          <div style="color:#ccd6f6;">{'Below candle low' if _dir=='long' else 'Above candle high'} + 0.5× ATR buffer</div>
+        </div>
+        <div style="margin-top:6px;">
+          <div style="color:#8892b0;">At TP1</div>
+          <div style="color:#ccd6f6;">Close 30–50% of position → move SL to breakeven</div>
+        </div>
+        <div style="margin-top:6px;">
+          <div style="color:#8892b0;">At TP2</div>
+          <div style="color:#ccd6f6;">Close another 30% → trail SL below last swing</div>
+        </div>
+        <div style="margin-top:6px;">
+          <div style="color:#8892b0;">At TP3 / Let Run</div>
+          <div style="color:#ccd6f6;">Hold remaining 20–40% with trailing SL for extended move</div>
+        </div>
+        <div style="margin-top:6px;">
+          <div style="color:#8892b0;">Skip Signal If</div>
+          <div style="color:#ccd6f6;">Price already &gt;1R from aggressive entry without a retrace</div>
+        </div>
+      </div>
+      <div style="margin-top:10px;padding-top:8px;border-top:1px solid #21262d;color:#8892b0;font-size:10px;line-height:1.5;">
+        <b style="color:#58a6ff;">Mgmt modes the backtest tests (4):</b><br>
+        • <b style="color:#ccd6f6;">Simple</b> — full size, hold to TP2 or original SL<br>
+        • <b style="color:#ccd6f6;">Partial</b> — TP 50% at 1R + auto-move SL to breakeven on remaining (lower risk after 1R, capped upside)<br>
+        • <b style="color:#ccd6f6;">Partial-NoBE</b> — TP 50% at 1R, KEEP original SL on remaining (real downside but full upside if it works)<br>
+        • <b style="color:#ccd6f6;">Trailing</b> — full size, BE at 1R, then trail 0.5×ATR until SL or TP
+      </div>
+    </div>"""
+
+                        st.markdown(
+                            f'<div style="background:#0d1f2d;border:1px solid #1f6feb;'
+                            f'border-radius:8px;padding:12px 16px;margin:8px 0;font-size:13px;">'
+                            f'<div style="color:#58a6ff;font-weight:700;font-size:14px;margin-bottom:6px;">🎯 Enhanced Trade Plan</div>'
+                            f'<div style="font-size:12px;line-height:1.5;margin-bottom:4px;">{_freshness_html}</div>'
+                            f'{_zone_rows}'
+                            f'{_mgmt_html}'
+                            f'</div>',
+                            unsafe_allow_html=True,
+                        )
+                    elif not _skip_inline_trend_render:
+                        # Fallback to old simple display if _trade_plan missing
+                        # (Skipped entirely when Tier 3 CT card was already rendered above.)
+                        st.markdown(
+                            f'<div style="background:#0d1f2d;border:1px solid #1f6feb;'
+                            f'border-radius:6px;padding:10px 14px;margin:8px 0;font-size:13px;">'
+                            f'<div style="color:#58a6ff;font-weight:700;margin-bottom:6px;">🎯 Trade Setup</div>'
+                            f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;">'
+                            f'<div><div style="color:#8892b0;font-size:11px;">ENTRY</div>'
+                            f'<div style="color:#ccd6f6;font-weight:700;">{sig["entry"]:.6g}</div></div>'
+                            f'<div><div style="color:#8892b0;font-size:11px;">STOP LOSS</div>'
+                            f'<div style="color:#ff6b6b;font-weight:700;">{sig["sl"]:.6g}</div></div>'
+                            f'<div><div style="color:#8892b0;font-size:11px;">TAKE PROFIT (2R)</div>'
+                            f'<div style="color:#64ffda;font-weight:700;">{sig["tp2r"]:.6g}</div></div>'
+                            f'</div></div>',
+                            unsafe_allow_html=True,
+                        )
+
+                    # Signal recency
                     st.markdown(
-                        f'<div style="background:#0d1f2d;border:1px solid #1f6feb;'
-                        f'border-radius:6px;padding:10px 14px;margin:8px 0;font-size:13px;">'
-                        f'<div style="color:#58a6ff;font-weight:700;margin-bottom:6px;">🎯 Trade Setup</div>'
-                        f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;">'
-                        f'<div><div style="color:#8892b0;font-size:11px;">ENTRY</div>'
-                        f'<div style="color:#ccd6f6;font-weight:700;">{sig["entry"]:.6g}</div></div>'
-                        f'<div><div style="color:#8892b0;font-size:11px;">STOP LOSS</div>'
-                        f'<div style="color:#ff6b6b;font-weight:700;">{sig["sl"]:.6g}</div></div>'
-                        f'<div><div style="color:#8892b0;font-size:11px;">TAKE PROFIT (2R)</div>'
-                        f'<div style="color:#64ffda;font-weight:700;">{sig["tp2r"]:.6g}</div></div>'
+                        f'<div style="color:#8892b0;font-size:12px;margin-bottom:8px;">'
+                        f'{recency_str}</div>',
+                        unsafe_allow_html=True,
+                    )
+
+                    # Reasons
+                    st.markdown(
+                        '<div style="color:#58a6ff;font-size:13px;font-weight:700;'
+                        'margin-bottom:6px;">Why this coin was selected:</div>',
+                        unsafe_allow_html=True,
+                    )
+                    for reason in sig["reasons"]:
+                        st.markdown(
+                            f'<div style="color:#ccd6f6;font-size:13px;padding:3px 0;'
+                            f'border-bottom:1px solid #21262d;">'
+                            f'▸ {reason}</div>',
+                            unsafe_allow_html=True,
+                        )
+
+                with col_r:
+                    # Score breakdown card — use safe score_pct already computed above
+                    score_color = (
+                        "#3fb950" if score_pct >= 70 else
+                        "#e3b341" if score_pct >= 50 else
+                        "#f85149"
+                    )
+                    st.markdown(
+                        f'<div style="background:#0d1117;border:1px solid {score_color};'
+                        f'border-radius:8px;padding:14px 16px;">'
+
+                        f'<div style="text-align:center;margin-bottom:12px;">'
+                        f'<div style="color:#8892b0;font-size:11px;text-transform:uppercase;'
+                        f'letter-spacing:1px;">Signal Score</div>'
+                        f'<div style="color:{score_color};font-size:32px;font-weight:800;">'
+                        f'{score_pct}<span style="font-size:16px;color:#8892b0;">/100</span></div>'
+                        f'<div style="font-family:monospace;font-size:11px;color:{score_color};">'
+                        f'{bar_filled}<span style="color:#3a3f4b;">{bar_empty}</span></div>'
+                        f'</div>'
+
+                        f'<div style="border-top:1px solid #21262d;padding-top:10px;">'
+
+                        f'<div style="display:flex;justify-content:space-between;padding:4px 0;">'
+                        f'<span style="color:#8892b0;font-size:12px;">Body %</span>'
+                        f'<span style="color:#ccd6f6;font-size:12px;font-weight:600;">'
+                        f'{sig["body_pct"]:.1f}%</span></div>'
+
+                        f'<div style="display:flex;justify-content:space-between;padding:4px 0;">'
+                        f'<span style="color:#8892b0;font-size:12px;">Volume ×</span>'
+                        f'<span style="color:#ccd6f6;font-size:12px;font-weight:600;">'
+                        f'{sig["vol_mult"]:.2f}×</span></div>'
+
+                        f'<div style="display:flex;justify-content:space-between;padding:4px 0;">'
+                        f'<span style="color:#8892b0;font-size:12px;">ADX</span>'
+                        f'<span style="color:#ccd6f6;font-size:12px;font-weight:600;">'
+                        f'{sig["adx"]:.0f}</span></div>'
+
+                        f'<div style="display:flex;justify-content:space-between;padding:4px 0;">'
+                        f'<span style="color:#8892b0;font-size:12px;">DI+ / DI−</span>'
+                        f'<span style="color:#ccd6f6;font-size:12px;font-weight:600;">'
+                        f'{sig["di_plus"]:.0f} / {sig["di_minus"]:.0f}</span></div>'
+
+                        f'<div style="display:flex;justify-content:space-between;padding:4px 0;">'
+                        f'<span style="color:#8892b0;font-size:12px;">ATR Ratio</span>'
+                        f'<span style="color:#ccd6f6;font-size:12px;font-weight:600;">'
+                        f'{sig["atr_ratio"]:.2f}×</span></div>'
+
+                        f'<div style="display:flex;justify-content:space-between;padding:4px 0;">'
+                        f'<span style="color:#8892b0;font-size:12px;">EMA Stack</span>'
+                        f'<span style="color:#ccd6f6;font-size:12px;font-weight:600;">'
+                        f'{ema_str}</span></div>'
+
+                        f'<div style="display:flex;justify-content:space-between;padding:4px 0;">'
+                        f'<span style="color:#8892b0;font-size:12px;">Candle Rank</span>'
+                        f'<span style="color:#ccd6f6;font-size:12px;font-weight:600;">'
+                        f'Top {(1-sig["candle_rank"])*100:.0f}%</span></div>'
+
+                        f'<div style="display:flex;justify-content:space-between;'
+                        f'padding:6px 0 0 0;border-top:1px solid #21262d;margin-top:4px;">'
+                        f'<span style="color:#8892b0;font-size:12px;">Regime</span>'
+                        f'<span style="color:{reg_color};font-size:12px;font-weight:700;">'
+                        f'{sig["regime"]} ({sig["regime_score"]}/100)</span></div>'
+
                         f'</div></div>',
                         unsafe_allow_html=True,
                     )
 
-                # Signal recency
-                st.markdown(
-                    f'<div style="color:#8892b0;font-size:12px;margin-bottom:8px;">'
-                    f'{recency_str}</div>',
-                    unsafe_allow_html=True,
-                )
+                    # ── OI + Funding Rate + Taker Buy block (fetched once per symbol, cached)
+                    _is_perp = sig["symbol"].upper().endswith("USDT")
+                    if _is_perp:
+                        _deriv_cache_key = f"deriv_{sig['symbol']}"
+                        if _deriv_cache_key not in st.session_state:
+                            try:
+                                _fr = fetch_funding_rate(sig["symbol"])
+                                _oi = fetch_open_interest(sig["symbol"])
+                            except Exception:
+                                _fr = {"rate": 0.0, "ok": False, "source": "error"}
+                                _oi = {"oi_change_pct": 0.0, "ok": False, "source": "error"}
+                            st.session_state[_deriv_cache_key] = {"fr": _fr, "oi": _oi}
+                        _deriv = st.session_state[_deriv_cache_key]
+                        _af_fr  = _deriv["fr"]
+                        _af_oi  = _deriv["oi"]
+                        _data_source = _af_oi.get("source") or _af_fr.get("source") or "none"
 
-                # Reasons
-                st.markdown(
-                    '<div style="color:#58a6ff;font-size:13px;font-weight:700;'
-                    'margin-bottom:6px;">Why this coin was selected:</div>',
-                    unsafe_allow_html=True,
-                )
-                for reason in sig["reasons"]:
-                    st.markdown(
-                        f'<div style="color:#ccd6f6;font-size:13px;padding:3px 0;'
-                        f'border-bottom:1px solid #21262d;">'
-                        f'▸ {reason}</div>',
-                        unsafe_allow_html=True,
-                    )
+                        _deriv_ok = _af_fr.get("ok") or _af_oi.get("ok")
+                        if _deriv_ok:
+                            _badge_html_parts = []
 
-            with col_r:
-                # Score breakdown card — use safe score_pct already computed above
-                score_color = (
-                    "#3fb950" if score_pct >= 70 else
-                    "#e3b341" if score_pct >= 50 else
-                    "#f85149"
-                )
-                st.markdown(
-                    f'<div style="background:#0d1117;border:1px solid {score_color};'
-                    f'border-radius:8px;padding:14px 16px;">'
-
-                    f'<div style="text-align:center;margin-bottom:12px;">'
-                    f'<div style="color:#8892b0;font-size:11px;text-transform:uppercase;'
-                    f'letter-spacing:1px;">Signal Score</div>'
-                    f'<div style="color:{score_color};font-size:32px;font-weight:800;">'
-                    f'{score_pct}<span style="font-size:16px;color:#8892b0;">/100</span></div>'
-                    f'<div style="font-family:monospace;font-size:11px;color:{score_color};">'
-                    f'{bar_filled}<span style="color:#3a3f4b;">{bar_empty}</span></div>'
-                    f'</div>'
-
-                    f'<div style="border-top:1px solid #21262d;padding-top:10px;">'
-
-                    f'<div style="display:flex;justify-content:space-between;padding:4px 0;">'
-                    f'<span style="color:#8892b0;font-size:12px;">Body %</span>'
-                    f'<span style="color:#ccd6f6;font-size:12px;font-weight:600;">'
-                    f'{sig["body_pct"]:.1f}%</span></div>'
-
-                    f'<div style="display:flex;justify-content:space-between;padding:4px 0;">'
-                    f'<span style="color:#8892b0;font-size:12px;">Volume ×</span>'
-                    f'<span style="color:#ccd6f6;font-size:12px;font-weight:600;">'
-                    f'{sig["vol_mult"]:.2f}×</span></div>'
-
-                    f'<div style="display:flex;justify-content:space-between;padding:4px 0;">'
-                    f'<span style="color:#8892b0;font-size:12px;">ADX</span>'
-                    f'<span style="color:#ccd6f6;font-size:12px;font-weight:600;">'
-                    f'{sig["adx"]:.0f}</span></div>'
-
-                    f'<div style="display:flex;justify-content:space-between;padding:4px 0;">'
-                    f'<span style="color:#8892b0;font-size:12px;">DI+ / DI−</span>'
-                    f'<span style="color:#ccd6f6;font-size:12px;font-weight:600;">'
-                    f'{sig["di_plus"]:.0f} / {sig["di_minus"]:.0f}</span></div>'
-
-                    f'<div style="display:flex;justify-content:space-between;padding:4px 0;">'
-                    f'<span style="color:#8892b0;font-size:12px;">ATR Ratio</span>'
-                    f'<span style="color:#ccd6f6;font-size:12px;font-weight:600;">'
-                    f'{sig["atr_ratio"]:.2f}×</span></div>'
-
-                    f'<div style="display:flex;justify-content:space-between;padding:4px 0;">'
-                    f'<span style="color:#8892b0;font-size:12px;">EMA Stack</span>'
-                    f'<span style="color:#ccd6f6;font-size:12px;font-weight:600;">'
-                    f'{ema_str}</span></div>'
-
-                    f'<div style="display:flex;justify-content:space-between;padding:4px 0;">'
-                    f'<span style="color:#8892b0;font-size:12px;">Candle Rank</span>'
-                    f'<span style="color:#ccd6f6;font-size:12px;font-weight:600;">'
-                    f'Top {(1-sig["candle_rank"])*100:.0f}%</span></div>'
-
-                    f'<div style="display:flex;justify-content:space-between;'
-                    f'padding:6px 0 0 0;border-top:1px solid #21262d;margin-top:4px;">'
-                    f'<span style="color:#8892b0;font-size:12px;">Regime</span>'
-                    f'<span style="color:{reg_color};font-size:12px;font-weight:700;">'
-                    f'{sig["regime"]} ({sig["regime_score"]}/100)</span></div>'
-
-                    f'</div></div>',
-                    unsafe_allow_html=True,
-                )
-
-                # ── OI + Funding Rate + Taker Buy block (fetched once per symbol, cached)
-                _is_perp = sig["symbol"].upper().endswith("USDT")
-                if _is_perp:
-                    _deriv_cache_key = f"deriv_{sig['symbol']}"
-                    if _deriv_cache_key not in st.session_state:
-                        try:
-                            _fr = fetch_funding_rate(sig["symbol"])
-                            _oi = fetch_open_interest(sig["symbol"])
-                        except Exception:
-                            _fr = {"rate": 0.0, "ok": False, "source": "error"}
-                            _oi = {"oi_change_pct": 0.0, "ok": False, "source": "error"}
-                        st.session_state[_deriv_cache_key] = {"fr": _fr, "oi": _oi}
-                    _deriv = st.session_state[_deriv_cache_key]
-                    _af_fr  = _deriv["fr"]
-                    _af_oi  = _deriv["oi"]
-                    _data_source = _af_oi.get("source") or _af_fr.get("source") or "none"
-
-                    _deriv_ok = _af_fr.get("ok") or _af_oi.get("ok")
-                    if _deriv_ok:
-                        _badge_html_parts = []
-
-                        # ── OI 24h Change badge ──
-                        _oi_chg_val = _af_oi.get("oi_change_pct", 0) if _af_oi.get("ok") else None
-                        # Store for AI prompt
-                        sig["oi_change_pct"] = _oi_chg_val
-                        if _oi_chg_val is not None:
-                            if _oi_chg_val >= 10:
-                                _oi_badge_col, _oi_badge_lbl = "#3fb950", "Strong inflow — new positions opening"
-                            elif _oi_chg_val >= 3:
-                                _oi_badge_col, _oi_badge_lbl = "#7ee787", "Rising — new money entering"
-                            elif _oi_chg_val >= -3:
-                                _oi_badge_col, _oi_badge_lbl = "#8892b0", "Neutral — no clear positioning shift"
-                            elif _oi_chg_val >= -10:
-                                _oi_badge_col, _oi_badge_lbl = "#e3b341", "Falling — position unwinding"
-                            else:
-                                _oi_badge_col, _oi_badge_lbl = "#f85149", "Heavy unwind — possible squeeze or exit"
-                            _oi_arrow = "▲" if _oi_chg_val >= 0 else "▼"
-                            _badge_html_parts.append(
-                                f'<div style="display:flex;justify-content:space-between;padding:5px 0;">'
-                                f'<span style="color:#8892b0;font-size:12px;">OI 24h Δ</span>'
-                                f'<span style="color:{_oi_badge_col};font-size:12px;font-weight:600;">'
-                                f'{_oi_arrow} {abs(_oi_chg_val):.1f}% — {_oi_badge_lbl}</span></div>'
-                            )
-
-                        # ── Funding Rate badge ──
-                        _fr_rate_val = _af_fr.get("rate", 0) if _af_fr.get("ok") else None
-                        sig["funding_rate"] = _fr_rate_val
-                        if _fr_rate_val is not None:
-                            _fr_pct = _fr_rate_val * 100  # e.g. 0.0001 → 0.01%
-                            if _fr_pct > 0.05:
-                                _fr_badge_col, _fr_badge_lbl = "#f85149", "Crowded LONG — longs paying heavily, squeeze risk"
-                            elif _fr_pct >= 0.01:
-                                _fr_badge_col, _fr_badge_lbl = "#e3b341", "Longs paying shorts — mild crowding"
-                            elif _fr_pct >= -0.01:
-                                _fr_badge_col, _fr_badge_lbl = "#8892b0", "Neutral — balanced positioning"
-                            elif _fr_pct >= -0.05:
-                                _fr_badge_col, _fr_badge_lbl = "#7ee787", "Shorts paying longs — long tailwind"
-                            else:
-                                _fr_badge_col, _fr_badge_lbl = "#3fb950", "Heavily negative — strong long tailwind"
-                            _badge_html_parts.append(
-                                f'<div style="display:flex;justify-content:space-between;padding:5px 0;">'
-                                f'<span style="color:#8892b0;font-size:12px;">Funding Rate</span>'
-                                f'<span style="color:{_fr_badge_col};font-size:12px;font-weight:600;">'
-                                f'{_fr_pct:.4f}% — {_fr_badge_lbl}</span></div>'
-                            )
-
-                        # ── Taker Buy Ratio badge ──
-                        _tbr_val = sig.get("taker_buy_ratio", 0.5)
-                        _tbr_real = _tbr_val != 0.5  # suppress display if default
-                        if _tbr_real:
-                            _tbr_pct = _tbr_val * 100
-                            if _tbr_pct >= 65:
-                                _tbr_badge_col, _tbr_badge_lbl = "#3fb950", "Buy-side dominant — strong aggressive buying"
-                            elif _tbr_pct >= 55:
-                                _tbr_badge_col, _tbr_badge_lbl = "#7ee787", "Buy-side lean — buyers in control"
-                            elif _tbr_pct >= 45:
-                                _tbr_badge_col, _tbr_badge_lbl = "#8892b0", "Balanced — no clear aggressor"
-                            elif _tbr_pct >= 35:
-                                _tbr_badge_col, _tbr_badge_lbl = "#e3b341", "Sell-side lean — sellers in control"
-                            else:
-                                _tbr_badge_col, _tbr_badge_lbl = "#f85149", "Sell-side dominant — aggressive selling"
-                            _badge_html_parts.append(
-                                f'<div style="display:flex;justify-content:space-between;padding:5px 0;">'
-                                f'<span style="color:#8892b0;font-size:12px;">Taker Buy Ratio</span>'
-                                f'<span style="color:{_tbr_badge_col};font-size:12px;font-weight:600;">'
-                                f'{_tbr_pct:.1f}% — {_tbr_badge_lbl}</span></div>'
-                            )
-
-                        # ── Combination reading ──
-                        _combo_html = ""
-                        _oi_rising = _oi_chg_val is not None and _oi_chg_val >= 3
-                        _oi_falling = _oi_chg_val is not None and _oi_chg_val < -3
-                        _tbr_buy = _tbr_val >= 0.55
-                        _tbr_sell = _tbr_val < 0.45
-                        _fr_crowded = _fr_rate_val is not None and _fr_rate_val * 100 > 0.03
-                        _fr_neutral_neg = _fr_rate_val is None or _fr_rate_val * 100 <= 0.03
-
-                        if _oi_rising and _tbr_buy and _fr_neutral_neg and not _fr_crowded:
-                            _combo_col, _combo_txt = "#3fb950", "✅ Organic momentum — new money + buyer aggression, not crowded"
-                        elif _oi_rising and _tbr_buy and _fr_crowded:
-                            _combo_col, _combo_txt = "#e3b341", "⚠️ Momentum but crowded — strong move, longs already heavy"
-                        elif _oi_falling and _tbr_sell:
-                            _combo_col, _combo_txt = "#f85149", "❌ Unwinding — positions closing, sellers aggressive"
-                        elif _oi_rising and _tbr_sell:
-                            _combo_col, _combo_txt = "#e3b341", "⚠️ OI rising but sellers dominant — possible short buildup"
-                        elif _oi_falling and _tbr_buy:
-                            _combo_col, _combo_txt = "#e3b341", "⚠️ Buyers aggressive but OI falling — short covering, not fresh longs"
-                        else:
-                            _combo_col, _combo_txt = "#8892b0", "➖ Mixed signals — use other confluence"
-
-                        _combo_html = (
-                            f'<div style="border-top:1px solid #21262d;margin-top:6px;padding-top:6px;">'
-                            f'<span style="color:{_combo_col};font-size:11px;font-weight:600;">{_combo_txt}</span></div>'
-                        )
-
-                        st.markdown(
-                            f'<div style="background:#0d1117;border:1px solid #2d3250;'
-                            f'border-radius:8px;padding:12px 16px;margin-top:10px;">'
-                            f'<div style="color:#8892b0;font-size:11px;text-transform:uppercase;'
-                            f'letter-spacing:1px;margin-bottom:6px;">📊 Derivatives Sentiment</div>'
-                            + "".join(_badge_html_parts)
-                            + _combo_html
-                            + f'</div>',
-                            unsafe_allow_html=True,
-                        )
-                    else:
-                        st.markdown(
-                            '<div style="color:#3a3f4b;font-size:11px;padding:4px 0;">'
-                            'Derivatives data unavailable</div>',
-                            unsafe_allow_html=True,
-                        )
-
-            # ── Confluence Panel (full-width, below both columns) ────────────
-            st.markdown("<div style='margin-top:14px;'></div>", unsafe_allow_html=True)
-
-            _sym_key       = f"{sig['symbol']}_{sig['timeframe']}_{sig['direction']}"
-            _bt_cache_key  = f"bt_{_sym_key}"
-            _ml_cache_key  = f"ml_{_sym_key}"            # legacy — primary/display ML
-            _ml_a_key      = f"mlA_{_sym_key}"           # Candidate A (newest bucket)
-            _ml_b_key      = f"mlB_{_sym_key}"           # Candidate B (weighted all-time)
-            _ml_primary    = f"ml_primary_{_sym_key}"    # "A" or "B" — which ML the UI/AI uses
-            _wfo_cache_key = f"wfo_{_sym_key}"
-            _ai_key        = f"ai_result_{_sym_key}"
-            _has_ai_key    = bool(st.session_state.get("groq_api_key", ""))
-
-            # ── Step 1: Backtest + WFO ───────────────────────────────────────
-            if st.button("📊 Step 1 — Backtest + WFO  (deep historical scan)",
-                         key=f"step1_{_sym_key}_{i}",
-                         use_container_width=True,
-                         help=("Deep fetch (up to 1000 bars) + multi-method backtest "
-                               "with time-decay buckets + WFO mini-validation. "
-                               "Also refreshes Pulse (on-chain + derivatives).")):
-                with st.spinner("Deep backtest + WFO + Pulse…"):
-                    # Route to CT backtest when the highest-tier match is
-                    # countertrend (lowest tier number = first in sorted list).
-                    # Trend-only signals go to the standard multi-method backtest.
-                    _primary_match_for_bt = (sig.get("_qf_matches") or [None])[0]
-                    if (_primary_match_for_bt is not None
-                            and _primary_match_for_bt.get("combo_type") == "countertrend"):
-                        _bt = _scanner_countertrend_quick_backtest(
-                            sig, _primary_match_for_bt)
-                    else:
-                        _bt  = _scanner_quick_backtest(sig)
-                    _wfo = _scanner_mini_wfo(sig, _bt)
-                    # Pulse fetch runs alongside so the signal card can show
-                    # on-chain confluence before the user clicks Step 2/3.
-                    # Pulse has its own internal TTL cache (5min–4hr per module),
-                    # so repeat clicks within the cache window are near-free.
-                    _pulse = _scanner_fetch_pulse(sig["symbol"])
-                st.session_state[_bt_cache_key]       = _bt
-                st.session_state[_wfo_cache_key]      = _wfo
-                st.session_state[f"pulse_{_sym_key}"] = _pulse
-                # Clear any previously cached ML so user re-trains on fresh backtest
-                for _k in (_ml_cache_key, _ml_a_key, _ml_b_key, _ml_primary, _ai_key):
-                    st.session_state.pop(_k, None)
-
-            _bt_ready = _bt_cache_key in st.session_state
-
-            # ── Step 2: Train ML (single button for both candidates) ─────────
-            if _bt_ready:
-                _bt_for_pick  = st.session_state[_bt_cache_key]
-                _cand_a_dict  = _bt_for_pick.get("candidate_newest")
-                _cand_b_dict  = _bt_for_pick.get("candidate_weighted")
-
-                def _cand_label(c):
-                    if not c:
-                        return "— n/a —"
-                    return (f"{c.get('zone','?')} / {c.get('sl_label','?')} / "
-                            f"{c.get('mgmt','?')} / TP{c.get('tp_mult',2.0):.1f}R")
-
-                # Detect if A and B are the same method
-                def _cfg_tuple(c):
-                    if not c:
-                        return None
-                    mc = c.get("method_cfg") or {}
-                    return (mc.get("zone"), mc.get("sl_label"), mc.get("mgmt"),
-                            round(float(mc.get("tp_mult", 2.0)), 2))
-
-                _a_cfg = _cfg_tuple(_cand_a_dict)
-                _b_cfg = _cfg_tuple(_cand_b_dict)
-                _ab_same = (_a_cfg is not None and _a_cfg == _b_cfg)
-
-                # Intro panel
-                _intro_note = (
-                    "Candidate A &amp; B resolved to the <b>same method</b> — ML will be trained once."
-                    if _ab_same else
-                    "Train adaptive ML (LR/RF/GB auto-picked by sample size) on both candidates in one click. "
-                    "Each candidate is labeled by its own method outcomes."
-                )
-                st.markdown(
-                    f'<div style="margin-top:10px;padding:8px 12px;background:#0d1117;'
-                    f'border:1px solid #30363d;border-radius:6px;">'
-                    f'<div style="color:#58a6ff;font-size:11px;text-transform:uppercase;'
-                    f'letter-spacing:1px;font-weight:700;margin-bottom:4px;">'
-                    f'🧠 Step 2 — Train ML for Both Candidates</div>'
-                    f'<div style="color:#8892b0;font-size:11px;">{_intro_note}</div>'
-                    f'<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px;">'
-                    f'<div style="background:#0d1f0d;border:1px solid #238636;border-radius:4px;padding:6px 8px;">'
-                    f'<div style="color:#3fb950;font-size:9px;font-weight:700;text-transform:uppercase;">'
-                    f'🟢 Candidate A {"(= B)" if _ab_same else ""}</div>'
-                    f'<div style="color:#ccd6f6;font-size:10px;font-family:monospace;margin-top:2px;">'
-                    f'{_cand_label(_cand_a_dict)}</div></div>'
-                    + (f'<div style="background:#0a1628;border:1px solid #1f6feb;border-radius:4px;padding:6px 8px;">'
-                       f'<div style="color:#58a6ff;font-size:9px;font-weight:700;text-transform:uppercase;">🔵 Candidate B</div>'
-                       f'<div style="color:#ccd6f6;font-size:10px;font-family:monospace;margin-top:2px;">'
-                       f'{_cand_label(_cand_b_dict)}</div></div>'
-                       if not _ab_same else
-                       f'<div style="background:#1a1500;border:1px solid #e3b341;border-radius:4px;padding:6px 8px;opacity:0.7;">'
-                       f'<div style="color:#e3b341;font-size:9px;font-weight:700;text-transform:uppercase;">'
-                       f'🔵 Candidate B — Same as A</div>'
-                       f'<div style="color:#8892b0;font-size:10px;margin-top:2px;">Unanimous — single training</div></div>')
-                    + f'</div></div>',
-                    unsafe_allow_html=True,
-                )
-
-                _ml_btn_disabled = (_cand_a_dict is None and _cand_b_dict is None)
-                _ml_btn_label = ("🧠 Step 2 — Train ML (Unanimous)"
-                                 if _ab_same else
-                                 "🧠 Step 2 — Train ML for Both Candidates")
-                if st.button(_ml_btn_label,
-                             key=f"ml_both_btn_{_sym_key}_{i}",
-                             use_container_width=True,
-                             disabled=_ml_btn_disabled):
-                    if _ab_same and _cand_a_dict:
-                        with st.spinner("Training ML (unanimous method)…"):
-                            _ml_shared = _scanner_train_ml(sig, _cand_a_dict["method_cfg"])
-                        st.session_state[_ml_a_key] = _ml_shared
-                        st.session_state[_ml_b_key] = _ml_shared
-                        st.session_state[_ml_cache_key] = _ml_shared
-                    else:
-                        with st.spinner("Training ML on Candidate A…"):
-                            if _cand_a_dict:
-                                _ml_a_new = _scanner_train_ml(sig, _cand_a_dict["method_cfg"])
-                                st.session_state[_ml_a_key] = _ml_a_new
-                        with st.spinner("Training ML on Candidate B…"):
-                            if _cand_b_dict:
-                                _ml_b_new = _scanner_train_ml(sig, _cand_b_dict["method_cfg"])
-                                st.session_state[_ml_b_key] = _ml_b_new
-                        # Primary display ML = A by default (can be changed)
-                        st.session_state[_ml_cache_key] = st.session_state.get(
-                            _ml_a_key, st.session_state.get(_ml_b_key)
-                        )
-                    st.session_state[_ml_primary] = "A"
-                    st.session_state.pop(_ai_key, None)
-
-            # ── Step 3: AI Final Verdict (dual-candidate analysis) ───────────
-            _ml_ready = (_ml_a_key in st.session_state) or (_ml_b_key in st.session_state)
-            _ai_disabled = not _has_ai_key or not (_bt_ready and _ml_ready)
-            _ai_tip = (
-                "Run Step 1 + Step 2 (train ML) first."
-                if not (_bt_ready and _ml_ready) else
-                "Ask Groq (gpt-oss-120b) to analyze both candidates and pick the winner."
-                if _has_ai_key else
-                "Add Groq API key in sidebar to enable."
-            )
-            if st.button("🤖 Step 3 — AI Dual-Candidate Analysis",
-                         key=f"step3_{_sym_key}_{i}",
-                         use_container_width=True,
-                         type="primary",
-                         disabled=_ai_disabled,
-                         help=_ai_tip):
-                with st.spinner("AI analyzing both candidates (may take 20-40s)…"):
-                    _bt_for_ai = st.session_state.get(_bt_cache_key, {}) or {}
-                    # Prefer Pulse cached by Step 1; only refetch if Step 1
-                    # didn't populate it (e.g. Pulse tab hadn't loaded yet).
-                    _pulse_for_ai = (st.session_state.get(f"pulse_{_sym_key}")
-                                     or _scanner_fetch_pulse(sig["symbol"]))
-                    st.session_state[f"pulse_{_sym_key}"] = _pulse_for_ai
-                    _ai_res = _scanner_ai_verdict(
-                        sig,
-                        ml_a   = st.session_state.get(_ml_a_key),
-                        ml_b   = st.session_state.get(_ml_b_key),
-                        bt     = _bt_for_ai,
-                        wfo    = st.session_state.get(_wfo_cache_key),
-                        cand_a = _bt_for_ai.get("candidate_newest"),
-                        cand_b = _bt_for_ai.get("candidate_weighted"),
-                        pulse  = _pulse_for_ai,
-                    )
-                st.session_state[_ai_key] = _ai_res
-
-            _bt_res  = st.session_state.get(_bt_cache_key)
-            _ml_res  = st.session_state.get(_ml_cache_key)
-            _wfo_res = st.session_state.get(_wfo_cache_key)
-            _ai_res  = st.session_state.get(_ai_key)
-
-            # ── Decision Matrix — synthesised verdict panel (TOP of confluence) ─
-            # Renders BEFORE all existing detail sections. Uses only data that is
-            # already cached in session_state — never triggers a new AI call.
-            _dm_html = _render_decision_matrix_html(
-                sig    = sig,
-                ai_res = _ai_res,
-                ml_a   = st.session_state.get(_ml_a_key),
-                ml_b   = st.session_state.get(_ml_b_key),
-                bt_res = _bt_res,
-            )
-            if _dm_html:
-                st.markdown(_dm_html, unsafe_allow_html=True)
-
-            # ── Piece 2: 📓 Add to Journal buttons ───────────────────────────
-            # Three decision buttons below the decision matrix. Clicking one
-            # writes a row to quantflow_journal.csv via _qf_journal_capture().
-            # The plan dict is populated from the signal's aggressive-zone
-            # entry/SL/TP and the primary combo's sizing info.
-            # Key suffix uses _sym_key so each card has independent buttons.
-            _jbtn_c1, _jbtn_c2, _jbtn_c3, _jbtn_c4 = st.columns([0.8, 0.8, 0.8, 2.6])
-            _jplan = {
-                "entry_price": sig.get("entry", ""),
-                "sl_price":    sig.get("sl", ""),
-                "tp_price":    sig.get("tp2r", ""),
-                "risk_pct":    (
-                    _qf_effective_size_pct(
-                        (sig.get("_qf_matches") or [{}])[0].get(
-                            "primary", {}).get("sizing", "FULL"),
-                        float((sig.get("_qf_matches") or [{}])[0].get("_size_factor", 1.0)),
-                    )
-                    if sig.get("_qf_matches") else 0.50
-                ),
-            }
-            _taken_key = f"_journal_taken_{_sym_key}"
-            with _jbtn_c1:
-                if st.button("✅ TAKE", key=f"jbtntake_{_sym_key}_{i}",
-                             use_container_width=True,
-                             help="Log this signal as a live trade entry"):
-                    try:
-                        _qf_journal_capture(sig, "TAKE", _jplan)
-                        st.session_state[_taken_key] = "TAKE"
-                        st.toast("📓 Logged as TAKE — good luck!", icon="✅")
-                    except Exception as _je:
-                        st.error(f"Journal write failed: {_je}")
-            with _jbtn_c2:
-                if st.button("📄 PAPER", key=f"jbtnpaper_{_sym_key}_{i}",
-                             use_container_width=True,
-                             help="Log as paper trade (simulated, no real money)"):
-                    try:
-                        _qf_journal_capture(sig, "PAPER", _jplan)
-                        st.session_state[_taken_key] = "PAPER"
-                        st.toast("📓 Logged as PAPER trade", icon="📄")
-                    except Exception as _je:
-                        st.error(f"Journal write failed: {_je}")
-            with _jbtn_c3:
-                if st.button("⛔ SKIP", key=f"jbtnkip_{_sym_key}_{i}",
-                             use_container_width=True,
-                             help="Log this signal as deliberately skipped"):
-                    try:
-                        _qf_journal_capture(sig, "SKIP", _jplan)
-                        st.session_state[_taken_key] = "SKIP"
-                        st.toast("📓 Logged as SKIP", icon="⛔")
-                    except Exception as _je:
-                        st.error(f"Journal write failed: {_je}")
-            with _jbtn_c4:
-                _taken_tag = st.session_state.get(_taken_key, "")
-                if _taken_tag:
-                    _tag_color = {
-                        "TAKE": "#3fb950", "PAPER": "#58a6ff", "SKIP": "#8892b0",
-                    }.get(_taken_tag, "#ccd6f6")
-                    st.markdown(
-                        f'<div style="margin-top:6px;color:{_tag_color};'
-                        f'font-size:11px;font-weight:700;">📓 {_taken_tag} logged this session</div>',
-                        unsafe_allow_html=True,
-                    )
-
-            if _bt_res or _ml_res:
-                _ml_res = _ml_res or _scanner_heuristic_ml(sig)
-                _bt_res = _bt_res or {}
-                _grade, _grade_color, _grade_desc = _scanner_setup_grade(sig, _ml_res, _bt_res)
-
-                # ── WFO Results Block ──────────────────────────────────────────
-                _wfo_block_html = ""
-                if _wfo_res:
-                    _wv      = _wfo_res.get("verdict", "INSUFFICIENT")
-                    _wv_col  = {"PASS": "#3fb950", "BORDERLINE": "#e3b341",
-                                "FAIL": "#f85149", "INSUFFICIENT": "#8892b0"}.get(_wv, "#8892b0")
-                    _wv_bg   = {"PASS": "#091a0d", "BORDERLINE": "#1a1500",
-                                "FAIL": "#1a0505", "INSUFFICIENT": "#0d1117"}.get(_wv, "#0d1117")
-                    _wv_icon = {"PASS": "✅", "BORDERLINE": "⚠️",
-                                "FAIL": "❌", "INSUFFICIENT": "⚠️"}.get(_wv, "—")
-                    _wfo_ran   = _wfo_res.get("ok", False)
-                    _wfo_note  = _wfo_res.get("note", "")
-                    _wfo_meth  = _wfo_res.get("method_used", "—") or "—"
-
-                    if _wvo_ran := _wfo_ran and _wv != "INSUFFICIENT":
-                        # Purge/embargo diagnostics — proves the leak protection
-                        # is actively dropping trades at the IS/OOS boundary.
-                        _pd_w = _wfo_res.get("purge_diag") or {}
-                        if _pd_w:
-                            _pd_html = (
-                                f'<div style="background:#0a0f1a;border-radius:4px;'
-                                f'padding:5px 8px;margin-top:4px;color:#8892b0;font-size:10px;">'
-                                f'🛡️ <b style="color:#58a6ff;">Purge/Embargo (de Prado)</b>: '
-                                f'IS raw={_pd_w.get("n_is_raw",0)} → kept {_wfo_res.get("is_n",0)} '
-                                f'(<span style="color:#f0883e;">purged {_pd_w.get("n_purged",0)} '
-                                f'label-overlap</span>) | '
-                                f'OOS raw={_pd_w.get("n_oos_raw",0)} → kept {_wfo_res.get("oos_n",0)} '
-                                f'(<span style="color:#f0883e;">embargoed {_pd_w.get("n_embargoed",0)}, '
-                                f'E={_pd_w.get("embargo_bars",0)} bars</span>)</div>'
-                            )
-                        else:
-                            _pd_html = ""
-
-                        # Honest-PF diagnostic — strips out near-breakeven outcomes
-                        # (|r_mult| <= 0.30R) so you can see how much of the edge is
-                        # actually clean WIN vs LOSS, vs how much is breakeven mush
-                        # from Partial+BE auto-stop-out.
-                        _ld = _wfo_res.get("label_diag") or {}
-                        if _ld and (_ld.get("n_neutral_is", 0) > 0 or _ld.get("n_neutral_oos", 0) > 0):
-                            _is_pfc = _ld.get("is_pf_clean", 0)
-                            _oos_pfc = _ld.get("oos_pf_clean", 0)
-                            _is_pfc_s = "∞" if _is_pfc >= 9.9 else f"{_is_pfc:.2f}"
-                            _oos_pfc_s = "∞" if _oos_pfc >= 9.9 else f"{_oos_pfc:.2f}"
-                            # Highlight when "honest" PF differs meaningfully from
-                            # raw PF (suggests Partial+BE inflation)
-                            _gap = abs(_oos_pfc - _wfo_res.get("oos_pf", 0))
-                            _gap_warn = ""
-                            if _gap >= 0.5 and _ld.get("n_neutral_oos", 0) >= 3:
-                                _gap_warn = (
-                                    ' <span style="color:#f0883e;">'
-                                    '⚠ Raw PF inflated by breakeven outcomes — trust the honest column more</span>'
+                            # ── OI 24h Change badge ──
+                            _oi_chg_val = _af_oi.get("oi_change_pct", 0) if _af_oi.get("ok") else None
+                            # Store for AI prompt
+                            sig["oi_change_pct"] = _oi_chg_val
+                            if _oi_chg_val is not None:
+                                if _oi_chg_val >= 10:
+                                    _oi_badge_col, _oi_badge_lbl = "#3fb950", "Strong inflow — new positions opening"
+                                elif _oi_chg_val >= 3:
+                                    _oi_badge_col, _oi_badge_lbl = "#7ee787", "Rising — new money entering"
+                                elif _oi_chg_val >= -3:
+                                    _oi_badge_col, _oi_badge_lbl = "#8892b0", "Neutral — no clear positioning shift"
+                                elif _oi_chg_val >= -10:
+                                    _oi_badge_col, _oi_badge_lbl = "#e3b341", "Falling — position unwinding"
+                                else:
+                                    _oi_badge_col, _oi_badge_lbl = "#f85149", "Heavy unwind — possible squeeze or exit"
+                                _oi_arrow = "▲" if _oi_chg_val >= 0 else "▼"
+                                _badge_html_parts.append(
+                                    f'<div style="display:flex;justify-content:space-between;padding:5px 0;">'
+                                    f'<span style="color:#8892b0;font-size:12px;">OI 24h Δ</span>'
+                                    f'<span style="color:{_oi_badge_col};font-size:12px;font-weight:600;">'
+                                    f'{_oi_arrow} {abs(_oi_chg_val):.1f}% — {_oi_badge_lbl}</span></div>'
                                 )
-                            _ld_html = (
-                                f'<div style="background:#0a0f1a;border-radius:4px;'
-                                f'padding:5px 8px;margin-top:4px;color:#8892b0;font-size:10px;">'
-                                f'🎯 <b style="color:#58a6ff;">Honest PF</b> '
-                                f'(excludes |r_mult| ≤ {_ld.get("neutral_threshold",0.30)}R breakevens): '
-                                f'IS={_is_pfc_s} <span style="color:#8892b0;">'
-                                f'(n_clean={_ld.get("is_n_clean",0)}, '
-                                f'{_ld.get("n_neutral_is",0)} excluded)</span> | '
-                                f'OOS={_oos_pfc_s} WR={_ld.get("oos_wr_clean",0):.1f}% '
-                                f'<span style="color:#8892b0;">'
-                                f'(n_clean={_ld.get("oos_n_clean",0)}, '
-                                f'{_ld.get("n_neutral_oos",0)} excluded)</span>'
-                                f'{_gap_warn}</div>'
-                            )
-                        else:
-                            _ld_html = ""
 
-                        # Bootstrap CI on OOS PF — honest accounting for sample size
-                        _ci = _wfo_res.get("oos_pf_ci") or {}
-                        if _ci.get("ok"):
-                            _ci_lo = _ci.get("lo", 0); _ci_hi = _ci.get("hi", 0)
-                            _ci_html = (
-                                f'<div style="background:#0a0f1a;border-radius:4px;'
-                                f'padding:5px 8px;margin-top:4px;color:#8892b0;font-size:10px;">'
-                                f'📊 <b style="color:#58a6ff;">OOS PF 95% CI</b> '
-                                f'(block bootstrap, 1000x): '
-                                f'<span style="color:#ccd6f6;">'
-                                f'[{("∞" if _ci_lo>=4.99 else f"{_ci_lo:.2f}")}, '
-                                f'{("∞" if _ci_hi>=4.99 else f"{_ci_hi:.2f}")}]</span> '
-                                f'<span style="color:#8892b0;">'
-                                f'— wide CI = small sample = treat point estimate with caution</span>'
-                                f'</div>'
-                            )
-                        else:
-                            _ci_html = ""
-
-                        # Rolling WFO — distribution across 5 cut points
-                        _rwfo = _wfo_res.get("rolling_wfo") or {}
-                        if _rwfo.get("ok"):
-                            _ehr = _rwfo.get("edge_hit_rate", 0)
-                            _ehr_color = ("#3fb950" if _ehr >= 80 else
-                                          "#e3b341" if _ehr >= 50 else "#f85149")
-                            _dist = _rwfo.get("oos_pf_dist", {}) or {}
-                            _wins = _rwfo.get("windows", []) or []
-                            # Compact table of windows
-                            _wins_rows = ""
-                            for w in _wins:
-                                _is_pf_v = w.get("is_pf", 0)
-                                _opf = w.get("oos_pf", 0)
-                                _is_pf_s = "∞" if _is_pf_v >= 9.9 else f"{_is_pf_v:.2f}"
-                                _opf_str = "∞" if _opf >= 9.9 else f"{_opf:.2f}"
-                                _opf_color = ("#3fb950" if _opf >= 1.3 else
-                                              "#e3b341" if _opf >= 1.0 else "#f85149")
-                                _wins_rows += (
-                                    f'<tr>'
-                                    f'<td style="color:#ccd6f6;padding:1px 6px;">{int(w.get("cut_pct",0))}%</td>'
-                                    f'<td style="color:#ccd6f6;padding:1px 6px;">{_is_pf_s} <span style="color:#8892b0;">(n={w.get("is_n",0)})</span></td>'
-                                    f'<td style="color:{_opf_color};font-weight:700;padding:1px 6px;">{_opf_str} <span style="color:#8892b0;font-weight:400;">(n={w.get("oos_n",0)}, WR={w.get("oos_wr",0):.0f}%)</span></td>'
-                                    f'</tr>'
+                            # ── Funding Rate badge ──
+                            _fr_rate_val = _af_fr.get("rate", 0) if _af_fr.get("ok") else None
+                            sig["funding_rate"] = _fr_rate_val
+                            if _fr_rate_val is not None:
+                                _fr_pct = _fr_rate_val * 100  # e.g. 0.0001 → 0.01%
+                                if _fr_pct > 0.05:
+                                    _fr_badge_col, _fr_badge_lbl = "#f85149", "Crowded LONG — longs paying heavily, squeeze risk"
+                                elif _fr_pct >= 0.01:
+                                    _fr_badge_col, _fr_badge_lbl = "#e3b341", "Longs paying shorts — mild crowding"
+                                elif _fr_pct >= -0.01:
+                                    _fr_badge_col, _fr_badge_lbl = "#8892b0", "Neutral — balanced positioning"
+                                elif _fr_pct >= -0.05:
+                                    _fr_badge_col, _fr_badge_lbl = "#7ee787", "Shorts paying longs — long tailwind"
+                                else:
+                                    _fr_badge_col, _fr_badge_lbl = "#3fb950", "Heavily negative — strong long tailwind"
+                                _badge_html_parts.append(
+                                    f'<div style="display:flex;justify-content:space-between;padding:5px 0;">'
+                                    f'<span style="color:#8892b0;font-size:12px;">Funding Rate</span>'
+                                    f'<span style="color:{_fr_badge_col};font-size:12px;font-weight:600;">'
+                                    f'{_fr_pct:.4f}% — {_fr_badge_lbl}</span></div>'
                                 )
-                            _rwfo_html = (
-                                f'<div style="background:#0a0f1a;border-radius:4px;'
-                                f'padding:6px 10px;margin-top:4px;color:#8892b0;font-size:10px;">'
-                                f'🔄 <b style="color:#58a6ff;">Rolling WFO ({len(_wins)} windows, anchored)</b>: '
-                                f'<span style="color:{_ehr_color};font-weight:700;">{_ehr}% edge hit rate</span> '
-                                f'<span style="color:#8892b0;">'
-                                f'({_rwfo.get("n_valid",0)}/{_rwfo.get("n_total",0)} windows valid; '
-                                f'OOS PF median {_dist.get("median","—")}, '
-                                f'range [{_dist.get("min","—")}, {_dist.get("max","—")}])</span>'
-                                f'<table style="margin-top:4px;font-size:10px;border-collapse:collapse;">'
-                                f'<tr style="color:#8892b0;">'
-                                f'<th style="text-align:left;padding:1px 6px;">Cut</th>'
-                                f'<th style="text-align:left;padding:1px 6px;">IS PF</th>'
-                                f'<th style="text-align:left;padding:1px 6px;">OOS PF</th></tr>'
-                                f'{_wins_rows}</table>'
-                                f'</div>'
-                            )
-                        else:
-                            _rwfo_html = ""
 
-                        # Regime-conditional breakdown
-                        _rb = _wfo_res.get("regime_breakdown") or {}
-                        if _rb.get("ok") and _rb.get("buckets"):
-                            _rb_rows = ""
-                            for bk in _rb["buckets"]:
-                                _bpf = bk.get("pf", 0)
-                                _bpf_s = "∞" if _bpf >= 9.9 else f"{_bpf:.2f}"
-                                _bpf_color = ("#3fb950" if _bpf >= 1.3 else
-                                              "#e3b341" if _bpf >= 1.0 else "#f85149")
-                                _rb_rows += (
-                                    f'<tr>'
-                                    f'<td style="color:#ccd6f6;padding:1px 6px;">{bk["regime"]}</td>'
-                                    f'<td style="color:{_bpf_color};font-weight:700;padding:1px 6px;">{_bpf_s}</td>'
-                                    f'<td style="color:#ccd6f6;padding:1px 6px;">{bk["wr"]:.0f}%</td>'
-                                    f'<td style="color:#ccd6f6;padding:1px 6px;">{bk["avg_r"]:+.2f}R</td>'
-                                    f'<td style="color:#8892b0;padding:1px 6px;">n={bk["n"]}</td>'
-                                    f'</tr>'
+                            # ── Taker Buy Ratio badge ──
+                            _tbr_val = sig.get("taker_buy_ratio", 0.5)
+                            _tbr_real = _tbr_val != 0.5  # suppress display if default
+                            if _tbr_real:
+                                _tbr_pct = _tbr_val * 100
+                                if _tbr_pct >= 65:
+                                    _tbr_badge_col, _tbr_badge_lbl = "#3fb950", "Buy-side dominant — strong aggressive buying"
+                                elif _tbr_pct >= 55:
+                                    _tbr_badge_col, _tbr_badge_lbl = "#7ee787", "Buy-side lean — buyers in control"
+                                elif _tbr_pct >= 45:
+                                    _tbr_badge_col, _tbr_badge_lbl = "#8892b0", "Balanced — no clear aggressor"
+                                elif _tbr_pct >= 35:
+                                    _tbr_badge_col, _tbr_badge_lbl = "#e3b341", "Sell-side lean — sellers in control"
+                                else:
+                                    _tbr_badge_col, _tbr_badge_lbl = "#f85149", "Sell-side dominant — aggressive selling"
+                                _badge_html_parts.append(
+                                    f'<div style="display:flex;justify-content:space-between;padding:5px 0;">'
+                                    f'<span style="color:#8892b0;font-size:12px;">Taker Buy Ratio</span>'
+                                    f'<span style="color:{_tbr_badge_col};font-size:12px;font-weight:600;">'
+                                    f'{_tbr_pct:.1f}% — {_tbr_badge_lbl}</span></div>'
                                 )
-                            _rb_html = (
-                                f'<div style="background:#0a0f1a;border-radius:4px;'
-                                f'padding:6px 10px;margin-top:4px;color:#8892b0;font-size:10px;">'
-                                f'🎯 <b style="color:#58a6ff;">OOS by Regime</b> '
-                                f'(proxy: ATR ratio):'
-                                f'<table style="margin-top:4px;font-size:10px;border-collapse:collapse;">'
-                                f'<tr style="color:#8892b0;">'
-                                f'<th style="text-align:left;padding:1px 6px;">Regime</th>'
-                                f'<th style="text-align:left;padding:1px 6px;">PF</th>'
-                                f'<th style="text-align:left;padding:1px 6px;">WR</th>'
-                                f'<th style="text-align:left;padding:1px 6px;">Avg R</th>'
-                                f'<th style="text-align:left;padding:1px 6px;">n</th></tr>'
-                                f'{_rb_rows}</table>'
-                                f'</div>'
-                            )
-                        else:
-                            _rb_html = ""
 
-                        # Full result card with metric grid
-                        _wfo_block_html = (
-                            f'<div style="margin-top:10px;background:{_wv_bg};'
-                            f'border:1px solid {_wv_col};border-radius:8px;padding:10px 14px;">'
-                            f'<div style="color:{_wv_col};font-size:11px;text-transform:uppercase;'
-                            f'letter-spacing:1px;font-weight:700;margin-bottom:6px;">'
-                            f'🔬 WFO Mini-Validation — {_wv_icon} {_wv}</div>'
-                            f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:6px;margin-bottom:6px;">'
-                            f'<div style="background:#0a0f1a;border-radius:4px;padding:5px 8px;">'
-                            f'<div style="color:#8892b0;font-size:9px;text-transform:uppercase;">IS PF</div>'
-                            f'<div style="color:#ccd6f6;font-size:14px;font-weight:800;">'+("∞" if _wfo_res.get("is_pf",0)>=9.9 else f"{_wfo_res.get('is_pf',0):.2f}")+'</div>'
-                            f'<div style="color:#8892b0;font-size:9px;">n={_wfo_res.get("is_n",0)}</div></div>'
-                            f'<div style="background:#0a0f1a;border-radius:4px;padding:5px 8px;">'
-                            f'<div style="color:#8892b0;font-size:9px;text-transform:uppercase;">OOS PF</div>'
-                            f'<div style="color:{_wv_col};font-size:14px;font-weight:800;">'+("∞" if _wfo_res.get("oos_pf",0)>=9.9 else f"{_wfo_res.get('oos_pf',0):.2f}")+'</div>'
-                            f'<div style="color:#8892b0;font-size:9px;">n={_wfo_res.get("oos_n",0)}</div></div>'
-                            f'<div style="background:#0a0f1a;border-radius:4px;padding:5px 8px;">'
-                            f'<div style="color:#8892b0;font-size:9px;text-transform:uppercase;">OOS WR</div>'
-                            f'<div style="color:#ccd6f6;font-size:14px;font-weight:800;">{_wfo_res.get("oos_wr",0):.1f}%</div></div>'
-                            f'<div style="background:#0a0f1a;border-radius:4px;padding:5px 8px;">'
-                            f'<div style="color:#8892b0;font-size:9px;text-transform:uppercase;">OOS/IS Ratio</div>'
-                            f'<div style="color:#ccd6f6;font-size:14px;font-weight:800;">{_wfo_res.get("oos_is_ratio",0):.2f}</div></div>'
-                            f'</div>'
-                            f'<div style="color:#8892b0;font-size:10px;">'
-                            f'Method: {_wfo_meth} &nbsp;|&nbsp; {_wfo_res.get("tier_label","70% IS / 30% OOS")}</div>'
-                            f'{_pd_html}'
-                            f'{_ld_html}'
-                            f'{_ci_html}'
-                            f'{_rwfo_html}'
-                            f'{_rb_html}'
-                            f'<div style="color:{_wv_col};font-size:11px;margin-top:4px;">{_wfo_note}</div>'
-                            f'</div>'
-                        )
-                    else:
-                        # INSUFFICIENT or failed-to-start — show simple explanatory card
-                        _ins_is_n = _wfo_res.get("is_n", 0)
-                        _ins_desc = (
-                            f"IS: {_ins_is_n} trades, OOS: {_wfo_res.get('oos_n',0)} trades"
-                            if _wfo_ran else ""
-                        )
-                        _wfo_block_html = (
-                            f'<div style="margin-top:10px;background:#0d1117;'
-                            f'border:1px solid #8892b0;border-radius:8px;padding:10px 14px;">'
-                            f'<div style="color:#8892b0;font-size:11px;text-transform:uppercase;'
-                            f'letter-spacing:1px;font-weight:700;margin-bottom:4px;">'
-                            f'🔬 WFO Mini-Validation — ⚠️ INSUFFICIENT SAMPLE</div>'
-                            f'<div style="color:#ccd6f6;font-size:12px;margin-bottom:4px;">'
-                            f'Method tested: <b>{_wfo_meth}</b>'
-                            + (f' &nbsp;|&nbsp; {_ins_desc}' if _ins_desc else '')
-                            + f'</div>'
-                            f'<div style="color:#e3b341;font-size:11px;">{_wfo_note}</div>'
-                            f'<div style="color:#8892b0;font-size:10px;margin-top:4px;">'
-                            f'WFO result ignored — signal may still be considered based on backtest and ML alone.</div>'
-                            f'</div>'
-                        )
+                            # ── Combination reading ──
+                            _combo_html = ""
+                            _oi_rising = _oi_chg_val is not None and _oi_chg_val >= 3
+                            _oi_falling = _oi_chg_val is not None and _oi_chg_val < -3
+                            _tbr_buy = _tbr_val >= 0.55
+                            _tbr_sell = _tbr_val < 0.45
+                            _fr_crowded = _fr_rate_val is not None and _fr_rate_val * 100 > 0.03
+                            _fr_neutral_neg = _fr_rate_val is None or _fr_rate_val * 100 <= 0.03
 
-                # ── 6 Intelligence Layers Expander ────────────────────────────
-                # ── Layer 2: Macro Context ────────────────────────────────────
-                # Read from session state first (already fetched by live scanner /
-                # main analysis tab). Fall back to fresh cached fetch (alternative.me
-                # for F&G, CoinGecko for BTC.D — both free, no API key needed).
-                _l2_fg_data   = (st.session_state.get("live_fg_data")
-                                 or st.session_state.get("_regime_fg_cache"))
-                if not _l2_fg_data or not _l2_fg_data.get("ok"):
-                    _l2_fg_data = fetch_fear_greed()
-                    if _l2_fg_data.get("ok"):
-                        st.session_state["_regime_fg_cache"] = _l2_fg_data
+                            if _oi_rising and _tbr_buy and _fr_neutral_neg and not _fr_crowded:
+                                _combo_col, _combo_txt = "#3fb950", "✅ Organic momentum — new money + buyer aggression, not crowded"
+                            elif _oi_rising and _tbr_buy and _fr_crowded:
+                                _combo_col, _combo_txt = "#e3b341", "⚠️ Momentum but crowded — strong move, longs already heavy"
+                            elif _oi_falling and _tbr_sell:
+                                _combo_col, _combo_txt = "#f85149", "❌ Unwinding — positions closing, sellers aggressive"
+                            elif _oi_rising and _tbr_sell:
+                                _combo_col, _combo_txt = "#e3b341", "⚠️ OI rising but sellers dominant — possible short buildup"
+                            elif _oi_falling and _tbr_buy:
+                                _combo_col, _combo_txt = "#e3b341", "⚠️ Buyers aggressive but OI falling — short covering, not fresh longs"
+                            else:
+                                _combo_col, _combo_txt = "#8892b0", "➖ Mixed signals — use other confluence"
 
-                _l2_btcd_data = st.session_state.get("_regime_btcd_cache")
-                if not _l2_btcd_data or not _l2_btcd_data.get("ok"):
-                    _l2_btcd_data = fetch_btc_dominance()
-                    if _l2_btcd_data.get("ok"):
-                        st.session_state["_regime_btcd_cache"] = _l2_btcd_data
-
-                _l2_fng_val  = _l2_fg_data.get("value") if _l2_fg_data and _l2_fg_data.get("ok") else None
-                _l2_fng_lbl  = _l2_fg_data.get("classification", "") if _l2_fg_data else ""
-                _l2_btcd_val = _l2_btcd_data.get("btc_d") if _l2_btcd_data and _l2_btcd_data.get("ok") else None
-
-                _layer2_btcd = (f"BTC.D: {_l2_btcd_val:.1f}%" if _l2_btcd_val is not None
-                                else "BTC.D: N/A")
-                _layer2_fng  = (f"F&G: {_l2_fng_val} ({_l2_fng_lbl})" if _l2_fng_val is not None
-                                else "F&G: N/A")
-                _layer2 = f"{_layer2_btcd} | {_layer2_fng}"
-
-                # ── Layer 3: Derivatives Sentiment ────────────────────────────
-                # OI / Funding are set on sig{} by the derivatives display block
-                # that ran earlier in this same render cycle (above the columns).
-                # Also check session-state cache as a fallback.
-                _l3_cache_key = f"deriv_{sig['symbol']}"
-                _l3_cached    = st.session_state.get(_l3_cache_key, {})
-                _l3_oi_val    = (sig.get("oi_change_pct")
-                                 if sig.get("oi_change_pct") is not None
-                                 else (_l3_cached.get("oi", {}).get("oi_change_pct")
-                                       if _l3_cached.get("oi", {}).get("ok") else None))
-                _l3_fr_val    = (sig.get("funding_rate")
-                                 if sig.get("funding_rate") is not None
-                                 else (_l3_cached.get("fr", {}).get("rate")
-                                       if _l3_cached.get("fr", {}).get("ok") else None))
-                _l3_tbr_val   = sig.get("taker_buy_ratio", 0.5)
-                _l3_tbr_real  = abs(_l3_tbr_val - 0.5) > 0.001   # False if still at default
-
-                _layer3_oi  = (f"OI 24h: {_l3_oi_val:+.1f}%" if _l3_oi_val is not None
-                               else "OI 24h: N/A (spot-only or derivatives API unavailable)")
-                _layer3_fr  = (f"Funding: {_l3_fr_val*100:.4f}%" if _l3_fr_val is not None
-                               else "Funding: N/A")
-                _layer3_tbr = (f"Taker Buy: {_l3_tbr_val*100:.1f}%" if _l3_tbr_real
-                               else "Taker Buy: N/A")
-                _layer3 = f"{_layer3_oi} | {_layer3_fr} | {_layer3_tbr}"
-
-                # ── Layers 1, 4, 5 ────────────────────────────────────────────
-                _layer1 = (
-                    f"Body {sig['body_pct']:.1f}% | Vol {sig['vol_mult']:.2f}× | "
-                    f"ADX {sig['adx']:.1f} | DI+ {sig['di_plus']:.1f} vs DI− {sig['di_minus']:.1f} | "
-                    f"ATR× {sig['atr_ratio']:.2f} | Candle Rank top {round((1-sig.get('candle_rank',0.5))*100):.0f}% | "
-                    f"Regime {sig['regime']} ({sig['regime_score']}/100) | Age: {max(sig.get('bar_offset',1)-1, 0)} candle(s)"
-                )
-                _ml_res_disp = _ml_res or _scanner_heuristic_ml(sig)
-                # Layer 4 — ML engine: show method name + CV accuracy + sample count
-                _ml_pct_d   = _ml_res_disp.get('pct', 50)
-                _ml_lbl_d   = _ml_res_disp.get('label', '—')
-                _ml_mname_d = _ml_res_disp.get('method_name', 'Heuristic')
-                _ml_ns_d    = _ml_res_disp.get('n_samples', 0)
-                _ml_cv_d    = _ml_res_disp.get('cv_accuracy')
-                _ml_trained = _ml_res_disp.get('trained', False)
-                if _ml_trained:
-                    _cv_str = f"CV={_ml_cv_d*100:.1f}%" if _ml_cv_d is not None else "CV=n/a"
-                    _layer4 = (f"ML Probability: {_ml_pct_d:.1f}% ({_ml_lbl_d}) | "
-                               f"Model: {_ml_mname_d} | n={_ml_ns_d} "
-                               f"({_ml_res_disp.get('n_wins',0)}W/{_ml_res_disp.get('n_losses',0)}L) | "
-                               f"{_cv_str}")
-                else:
-                    _layer4 = (f"ML Probability: {_ml_pct_d:.1f}% ({_ml_lbl_d}) | "
-                               f"{_ml_mname_d} — train a model in Step 2 for real ML")
-
-                # Layer 5 — Backtest: show best method + WR + EV + PF + bars used
-                _best_disp = _bt_res.get("best", {})
-                _bk_disp   = _bt_res.get("best_key", "—") or "—"
-                _meta_d    = _bt_res.get("meta", {}) or {}
-                _bars_used = _meta_d.get("bars_used", 0)
-                _bkt_cnt   = _meta_d.get("bucket_count", 1)
-                if _bk_disp != "—":
-                    _pf_d = _best_disp.get('pf', 0)
-                    _pf_str = "∞" if _pf_d >= 9.9 else f"{_pf_d:.2f}"
-                    _layer5 = (
-                        f"Best: {_bk_disp} | "
-                        f"WR={_best_disp.get('win_rate',0):.1f}% | "
-                        f"EV={_best_disp.get('ev',0):+.2f}R | "
-                        f"EVw={_best_disp.get('ev_weighted',0):+.2f}R | "
-                        f"PF={_pf_str} | n={_best_disp.get('n',0)} | "
-                        f"Bars={_bars_used} ({_bkt_cnt} decay buckets)"
-                    )
-                else:
-                    _layer5 = f"Backtest: no valid method found (bars={_bars_used})"
-
-                # ── Rich ML card (detailed, shown inline in the main card) ───
-                # Builds a block showing method name, sample size, CV, top features,
-                # and — if Candidate A & B are BOTH trained — a comparison strip.
-                _ml_a_show = st.session_state.get(_ml_a_key)
-                _ml_b_show = st.session_state.get(_ml_b_key)
-                _ml_primary_show = st.session_state.get(_ml_primary, "A")
-
-                def _render_ml_block(ml_dict, title, accent_color, bg_color):
-                    if not ml_dict:
-                        return ""
-                    _trained = ml_dict.get("trained", False)
-                    _mname   = ml_dict.get("method_name", "Heuristic")
-                    _mcfg    = ml_dict.get("method_cfg") or {}
-                    _pct     = ml_dict.get("pct", 50)
-                    _lbl     = ml_dict.get("label", "—")
-                    _ns      = ml_dict.get("n_samples", 0)
-                    _nw      = ml_dict.get("n_wins",  0)
-                    _nl      = ml_dict.get("n_losses", 0)
-                    _cv      = ml_dict.get("cv_accuracy")
-                    _cv_std  = ml_dict.get("cv_std")
-                    _note    = ml_dict.get("note", "")
-                    _fi      = ml_dict.get("feature_importance", [])
-
-                    _mcfg_str = (
-                        f"{_mcfg.get('zone','?')} / {_mcfg.get('sl_label','?')} / "
-                        f"{_mcfg.get('mgmt','?')} / TP{_mcfg.get('tp_mult',2.0):.1f}R"
-                    ) if _mcfg else "n/a"
-
-                    _prob_color = ("#3fb950" if _pct >= 65 else
-                                   "#e3b341" if _pct >= 50 else "#f85149")
-                    _cv_color   = ("#3fb950" if (_cv or 0) >= 0.65 else
-                                   "#e3b341" if (_cv or 0) >= 0.55 else "#f85149")
-                    _cv_str = (
-                        f"{_cv*100:.1f}% ± {(_cv_std or 0)*100:.1f}%"
-                        if _cv is not None else "n/a"
-                    )
-
-                    # Top-3 feature importance bars
-                    _fi_html = ""
-                    if _fi:
-                        _top = _fi[:3]
-                        _max_imp = max((f["importance"] for f in _fi), default=1.0) or 1.0
-                        for _f in _top:
-                            _pct_bar = int((_f["importance"] / _max_imp) * 100)
-                            _fi_html += (
-                                f'<div style="display:grid;grid-template-columns:90px 1fr 50px;'
-                                f'gap:6px;align-items:center;padding:2px 0;">'
-                                f'<div style="color:#ccd6f6;font-size:10px;font-family:monospace;">{_f["feature"]}</div>'
-                                f'<div style="background:#21262d;border-radius:3px;height:8px;overflow:hidden;">'
-                                f'<div style="background:{accent_color};width:{_pct_bar}%;height:100%;"></div></div>'
-                                f'<div style="color:#8892b0;font-size:10px;text-align:right;">{_f["importance"]:.2f}</div>'
-                                f'</div>'
-                            )
-                        _fi_html = (
-                            f'<div style="margin-top:6px;padding-top:6px;border-top:1px solid #21262d;">'
-                            f'<div style="color:#8892b0;font-size:9px;text-transform:uppercase;'
-                            f'letter-spacing:1px;margin-bottom:3px;">Top Feature Importance</div>'
-                            + _fi_html + '</div>'
-                        )
-
-                    _status_badge = (
-                        f'<span style="background:#0d2818;color:#3fb950;font-size:9px;'
-                        f'padding:2px 6px;border-radius:3px;margin-left:6px;">✓ TRAINED</span>'
-                        if _trained else
-                        f'<span style="background:#2d2200;color:#e3b341;font-size:9px;'
-                        f'padding:2px 6px;border-radius:3px;margin-left:6px;">⚠ HEURISTIC</span>'
-                    )
-
-                    # Filter ratchet badge — shows whether the analog filter
-                    # was strict (close match to current signal) or loose
-                    # (broad analogs, less specific to this exact setup).
-                    _filter_ratio = ml_dict.get("filter_ratio")
-                    _filter_min_body = ml_dict.get("filter_min_body")
-                    _filter_min_vol  = ml_dict.get("filter_min_vol")
-                    if _filter_ratio is not None and _trained:
-                        _fr_pct = int(_filter_ratio * 100)
-                        if _filter_ratio >= 0.55:
-                            _fr_color = "#3fb950"
-                            _fr_label = f"STRICT {_fr_pct}%"
-                        elif _filter_ratio >= 0.35:
-                            _fr_color = "#e3b341"
-                            _fr_label = f"RELAXED {_fr_pct}%"
-                        else:
-                            _fr_color = "#f0883e"
-                            _fr_label = f"LOOSE {_fr_pct}%"
-                        _filter_badge = (
-                            f'<span style="background:#0d1117;color:{_fr_color};font-size:9px;'
-                            f'padding:2px 6px;border-radius:3px;margin-left:4px;'
-                            f'border:1px solid {_fr_color};" '
-                            f'title="Analog filter ratchet — body≥{_filter_min_body:.2f}, vol≥{_filter_min_vol:.2f}">'
-                            f'🔍 {_fr_label}</span>'
-                        )
-                    else:
-                        _filter_badge = ""
-
-                    _note_html = (
-                        f'<div style="color:#8892b0;font-size:10px;margin-top:4px;font-style:italic;">{_note}</div>'
-                        if _note else ""
-                    )
-
-                    return (
-                        f'<div style="background:{bg_color};border:1px solid {accent_color};'
-                        f'border-radius:6px;padding:8px 10px;margin-top:6px;">'
-                        f'<div style="display:flex;justify-content:space-between;align-items:center;'
-                        f'margin-bottom:4px;">'
-                        f'<div style="color:{accent_color};font-size:10px;font-weight:700;'
-                        f'text-transform:uppercase;letter-spacing:1px;">{title}{_status_badge}{_filter_badge}</div>'
-                        f'<div style="color:{_prob_color};font-size:16px;font-weight:800;">{_pct:.1f}%</div>'
-                        f'</div>'
-                        f'<div style="color:#ccd6f6;font-size:11px;font-family:monospace;">{_mname}</div>'
-                        f'<div style="color:#8892b0;font-size:10px;margin-top:2px;">Labeled by: {_mcfg_str}</div>'
-                        f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;margin-top:6px;'
-                        f'padding-top:6px;border-top:1px solid #21262d;">'
-                        f'<div><div style="color:#8892b0;font-size:9px;">Samples</div>'
-                        f'<div style="color:#ccd6f6;font-size:12px;font-weight:700;">{_ns} ({_nw}W/{_nl}L)</div></div>'
-                        f'<div><div style="color:#8892b0;font-size:9px;">CV Accuracy</div>'
-                        f'<div style="color:{_cv_color};font-size:12px;font-weight:700;">{_cv_str}</div></div>'
-                        f'<div><div style="color:#8892b0;font-size:9px;">Verdict</div>'
-                        f'<div style="color:{_prob_color};font-size:12px;font-weight:700;">{_lbl}</div></div>'
-                        f'</div>'
-                        + _note_html
-                        + _fi_html
-                        + f'</div>'
-                    )
-
-                _ml_card_html = ""
-                if _ml_a_show or _ml_b_show:
-                    # Detect if A and B are the same object (unanimous case)
-                    _ml_unanimous_disp = (
-                        _ml_a_show is _ml_b_show and _ml_a_show is not None
-                    ) or (
-                        _ml_a_show and _ml_b_show
-                        and (_ml_a_show.get("method_cfg") or {}) == (_ml_b_show.get("method_cfg") or {})
-                    )
-
-                    _header = (
-                        f'<div style="margin-top:10px;padding-top:8px;border-top:1px solid #21262d;">'
-                        f'<div style="color:#58a6ff;font-size:11px;text-transform:uppercase;'
-                        f'letter-spacing:1px;font-weight:700;margin-bottom:4px;">'
-                        f'🧠 Trained ML — Adaptive Model'
-                        f'{" (Unanimous: A ≡ B)" if _ml_unanimous_disp else ""}</div>'
-                        f'</div>'
-                    )
-                    if _ml_unanimous_disp:
-                        _ml_card_html = _header + _render_ml_block(
-                            _ml_a_show or _ml_b_show,
-                            "🟢 A ≡ B — Unanimous Method",
-                            "#3fb950", "#091a0d",
-                        )
-                    else:
-                        _a_block = _render_ml_block(
-                            _ml_a_show,
-                            "🟢 Candidate A — Best Newest-Bucket Method",
-                            "#3fb950", "#091a0d",
-                        )
-                        _b_block = _render_ml_block(
-                            _ml_b_show,
-                            "🔵 Candidate B — Weighted All-Time Best",
-                            "#58a6ff", "#0a1628",
-                        )
-                        _ml_card_html = _header + _a_block + _b_block
-
-                # ── Layer 6: WFO ───────────────────────────────────────────────
-                # Show WFO result whenever it ran (ok=True = ran, even if INSUFFICIENT).
-                # ok=False = could not start at all.
-                _wfo_l = _wfo_res or {}
-                if _wfo_l.get("ok"):
-                    _wfo_v = _wfo_l.get("verdict", "—")
-                    if _wfo_v == "INSUFFICIENT":
-                        _layer6 = (
-                            f"WFO ran: {_wfo_v} | IS={_wfo_l.get('is_n',0)} trades | "
-                            f"OOS={_wfo_l.get('oos_n',0)} trades — "
-                            f"insufficient sample — result ignored | Method: {_wfo_l.get('method_used','—')}"
-                        )
-                    else:
-                        _layer6 = (
-                            f"WFO: {_wfo_v} | "
-                            f"IS PF={'∞' if _wfo_l.get('is_pf',0)>=9.9 else f"{_wfo_l.get('is_pf',0):.2f}"} (n={_wfo_l.get('is_n',0)}) | "
-                            f"OOS PF={'∞' if _wfo_l.get('oos_pf',0)>=9.9 else f"{_wfo_l.get('oos_pf',0):.2f}"} WR={_wfo_l.get('oos_wr',0):.1f}% "
-                            f"(n={_wfo_l.get('oos_n',0)}) | Ratio={_wfo_l.get('oos_is_ratio',0):.2f}"
-                        )
-                elif _wfo_l.get("verdict") == "INSUFFICIENT":
-                    # Ran but failed before simulation (no data / no method)
-                    _layer6 = f"WFO: could not run — {_wfo_l.get('note', 'insufficient data')}"
-                else:
-                    _layer6 = "WFO: not yet run (click Step 1 first)"
-
-                _intelligence_rows = [
-                    ("1. Signal Raw Data",       "#58a6ff", _layer1),
-                    ("2. Macro Context",          "#7ee787", _layer2),
-                    ("3. Derivatives Sentiment",  "#e3b341", _layer3),
-                    ("4. ML Engine",              "#64ffda", _layer4),
-                    ("5. Backtest",               "#ccd6f6", _layer5),
-                    ("6. WFO Validation",         "#f0883e", _layer6),
-                ]
-                _intel_rows_html = "".join(
-                    f'<div style="display:grid;grid-template-columns:160px 1fr;gap:8px;'
-                    f'padding:5px 0;border-bottom:1px solid #21262d;">'
-                    f'<div style="color:{c};font-size:11px;font-weight:700;">{lbl}</div>'
-                    f'<div style="color:#ccd6f6;font-size:11px;font-family:monospace;">{val}</div></div>'
-                    for lbl, c, val in _intelligence_rows
-                )
-                _intel_expander_html = (
-                    f'<div style="background:#0d1117;border:1px solid #30363d;border-radius:8px;'
-                    f'padding:12px 14px;margin-top:8px;">'
-                    f'<div style="color:#8892b0;font-size:11px;text-transform:uppercase;'
-                    f'letter-spacing:1px;font-weight:700;margin-bottom:8px;">🔭 6 Intelligence Layers</div>'
-                    + _intel_rows_html
-                    + f'</div>'
-                )
-
-
-                # Build backtest rows — enhanced multi-method comparison
-                _bt_valid    = _bt_res.get("error") is None and _bt_res.get("n", 0) >= 3
-                _zone_best   = _bt_res.get("zone_best", {})
-                _best        = _bt_res.get("best", {})
-                _best_key    = _bt_res.get("best_key", "")
-                _per_method  = _bt_res.get("per_method", {})
-
-                def _ev_color(ev):
-                    return "#3fb950" if ev > 0.3 else "#e3b341" if ev > 0 else "#f85149"
-                def _wr_color(wr):
-                    return "#3fb950" if wr >= 55 else "#e3b341" if wr >= 45 else "#f85149"
-                def _fill_color(fr):
-                    # Fill rate sensitivity: Aggressive zone ~100% always, so
-                    # green starts at 80% (where even Standard/Golden Fibo/
-                    # Sniper become credible); 50-80% = yellow ("half the
-                    # signals fill, half vanish — so reported WR is a lucky-
-                    # subset stat"); <50% = red (most signals never fill,
-                    # selection bias severe).
-                    return "#3fb950" if fr >= 80 else "#e3b341" if fr >= 50 else "#f85149"
-
-
-                # ── Zone comparison table with execution detail ───────────────
-                _etp_card   = sig.get("_trade_plan", {})
-                _direction  = sig["direction"]
-                _close_ref  = sig.get("close", 0)
-
-                # Zone → _etp field prefix mapping
-                _zone_etp = {
-                    "Aggressive":  ("agg_entry",    "agg_sl",    "agg_tp1",    "agg_tp2",    "agg_tp3"),
-                    "Standard":    ("std_entry",    "std_sl",    "std_tp1",    "std_tp2",    "std_tp3"),
-                    "Golden Fibo": ("golden_entry", "golden_sl", "golden_tp1", "golden_tp2", "golden_tp3"),
-                    "Sniper":      ("sniper_entry", "sniper_sl", "sniper_tp1", "sniper_tp2", "sniper_tp3"),
-                }
-                FIXED_SL_PCT = 0.015
-
-                def _zone_fixed_sl(entry_px):
-                    if _direction == "long":
-                        return round(entry_px * (1 - FIXED_SL_PCT), 8)
-                    else:
-                        return round(entry_px * (1 + FIXED_SL_PCT), 8)
-
-                def _zone_fixed_tps(entry_px, sl_px):
-                    risk = abs(entry_px - sl_px)
-                    if _direction == "long":
-                        return (round(entry_px + risk, 8),
-                                round(entry_px + 2 * risk, 8),
-                                round(entry_px + 3 * risk, 8))
-                    else:
-                        return (round(entry_px - risk, 8),
-                                round(entry_px - 2 * risk, 8),
-                                round(entry_px - 3 * risk, 8))
-
-                def _fmt_px(v):
-                    return f"{v:.6g}" if v else "—"
-
-                def _mgmt_detail_html(entry_px, sl_px, tp1_px, tp2_px, mgmt_mode, sl_label):
-                    risk = abs(entry_px - sl_px)
-                    be_px = entry_px
-                    if mgmt_mode == "Simple":
-                        return (
-                            f'<div style="color:#8892b0;font-size:10px;margin-top:6px;">'
-                            f'📋 <b style="color:#ccd6f6;">Simple:</b> '
-                            f'Hold full position → TP at <b style="color:#64ffda;">{_fmt_px(tp2_px)}</b> (2R) '
-                            f'or SL at <b style="color:#ff6b6b;">{_fmt_px(sl_px)}</b> ({sl_label})</div>'
-                        )
-                    elif mgmt_mode == "Partial":
-                        return (
-                            f'<div style="color:#8892b0;font-size:10px;margin-top:6px;">'
-                            f'📋 <b style="color:#ccd6f6;">Partial (auto-BE):</b> '
-                            f'At <b style="color:#64ffda;">{_fmt_px(tp1_px)}</b> (1R) → close 50% → '
-                            f'move SL to BE <b style="color:#e3b341;">{_fmt_px(be_px)}</b> → '
-                            f'hold rest to <b style="color:#64ffda;">{_fmt_px(tp2_px)}</b> (2R)</div>'
-                        )
-                    elif mgmt_mode == "Partial-NoBE":
-                        return (
-                            f'<div style="color:#8892b0;font-size:10px;margin-top:6px;">'
-                            f'📋 <b style="color:#ccd6f6;">Partial (no BE):</b> '
-                            f'At <b style="color:#64ffda;">{_fmt_px(tp1_px)}</b> (1R) → close 50% → '
-                            f'<b style="color:#f0883e;">KEEP original SL</b> at <b style="color:#ff6b6b;">{_fmt_px(sl_px)}</b> → '
-                            f'hold rest to <b style="color:#64ffda;">{_fmt_px(tp2_px)}</b> (2R). '
-                            f'<span style="color:#8892b0;">Real downside on remaining half but full upside if it works.</span></div>'
-                        )
-                    elif mgmt_mode == "Trailing":
-                        return (
-                            f'<div style="color:#8892b0;font-size:10px;margin-top:6px;">'
-                            f'📋 <b style="color:#ccd6f6;">Trailing:</b> '
-                            f'At <b style="color:#64ffda;">{_fmt_px(tp1_px)}</b> (1R) → move SL to BE '
-                            f'<b style="color:#e3b341;">{_fmt_px(be_px)}</b> → '
-                            f'trail SL by 0.5× ATR until TP or stopped out</div>'
-                        )
-                    return ""
-
-                _zone_table_rows = ""
-                _zone_icons = {"Aggressive": "⚡", "Standard": "✅", "Golden Fibo": "🥇", "Sniper": "🎯"}
-                _zone_desc  = {
-                    "Aggressive":  "Enter at candle close — highest fill chance",
-                    "Standard":    "Wait for 38.2% retrace into candle body",
-                    "Golden Fibo": "Wait for 61.8% golden ratio retrace — balanced R:R + fill",
-                    "Sniper":      "Wait for 78.6% Fib retrace — deepest pullback, lowest fill rate",
-                }
-
-                for _zn in ("Aggressive", "Standard", "Golden Fibo", "Sniper"):
-                    _zd       = _zone_best.get(_zn, {})
-                    _is_best_zone = _best_key and _zd.get("key", "") == _best_key
-                    _border   = "border:1px solid #3fb950;" if _is_best_zone else "border:1px solid #30363d;"
-                    _crown    = " 👑 BEST" if _is_best_zone else ""
-                    _bg       = "background:#091a0d;" if _is_best_zone else "background:#0d1117;"
-
-                    # Pull prices from _etp
-                    _ep_keys   = _zone_etp.get(_zn, ())
-                    _ep        = _etp_card.get(_ep_keys[0], 0) if _ep_keys else 0
-                    _atr_sl_p  = _etp_card.get(_ep_keys[1], 0) if _ep_keys else 0
-                    _tp1_p     = _etp_card.get(_ep_keys[2], 0) if _ep_keys else 0
-                    _tp2_p     = _etp_card.get(_ep_keys[3], 0) if _ep_keys else 0
-                    _tp3_p     = _etp_card.get(_ep_keys[4], 0) if _ep_keys else 0
-                    _fix_sl_p  = _zone_fixed_sl(_ep) if _ep else 0
-                    _fix_tp1, _fix_tp2, _fix_tp3 = _zone_fixed_tps(_ep, _fix_sl_p) if _ep else (0, 0, 0)
-
-                    # ── Structural validity check ─────────────────────────────
-                    # If the Fibonacci retrace zone overshoots the structural SL,
-                    # the zone is physically impossible — show a hard warning.
-                    # We check BOTH the _etp_card validity flags AND the zone_best
-                    # flag that _scanner_quick_backtest now sets for filtered zones.
-                    _structurally_invalid = False
-                    if _zd.get("structurally_invalid"):
-                        _structurally_invalid = True
-                    elif _zn == "Standard"    and not _etp_card.get("std_valid",    True):
-                        _structurally_invalid = True
-                    elif _zn == "Golden Fibo" and not _etp_card.get("golden_valid", True):
-                        _structurally_invalid = True
-                    elif _zn == "Sniper"      and not _etp_card.get("sniper_valid", True):
-                        _structurally_invalid = True
-
-                    if _structurally_invalid:
-                        _sl_pct_conf = _etp_card.get("sl_dist_pct", 0)
-                        _fib_label   = (
-                            "38.2%" if _zn == "Standard"    else
-                            "61.8%" if _zn == "Golden Fibo" else
-                            "78.6%"  # Sniper
-                        )
-                        _zone_table_rows += (
-                            f'<div style="background:#1a0a0a;border:2px solid #6b2222;border-radius:6px;'
-                            f'padding:10px 12px;margin-bottom:6px;">'
-                            f'<div style="color:#ff6b6b;font-size:12px;font-weight:700;margin-bottom:4px;">'
-                            f'{_zone_icons.get(_zn,"•")} {_zn} — ❌ STRUCTURALLY INVALID</div>'
-                            f'<div style="color:#cc8888;font-size:11px;line-height:1.4;">'
-                            f'Candle body is too large for this SL distance ({_sl_pct_conf:.1f}%). '
-                            f'The {_fib_label} retrace zone falls at or beyond the structural stop-loss level. '
-                            f'Entering this zone would mean your SL is already triggered at fill. '
-                            f'<b style="color:#ffaa88;">Use Aggressive zone only.</b></div>'
-                            f'</div>'
-                        )
-                        continue
-
-                    # Best config for this zone
-                    _best_sl_label = _zd.get("sl_label", "Fixed SL") if _zd else "Fixed SL"
-                    _best_mgmt     = _zd.get("mgmt", "Simple") if _zd else "Simple"
-                    _best_tp_mult  = _zd.get("tp_mult", 2.0) if _zd else 2.0
-                    _use_atr       = "ATR" in _best_sl_label
-
-                    # ── Price alignment fix ───────────────────────────────────
-                    # All prices (SL, TP1, TP2) must be derived from the SAME
-                    # config that produced the EV/WR stats shown in the card.
-                    # SL distance: ATR-based (from _etp_card) or Fixed 1.5%
-                    # TP target:   entry ± tp_mult × risk (NOT always 2R)
-                    if _use_atr and _atr_sl_p:
-                        _sl_show     = _atr_sl_p
-                        _sl_pct_show = _etp_card.get("sl_dist_pct", FIXED_SL_PCT * 100)
-                    else:
-                        _sl_show     = _fix_sl_p
-                        _sl_pct_show = FIXED_SL_PCT * 100
-                    # Recompute TP1 and TP2 from the actual risk distance of this config
-                    _risk_show = abs(_ep - _sl_show) if _ep and _sl_show else 0
-                    if _risk_show > 0 and _ep:
-                        _sign      = 1 if _direction == "long" else -1
-                        _tp1_show  = round(_ep + _sign * 1.0            * _risk_show, 8)
-                        _tp2_show  = round(_ep + _sign * _best_tp_mult  * _risk_show, 8)
-                        _tp3_show  = round(_ep + _sign * (_best_tp_mult + 1.0) * _risk_show, 8)
-                    else:
-                        # Fallback to _etp values if risk calc not possible
-                        _tp1_show = _tp1_p if (_use_atr and _ep) else _fix_tp1
-                        _tp2_show = _tp2_p if (_use_atr and _ep) else _fix_tp2
-                        _tp3_show = _tp3_p if (_use_atr and _ep) else _fix_tp3
-
-                    if _zd and not _zd.get("insufficient") and _zd.get("n", 0) >= 4:
-                        _expiry_note = "" if _zn == "Aggressive" else (
-                            f' <span style="color:#e3b341;font-size:10px;">· Expires in 3 bars if not filled</span>'
-                        )
-                        _below_wr_floor = _zd.get("below_wr_floor", False)
-                        _wr_floor_badge = (
-                            f' <span style="background:#2d1a00;color:#e3b341;font-size:9px;'
-                            f'padding:1px 6px;border-radius:3px;margin-left:4px;">'
-                            f'⚠️ WR {_zd.get("win_rate",0):.1f}% — below 35% floor (EV shown, not recommended)</span>'
-                        ) if _below_wr_floor else ""
-                        _mgmt_html = _mgmt_detail_html(_ep, _sl_show, _tp1_show, _tp2_show, _best_mgmt, _best_sl_label)
-
-                        _zone_table_rows += (
-                            f'<div style="{_bg}{_border}border-radius:8px;padding:12px 14px;margin-bottom:8px;">'
-
-                            # Header row
-                            f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">'
-                            f'<div>'
-                            f'<span style="color:#ccd6f6;font-size:13px;font-weight:700;">{_zone_icons.get(_zn,"•")} {_zn}'
-                            f'<span style="color:#3fb950;font-size:12px;">{_crown}</span></span>'
-                            f'{_wr_floor_badge}'
-                            f'<div style="color:#8892b0;font-size:10px;margin-top:1px;">{_zone_desc.get(_zn,"")}{_expiry_note}</div>'
-                            f'</div>'
-                            f'<div style="text-align:right;">'
-                            f'<span style="background:#1a2030;border-radius:4px;padding:2px 8px;font-size:10px;color:#58a6ff;">{_best_sl_label} · {_best_mgmt}</span>'
-                            f'<div style="color:#8892b0;font-size:10px;margin-top:2px;">n={_zd.get("n",0)} historical setups</div>'
-                            f'</div>'
-                            f'</div>'
-
-                            # Stats row
-                            f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;margin-bottom:8px;">'
-                            f'<div style="background:#0a0f1a;border-radius:4px;padding:5px 8px;">'
-                            f'<div style="color:#8892b0;font-size:10px;">Win Rate</div>'
-                            f'<div style="color:{_wr_color(_zd.get("win_rate",0))};font-size:15px;font-weight:800;">{_zd.get("win_rate",0):.1f}%</div>'
-                            f'</div>'
-                            f'<div style="background:#0a0f1a;border-radius:4px;padding:5px 8px;">'
-                            f'<div style="color:#8892b0;font-size:10px;">Exp. Value</div>'
-                            f'<div style="color:{_ev_color(_zd.get("ev",0))};font-size:15px;font-weight:800;">{_zd.get("ev",0):+.2f}R</div>'
-                            f'</div>'
-                            f'<div style="background:#0a0f1a;border-radius:4px;padding:5px 8px;">'
-                            f'<div style="color:#8892b0;font-size:10px;">Avg Hold</div>'
-                            f'<div style="color:#ccd6f6;font-size:15px;font-weight:800;">{_zd.get("avg_bars",0):.1f} bars</div>'
-                            f'</div>'
-                            f'</div>'
-
-                            # Price levels
-                            f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:5px;margin-bottom:6px;">'
-                            f'<div style="background:#0a0f1a;border-radius:4px;padding:5px 8px;">'
-                            f'<div style="color:#8892b0;font-size:9px;text-transform:uppercase;">Entry</div>'
-                            f'<div style="color:#58a6ff;font-size:12px;font-weight:700;">{_fmt_px(_ep)}</div>'
-                            f'</div>'
-                            f'<div style="background:#0a0f1a;border-radius:4px;padding:5px 8px;">'
-                            f'<div style="color:#8892b0;font-size:9px;text-transform:uppercase;">SL ({_sl_pct_show:.1f}%)</div>'
-                            f'<div style="color:#ff6b6b;font-size:12px;font-weight:700;">{_fmt_px(_sl_show)}</div>'
-                            f'</div>'
-                            f'<div style="background:#0a0f1a;border-radius:4px;padding:5px 8px;">'
-                            f'<div style="color:#8892b0;font-size:9px;text-transform:uppercase;">TP1 (1R)</div>'
-                            f'<div style="color:#64ffda;font-size:12px;font-weight:700;">{_fmt_px(_tp1_show)}</div>'
-                            f'</div>'
-                            f'<div style="background:#0a0f1a;border-radius:4px;padding:5px 8px;">'
-                            f'<div style="color:#8892b0;font-size:9px;text-transform:uppercase;">TP2 ({_zd.get("tp_mult",2.0):.1f}R) / TP3</div>'
-                            f'<div style="color:#64ffda;font-size:12px;font-weight:700;">{_fmt_px(_tp2_show)}</div>'
-                            f'<div style="color:#3fb950;font-size:10px;">{_fmt_px(_tp3_show)}</div>'
-                            f'</div>'
-                            f'</div>'
-
-                            # Management instructions
-                            + _mgmt_html
-                            + f'</div>'
-                        )
-                    else:
-                        # Check if excluded due to low win rate (35% floor) vs truly insufficient data
-                        _best_wr_for_zone = max(
-                            (v.get("win_rate", 0) for v in _per_method.values()
-                             if v.get("zone") == _zn and not v.get("insufficient") and v.get("n", 0) >= 4),
-                            default=None
-                        )
-                        if _best_wr_for_zone is not None and _best_wr_for_zone < 35:
-                            _zone_table_rows += (
-                                f'<div style="background:#0d1117;border:1px solid #2d2200;border-radius:6px;'
-                                f'padding:8px 10px;margin-bottom:6px;">' 
-                                f'<div style="display:flex;justify-content:space-between;align-items:center;">'
-                                f'<span style="color:#8892b0;font-size:12px;">{_zone_icons.get(_zn,"•")} {_zn}</span>'
-                                f'<span style="background:#2d2200;color:#e3b341;font-size:10px;padding:2px 8px;border-radius:4px;">'
-                                f'⚠️ Excluded — Win Rate {_best_wr_for_zone:.1f}% below 35% minimum</span></div>'
-                                f'<div style="color:#8892b0;font-size:10px;margin-top:4px;">'
-                                f'EV may be positive but strategy wins fewer than 1 in 3 trades — not recommended for live trading.</div>'
-                                f'</div>'
-                            )
-                        else:
-                            _zone_table_rows += (
-                                f'<div style="background:#0d1117;border:1px solid #21262d;border-radius:6px;'
-                                f'padding:8px 10px;margin-bottom:6px;opacity:0.5;">'
-                                f'<span style="color:#8892b0;font-size:12px;">{_zone_icons.get(_zn,"•")} {_zn} — insufficient data (&lt;4 setups)</span>'
-                                f'</div>'
+                            _combo_html = (
+                                f'<div style="border-top:1px solid #21262d;margin-top:6px;padding-top:6px;">'
+                                f'<span style="color:{_combo_col};font-size:11px;font-weight:600;">{_combo_txt}</span></div>'
                             )
 
-                # ── Best method recommendation with full execution plan ────────
-                # Extra safety: never recommend a structurally invalid zone even if
-                # best_key somehow slipped through (e.g. cached from earlier run).
-                _best_zone_name = _best.get("zone", "Aggressive") if _best else "Aggressive"
-                _best_structurally_ok = True
-                if _best_zone_name == "Standard"    and not _etp_card.get("std_valid",    True):
-                    _best_structurally_ok = False
-                elif _best_zone_name == "Golden Fibo" and not _etp_card.get("golden_valid", True):
-                    _best_structurally_ok = False
-                elif _best_zone_name == "Sniper"    and not _etp_card.get("sniper_valid", True):
-                    _best_structurally_ok = False
-
-                if _best and _best_key and not _best_structurally_ok:
-                    # Demote to best VALID zone instead
-                    _fallback_best_key = None
-                    _fallback_best     = {}
-                    for _fb_k, _fb_v in sorted(
-                        _per_method.items(), key=lambda x: -x[1].get("ev", -99)
-                    ):
-                        if _fb_v.get("insufficient") or _fb_v.get("n", 0) < 4:
-                            continue
-                        _fb_zone = _fb_v.get("zone", "Aggressive")
-                        if _fb_zone == "Standard"    and not _etp_card.get("std_valid",    True):
-                            continue
-                        if _fb_zone == "Golden Fibo" and not _etp_card.get("golden_valid", True):
-                            continue
-                        if _fb_zone == "Sniper"      and not _etp_card.get("sniper_valid", True):
-                            continue
-                        _fallback_best_key = _fb_k
-                        _fallback_best     = _fb_v
-                        break
-                    _best     = _fallback_best
-                    _best_key = _fallback_best_key
-
-                if _best and _best_key:
-                    _bev    = _best.get("ev", 0)
-                    _bwr    = _best.get("win_rate", 0)
-                    _bn     = _best.get("n", 0)
-                    _bzone  = _best.get("zone", "Aggressive")
-                    _bsl    = _best.get("sl_label", "Fixed SL")
-                    _bmgmt  = _best.get("mgmt", "Simple")
-                    _btp    = _best.get("tp_mult", 2.0)
-                    _bbars  = _best.get("avg_bars", 0)
-
-                    _bep_keys  = _zone_etp.get(_bzone, ())
-                    _bep       = _etp_card.get(_bep_keys[0], 0) if _bep_keys else 0
-                    _b_atr_sl  = _etp_card.get(_bep_keys[1], 0) if _bep_keys else 0
-                    _b_tp1     = _etp_card.get(_bep_keys[2], 0) if _bep_keys else 0
-                    _b_tp2     = _etp_card.get(_bep_keys[3], 0) if _bep_keys else 0
-                    _b_fix_sl  = _zone_fixed_sl(_bep) if _bep else 0
-                    _b_fix_tp1, _b_fix_tp2, _ = _zone_fixed_tps(_bep, _b_fix_sl) if _bep else (0, 0, 0)
-                    _b_use_atr = "ATR" in _bsl
-                    _b_sl_px   = _b_atr_sl if (_b_use_atr and _b_atr_sl) else _b_fix_sl
-                    # Recompute TP prices from actual config SL distance and tp_mult
-                    # so EXECUTE THIS prices align with the EV/WR stats shown
-                    _b_risk    = abs(_bep - _b_sl_px) if _bep and _b_sl_px else 0
-                    if _b_risk > 0 and _bep:
-                        _b_sign    = 1 if _direction == "long" else -1
-                        _b_tp1_px  = round(_bep + _b_sign * 1.0   * _b_risk, 8)
-                        _b_tp2_px  = round(_bep + _b_sign * _btp  * _b_risk, 8)
-                    else:
-                        _b_tp1_px  = _b_tp1 if (_b_use_atr and _bep) else _b_fix_tp1
-                        _b_tp2_px  = _b_tp2 if (_b_use_atr and _bep) else _b_fix_tp2
-
-                    _exec_detail = _mgmt_detail_html(_bep, _b_sl_px, _b_tp1_px, _b_tp2_px, _bmgmt, _bsl)
-                    _wait_note   = (
-                        f'<div style="color:#e3b341;font-size:11px;margin-top:4px;">'
-                        f'⏳ Wait for retrace to <b>{_fmt_px(_bep)}</b> — expires if not filled within 3 bars</div>'
-                    ) if _bzone != "Aggressive" else ""
-
-                    _recommendation_html = (
-                        f'<div style="background:#091a0d;border:1px solid #3fb950;border-radius:8px;'
-                        f'padding:12px 14px;margin-top:10px;">'
-                        f'<div style="color:#3fb950;font-size:11px;text-transform:uppercase;'
-                        f'letter-spacing:1px;font-weight:700;margin-bottom:8px;">🏆 EXECUTE THIS — Best Proven Method</div>'
-                        f'<div style="color:#ccd6f6;font-size:13px;font-weight:700;margin-bottom:8px;">{_bzone} / {_bsl} / {_bmgmt} &nbsp;<span style="color:#e3b341;font-size:12px;">TP {_btp:.1f}R</span></div>'
-                        f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:5px;margin-bottom:8px;">'
-                        f'<div style="background:#0a1a0a;border-radius:4px;padding:5px 8px;">'
-                        f'<div style="color:#8892b0;font-size:9px;text-transform:uppercase;">Entry</div>'
-                        f'<div style="color:#58a6ff;font-size:13px;font-weight:800;">{_fmt_px(_bep)}</div></div>'
-                        f'<div style="background:#0a1a0a;border-radius:4px;padding:5px 8px;">'
-                        f'<div style="color:#8892b0;font-size:9px;text-transform:uppercase;">Stop Loss</div>'
-                        f'<div style="color:#ff6b6b;font-size:13px;font-weight:800;">{_fmt_px(_b_sl_px)}</div></div>'
-                        f'<div style="background:#0a1a0a;border-radius:4px;padding:5px 8px;">'
-                        f'<div style="color:#8892b0;font-size:9px;text-transform:uppercase;">TP1 (1R)</div>'
-                        f'<div style="color:#64ffda;font-size:13px;font-weight:800;">{_fmt_px(_b_tp1_px)}</div></div>'
-                        f'<div style="background:#0a1a0a;border-radius:4px;padding:5px 8px;">'
-                        f'<div style="color:#8892b0;font-size:9px;text-transform:uppercase;">TP ({_btp:.1f}R)</div>'
-                        f'<div style="color:#64ffda;font-size:13px;font-weight:800;">{_fmt_px(_b_tp2_px)}</div></div>'
-                        f'</div>'
-                        + _wait_note
-                        + _exec_detail
-                        + f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;margin-top:10px;'
-                        f'padding-top:8px;border-top:1px solid #1a3a1a;">'
-                        f'<div><div style="color:#8892b0;font-size:10px;">Historical Win Rate</div>'
-                        f'<div style="color:{_wr_color(_bwr)};font-size:16px;font-weight:800;">{_bwr:.1f}%</div></div>'
-                        f'<div><div style="color:#8892b0;font-size:10px;">Expected Value</div>'
-                        f'<div style="color:{_ev_color(_bev)};font-size:16px;font-weight:800;">{_bev:+.2f}R</div></div>'
-                        f'<div><div style="color:#8892b0;font-size:10px;">Sample / Avg Hold</div>'
-                        f'<div style="color:#ccd6f6;font-size:16px;font-weight:800;">{_bn}t / {_bbars:.0f}b</div></div>'
-                        f'</div></div>'
-                    )
-                else:
-                    _recommendation_html = (
-                        f'<div style="color:#8892b0;font-size:12px;padding:8px 0;">'
-                        f'Not enough data to determine best method (&lt;4 setups per zone).</div>'
-                    )
-
-                # ── NEW: 2 CANDIDATE EXECUTION CARDS (A = newest, B = weighted) ───
-                # These replace the 3 zone cards at the top of the view. The 3 zone
-                # cards are still available inside an expander for power users.
-                _cand_a_card = _bt_res.get("candidate_newest")
-                _cand_b_card = _bt_res.get("candidate_weighted")
-
-                def _cfg_of_card(c):
-                    if not c:
-                        return None
-                    mc = c.get("method_cfg") or {}
-                    return (mc.get("zone"), mc.get("sl_label"), mc.get("mgmt"),
-                            round(float(mc.get("tp_mult", 2.0)), 2))
-                _a_cfg_disp = _cfg_of_card(_cand_a_card)
-                _b_cfg_disp = _cfg_of_card(_cand_b_card)
-                _ab_unanimous_disp = (_a_cfg_disp is not None and _a_cfg_disp == _b_cfg_disp)
-
-                def _build_cand_exec_card(cand, letter, title, accent, bg, border):
-                    """Render one candidate execution card with prices + decay buckets."""
-                    if not cand:
-                        return (
-                            f'<div style="background:{bg};border:1px solid {border};'
-                            f'border-radius:8px;padding:12px 14px;margin-top:10px;">'
-                            f'<div style="color:{accent};font-size:11px;font-weight:700;'
-                            f'text-transform:uppercase;letter-spacing:1px;">{letter} · {title}</div>'
-                            f'<div style="color:#8892b0;font-size:12px;margin-top:8px;">'
-                            f'No valid method found — not enough historical data or all filters fail.</div>'
-                            f'</div>'
-                        )
-
-                    _mc   = cand.get("method_cfg") or {}
-                    _czn  = _mc.get("zone", "Aggressive")
-                    _csl  = _mc.get("sl_label", "Fixed SL")
-                    _cmg  = _mc.get("mgmt", "Simple")
-                    _ctp  = float(_mc.get("tp_mult", 2.0))
-                    _cwr  = cand.get("win_rate", 0)
-                    _cev  = cand.get("ev", 0)
-                    _cevw = cand.get("ev_weighted", 0)
-                    _cpf  = cand.get("pf", 0)
-                    _cpfs = "∞" if _cpf >= 9.9 else f"{_cpf:.2f}"
-                    _cpfc = ("#3fb950" if _cpf >= 1.5 else
-                             "#e3b341" if _cpf >= 1.0 else "#f85149")
-                    _cn   = cand.get("n", 0)
-                    _cbars= cand.get("avg_bars", 0)
-                    _cnb  = cand.get("newest_bucket", {}) or {}
-
-                    # Fill rate: % of qualifying signals whose limit order was
-                    # actually filled within 3 bars. Aggressive zones are
-                    # market-entry (always 100%), Standard/Golden Fibo/Sniper
-                    # require a retrace to the zone band and can fall far below
-                    # 100%. Low fill = the reported WR/EV only include the lucky
-                    # filled subset — so a "great" Standard method that fills
-                    # 30% of the time is materially different from one that
-                    # fills 90%.
-                    _cfr = cand.get("fill_rate", None)
-                    if _cfr is None or _cfr <= 0:
-                        _cfr_str = "—"
-                        _cfr_val = 100.0
-                    else:
-                        _cfr_val = float(_cfr)
-                        _cfr_str = f"{_cfr_val:.0f}%"
-
-                    # CANONICAL prices — same helper the AI prompt uses, so
-                    # the prices the user sees here are guaranteed identical
-                    # to what the AI receives. Single source of truth.
-                    _px = _compute_candidate_prices(cand, sig)
-                    if _px["ok"]:
-                        _c_ep     = _px["entry"]
-                        _c_sl_px  = _px["sl"]
-                        _c_sl_pct = _px["sl_pct"]
-                        _c_tp1_px = _px["tp1"]
-                        _c_tp2_px = _px["tp2"]
-                    else:
-                        _c_ep = _c_sl_px = _c_tp1_px = _c_tp2_px = 0
-                        _c_sl_pct = 0
-
-                    _exec_detail = _mgmt_detail_html(_c_ep, _c_sl_px, _c_tp1_px, _c_tp2_px, _cmg, _csl) if _c_ep else ""
-                    _wait_note = (
-                        f'<div style="color:#e3b341;font-size:11px;margin-top:4px;">'
-                        f'⏳ Wait for retrace to <b>{_fmt_px(_c_ep)}</b> — expires if not filled within 3 bars</div>'
-                    ) if _czn != "Aggressive" and _c_ep else ""
-
-                    # Time-decay bucket strip for this candidate
-                    _buckets = cand.get("buckets", []) or []
-                    _bkt_cells = ""
-                    if _buckets:
-                        _n_bkt = len(_buckets)
-                        for _bi, _br in enumerate(_buckets):
-                            _bn_i   = _br.get("n", 0)
-                            _bwr_i  = _br.get("wr", 0)
-                            _bev_i  = _br.get("ev", 0)
-                            _bw_i   = _br.get("weight", 1.0)
-                            _blbl_i = _br.get("label", "—")
-                            _is_newest = (_bi == _n_bkt - 1)
-                            _cell_bg = "#091a0d" if _is_newest else "#0d1117"
-                            _cell_border = accent if _is_newest else "#21262d"
-                            _wr_col_c = _wr_color(_bwr_i) if _bn_i >= 2 else "#555"
-                            _ev_col_c = _ev_color(_bev_i) if _bn_i >= 2 else "#555"
-                            _bkt_cells += (
-                                f'<div style="background:{_cell_bg};border:1px solid {_cell_border};'
-                                f'border-radius:4px;padding:5px 6px;">'
-                                f'<div style="color:#8892b0;font-size:9px;text-transform:uppercase;">'
-                                f'{_blbl_i} · w={_bw_i:.2f}</div>'
-                                f'<div style="display:flex;justify-content:space-between;align-items:baseline;margin-top:2px;">'
-                                f'<span style="color:{_wr_col_c};font-size:11px;font-weight:700;">{_bwr_i:.0f}%</span>'
-                                f'<span style="color:{_ev_col_c};font-size:10px;">{_bev_i:+.1f}R</span>'
-                                f'<span style="color:#8892b0;font-size:9px;">n={_bn_i}</span>'
-                                f'</div></div>'
-                            )
-                        _bkt_strip = (
-                            f'<div style="margin-top:8px;">'
-                            f'<div style="color:#8892b0;font-size:9px;text-transform:uppercase;'
-                            f'letter-spacing:1px;margin-bottom:4px;">⏱ Time-Decay Breakdown (oldest → newest)</div>'
-                            f'<div style="display:grid;grid-template-columns:repeat({_n_bkt},1fr);gap:4px;">'
-                            f'{_bkt_cells}</div></div>'
-                        )
-                    else:
-                        _bkt_strip = ""
-
-                    return (
-                        f'<div style="background:{bg};border:1px solid {border};'
-                        f'border-radius:8px;padding:12px 14px;margin-top:10px;">'
-                        # Header
-                        f'<div style="display:flex;justify-content:space-between;align-items:center;'
-                        f'margin-bottom:6px;">'
-                        f'<div style="color:{accent};font-size:11px;font-weight:700;'
-                        f'text-transform:uppercase;letter-spacing:1px;">{letter} · {title}</div>'
-                        f'<div style="color:#8892b0;font-size:10px;">'
-                        f'{_czn} / {_csl} / {_cmg} · <span style="color:#e3b341;">TP{_ctp:.1f}R</span></div>'
-                        f'</div>'
-                        # Price grid
-                        f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:5px;margin-bottom:6px;">'
-                        f'<div style="background:#0a0f1a;border-radius:4px;padding:5px 8px;">'
-                        f'<div style="color:#8892b0;font-size:9px;text-transform:uppercase;">Entry</div>'
-                        f'<div style="color:#58a6ff;font-size:13px;font-weight:800;">{_fmt_px(_c_ep)}</div></div>'
-                        f'<div style="background:#0a0f1a;border-radius:4px;padding:5px 8px;">'
-                        f'<div style="color:#8892b0;font-size:9px;text-transform:uppercase;">SL ({_c_sl_pct:.1f}%)</div>'
-                        f'<div style="color:#ff6b6b;font-size:13px;font-weight:800;">{_fmt_px(_c_sl_px)}</div></div>'
-                        f'<div style="background:#0a0f1a;border-radius:4px;padding:5px 8px;">'
-                        f'<div style="color:#8892b0;font-size:9px;text-transform:uppercase;">TP1 (1R)</div>'
-                        f'<div style="color:#64ffda;font-size:13px;font-weight:800;">{_fmt_px(_c_tp1_px)}</div></div>'
-                        f'<div style="background:#0a0f1a;border-radius:4px;padding:5px 8px;">'
-                        f'<div style="color:#8892b0;font-size:9px;text-transform:uppercase;">TP ({_ctp:.1f}R)</div>'
-                        f'<div style="color:#64ffda;font-size:13px;font-weight:800;">{_fmt_px(_c_tp2_px)}</div></div>'
-                        f'</div>'
-                        + _wait_note
-                        + _exec_detail
-                        # Stats strip — expanded to include Fill% so the user
-                        # can see the pragmatic question: "how often does this
-                        # method's limit order even get filled within 3 bars?"
-                        # Low fill = high selection bias in the WR/EV numbers
-                        # (only the filled trades count). Aggressive zone =
-                        # usually 100% fill. Standard/Golden Fibo/Sniper can
-                        # drop to 40-70% (Sniper at 0.786 is the lowest of all).
-                        + f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr 1fr 1fr;gap:6px;margin-top:8px;'
-                        f'padding-top:8px;border-top:1px solid #21262d;">'
-                        f'<div><div style="color:#8892b0;font-size:9px;">All-time WR</div>'
-                        f'<div style="color:{_wr_color(_cwr)};font-size:14px;font-weight:800;">{_cwr:.1f}%</div></div>'
-                        f'<div><div style="color:#8892b0;font-size:9px;">EV</div>'
-                        f'<div style="color:{_ev_color(_cev)};font-size:14px;font-weight:800;">{_cev:+.2f}R</div></div>'
-                        f'<div><div style="color:#8892b0;font-size:9px;">EVw</div>'
-                        f'<div style="color:{_ev_color(_cevw)};font-size:14px;font-weight:800;">{_cevw:+.2f}R</div></div>'
-                        f'<div><div style="color:#8892b0;font-size:9px;">PF</div>'
-                        f'<div style="color:{_cpfc};font-size:14px;font-weight:800;">{_cpfs}</div></div>'
-                        f'<div title="% of qualifying signals where the limit order actually filled within 3 bars">'
-                        f'<div style="color:#8892b0;font-size:9px;">Fill% (≤3 bars)</div>'
-                        f'<div style="color:{_fill_color(_cfr)};font-size:14px;font-weight:800;">{_cfr_str}</div></div>'
-                        f'<div><div style="color:#8892b0;font-size:9px;">Samples</div>'
-                        f'<div style="color:#ccd6f6;font-size:14px;font-weight:800;">{_cn}t/{_cbars:.0f}b</div></div>'
-                        f'</div>'
-                        + _bkt_strip
-                        + f'</div>'
-                    )
-
-                if _ab_unanimous_disp:
-                    _candidate_cards_html = _build_cand_exec_card(
-                        _cand_a_card, "🟢 A ≡ B",
-                        "UNANIMOUS — Best in Both Views",
-                        "#3fb950", "#091a0d", "#3fb950",
-                    )
-                else:
-                    _card_a_html = _build_cand_exec_card(
-                        _cand_a_card, "🟢 A",
-                        "Best in Newest Bucket",
-                        "#3fb950", "#091a0d", "#238636",
-                    ) if _cand_a_card else ""
-                    _card_b_html = _build_cand_exec_card(
-                        _cand_b_card, "🔵 B",
-                        "Best Weighted All-Time",
-                        "#58a6ff", "#0a1628", "#1f6feb",
-                    ) if _cand_b_card else ""
-                    _candidate_cards_html = _card_a_html + _card_b_html
-
-                # ── Full management breakdown (expandable) ────────────────────
-                _mgmt_table = ""
-                if _per_method:
-                    _mgmt_rows_html = ""
-                    # Sort by weighted EV so time-decay ranking surfaces the best recent methods first
-                    for _mk, _mv in sorted(_per_method.items(),
-                                           key=lambda x: -x[1].get("ev_weighted", x[1].get("ev", -99))):
-                        if _mv.get("insufficient") or _mv.get("n", 0) < 4:
-                            continue
-                        _is_best = (_mk == _best_key)
-                        _row_bg  = "background:#091a0d;" if _is_best else ""
-                        _crown2  = " 👑" if _is_best else ""
-                        _tp_label = f"TP{_mv.get('tp_mult',2.0):.1f}R"
-                        _pf_val  = _mv.get("pf", 0)
-                        _pf_str  = "∞" if _pf_val >= 9.9 else f"{_pf_val:.2f}"
-                        _pf_c    = ("#3fb950" if _pf_val >= 1.5 else
-                                    "#e3b341" if _pf_val >= 1.0 else "#f85149")
-                        _evw     = _mv.get("ev_weighted", _mv.get("ev", 0))
-                        _nbkt    = _mv.get("newest_bucket", {}) or {}
-                        _nbkt_wr = _nbkt.get("wr", 0)
-                        _nbkt_n  = _nbkt.get("n",  0)
-                        _nbkt_ev = _nbkt.get("ev", 0)
-                        _nbkt_txt = f"{_nbkt_wr:.0f}%/{_nbkt_ev:+.1f}R (n{_nbkt_n})" if _nbkt_n > 0 else "—"
-                        _nbkt_color = _wr_color(_nbkt_wr) if _nbkt_n >= 3 else "#8892b0"
-                        _mgmt_rows_html += (
-                            f'<div style="{_row_bg}display:grid;grid-template-columns:2.6fr 0.7fr 0.7fr 0.7fr 0.7fr 0.7fr 1.1fr 0.8fr;'
-                            f'gap:4px;padding:5px 6px;border-bottom:1px solid #1a1f2e;font-size:11px;">'
-                            f'<div style="color:#ccd6f6;">{_mk}{_crown2}</div>'
-                            f'<div style="color:{_wr_color(_mv["win_rate"])};text-align:right;font-weight:700;">{_mv["win_rate"]:.0f}%</div>'
-                            f'<div style="color:{_ev_color(_mv["ev"])};text-align:right;font-weight:700;">{_mv["ev"]:+.2f}R</div>'
-                            f'<div style="color:{_ev_color(_evw)};text-align:right;font-weight:700;">{_evw:+.2f}R</div>'
-                            f'<div style="color:{_pf_c};text-align:right;font-weight:700;">{_pf_str}</div>'
-                            f'<div style="color:#e3b341;text-align:right;font-weight:600;">{_tp_label}</div>'
-                            f'<div style="color:{_nbkt_color};text-align:right;font-size:10px;">{_nbkt_txt}</div>'
-                            f'<div style="color:#8892b0;text-align:right;">{_mv["n"]}n/{_mv["avg_bars"]:.0f}b</div>'
-                            f'</div>'
-                        )
-                    if _mgmt_rows_html:
-                        _mgmt_table = (
-                            f'<div style="margin-top:10px;border:1px solid #21262d;border-radius:6px;overflow:hidden;">'
-                            f'<div style="background:#161b22;display:grid;grid-template-columns:2.6fr 0.7fr 0.7fr 0.7fr 0.7fr 0.7fr 1.1fr 0.8fr;'
-                            f'gap:4px;padding:5px 6px;border-bottom:1px solid #30363d;">'
-                            f'<div style="color:#8892b0;font-size:10px;text-transform:uppercase;">Method (sorted by EVw)</div>'
-                            f'<div style="color:#8892b0;font-size:10px;text-align:right;">WR%</div>'
-                            f'<div style="color:#8892b0;font-size:10px;text-align:right;">EV</div>'
-                            f'<div style="color:#8892b0;font-size:10px;text-align:right;">EVw</div>'
-                            f'<div style="color:#8892b0;font-size:10px;text-align:right;">PF</div>'
-                            f'<div style="color:#e3b341;font-size:10px;text-align:right;">TP</div>'
-                            f'<div style="color:#8892b0;font-size:10px;text-align:right;">Newest bkt</div>'
-                            f'<div style="color:#8892b0;font-size:10px;text-align:right;">n/bars</div>'
-                            f'</div>'
-                            f'{_mgmt_rows_html}'
-                            f'</div>'
-                        )
-
-                # ── Data provenance strip ──────────────────────────────────
-                # Shows what historical data the backtest ran on so the user
-                # knows whether the numbers are backed by enough history.
-                _meta_bt       = _bt_res.get("meta", {}) or {}
-                _bars_used_p   = _meta_bt.get("bars_used", 0)
-                _bars_req_p    = _meta_bt.get("bars_requested", 0)
-                _coverage_p    = _meta_bt.get("bars_coverage", "—")
-                _bkt_cnt_p     = _meta_bt.get("bucket_count", 1)
-                _bkt_weights_p = _meta_bt.get("bucket_weights", [1.0])
-                _bkt_labels_p  = _meta_bt.get("bucket_labels", ["All bars"])
-                _bt_filter_r   = _meta_bt.get("filter_ratio")
-                _bt_filt_mb    = _meta_bt.get("filter_min_body")
-                _bt_filt_mv    = _meta_bt.get("filter_min_vol")
-
-                _is_short_history = (_bars_req_p > 0 and _bars_used_p < _bars_req_p * 0.9)
-                _weights_str = " → ".join(f"{int(w*100)}%" for w in _bkt_weights_p)
-                _provenance_note = (
-                    f"⚠️ Coin is new: only {_bars_used_p} bars available (requested {_bars_req_p})"
-                    if _is_short_history else
-                    f"📅 {_bars_used_p} bars used"
-                )
-
-                # Filter ratio badge — same colour scheme as ML card
-                if _bt_filter_r is not None:
-                    _br_pct = int(_bt_filter_r * 100)
-                    if _bt_filter_r >= 0.55:
-                        _br_color = "#3fb950"
-                        _br_label = f"STRICT {_br_pct}%"
-                    elif _bt_filter_r >= 0.35:
-                        _br_color = "#e3b341"
-                        _br_label = f"RELAXED {_br_pct}%"
-                    else:
-                        _br_color = "#f0883e"
-                        _br_label = f"LOOSE {_br_pct}%"
-                    _filter_badge_bt = (
-                        f' · <span style="color:{_br_color};font-weight:700;'
-                        f'border:1px solid {_br_color};padding:1px 6px;border-radius:3px;" '
-                        f'title="Backtest analog filter ratchet — body≥{(_bt_filt_mb or 0):.2f}, vol≥{(_bt_filt_mv or 0):.2f}">'
-                        f'🔍 {_br_label}</span>'
-                    )
-                else:
-                    _filter_badge_bt = ""
-
-                # Regime weighting badge — shows the current regime score the
-                # backtest is biasing toward. Historical analogs in the same
-                # regime contribute fully; opposite-regime analogs contribute
-                # at the 0.15 floor.
-                _bt_regime_w = _meta_bt.get("regime_weighted", False)
-                _bt_curr_rs  = _meta_bt.get("current_regime_score")
-                if _bt_regime_w and _bt_curr_rs is not None:
-                    if _bt_curr_rs >= 67:
-                        _rg_color = "#3fb950"
-                        _rg_label = f"GREEN {int(_bt_curr_rs)}"
-                    elif _bt_curr_rs >= 50:
-                        _rg_color = "#e3b341"
-                        _rg_label = f"YELLOW {int(_bt_curr_rs)}"
-                    else:
-                        _rg_color = "#f85149"
-                        _rg_label = f"RED {int(_bt_curr_rs)}"
-                    _regime_badge_bt = (
-                        f' · <span style="color:{_rg_color};font-weight:700;'
-                        f'border:1px solid {_rg_color};padding:1px 6px;border-radius:3px;" '
-                        f'title="Soft regime filter — historical analogs are weighted by similarity to today\'s regime score. Same-regime analogs count fully; opposite-regime analogs count at 15% floor.">'
-                        f'🎯 REGIME {_rg_label}</span>'
-                    )
-                else:
-                    _regime_badge_bt = ""
-
-                _provenance_html = (
-                    f'<div style="background:#0d1117;border:1px solid #21262d;border-radius:6px;'
-                    f'padding:8px 12px;margin-top:10px;font-family:monospace;">'
-                    f'<div style="color:#58a6ff;font-size:10px;text-transform:uppercase;'
-                    f'letter-spacing:1px;font-weight:700;margin-bottom:4px;">📊 Backtest Data &amp; Time-Decay Scheme</div>'
-                    f'<div style="color:#ccd6f6;font-size:11px;">'
-                    f'{_provenance_note} · Coverage: {_coverage_p}{_filter_badge_bt}{_regime_badge_bt}'
-                    f'</div>'
-                    f'<div style="color:#8892b0;font-size:10px;margin-top:3px;">'
-                    f'Time-decay: {_bkt_cnt_p} buckets (oldest→newest) with weights [{_weights_str}] · '
-                    f'Candidate A = best WR/EV in newest bucket · Candidate B = best by weighted-EV all-time'
-                    f'</div>'
-                    f'</div>'
-                ) if _bt_valid else ""
-
-                # ── Time-decay bucket breakdown for the BEST method ────────
-                # Shows how the edge evolved over time for the winning method.
-                _best_buckets_html = ""
-                _best_for_buckets = _best if _best else {}
-                _best_buckets     = _best_for_buckets.get("buckets", []) if _best_for_buckets else []
-                if _best_buckets and _bt_valid:
-                    _bkt_row_html = ""
-                    for _br in _best_buckets:
-                        _br_wr = _br.get("wr", 0)
-                        _br_ev = _br.get("ev", 0)
-                        _br_n  = _br.get("n",  0)
-                        _br_w  = _br.get("weight", 1.0)
-                        _br_lb = _br.get("label", "—")
-                        _wr_c  = _wr_color(_br_wr) if _br_n > 0 else "#444"
-                        _ev_c  = _ev_color(_br_ev) if _br_n > 0 else "#444"
-                        _bkt_row_html += (
-                            f'<div style="display:grid;grid-template-columns:1.6fr 0.6fr 1fr 1fr 1fr;'
-                            f'gap:4px;padding:4px 6px;border-bottom:1px solid #1a1f2e;font-size:11px;">'
-                            f'<div style="color:#ccd6f6;">{_br_lb}</div>'
-                            f'<div style="color:#8892b0;text-align:right;">×{_br_w:.2f}</div>'
-                            f'<div style="color:{_wr_c};text-align:right;font-weight:700;">{_br_wr:.1f}%</div>'
-                            f'<div style="color:{_ev_c};text-align:right;font-weight:700;">{_br_ev:+.2f}R</div>'
-                            f'<div style="color:#8892b0;text-align:right;">n={_br_n}</div>'
-                            f'</div>'
-                        )
-                    _best_buckets_html = (
-                        f'<div style="margin-top:8px;border:1px solid #21262d;border-radius:6px;overflow:hidden;">'
-                        f'<div style="background:#161b22;padding:6px 8px;color:#58a6ff;font-size:10px;'
-                        f'text-transform:uppercase;letter-spacing:1px;font-weight:700;border-bottom:1px solid #30363d;">'
-                        f'⏱ Time-Decay Breakdown — Best Method ({_best_for_buckets.get("zone","?")} / '
-                        f'{_best_for_buckets.get("sl_label","?")} / {_best_for_buckets.get("mgmt","?")} / '
-                        f'TP{_best_for_buckets.get("tp_mult",2.0):.1f}R)'
-                        f'</div>'
-                        f'<div style="background:#161b22;display:grid;grid-template-columns:1.6fr 0.6fr 1fr 1fr 1fr;'
-                        f'gap:4px;padding:4px 6px;border-bottom:1px solid #30363d;">'
-                        f'<div style="color:#8892b0;font-size:10px;">Bucket</div>'
-                        f'<div style="color:#8892b0;font-size:10px;text-align:right;">Weight</div>'
-                        f'<div style="color:#8892b0;font-size:10px;text-align:right;">WR%</div>'
-                        f'<div style="color:#8892b0;font-size:10px;text-align:right;">EV</div>'
-                        f'<div style="color:#8892b0;font-size:10px;text-align:right;">Trades</div>'
-                        f'</div>'
-                        f'{_bkt_row_html}'
-                        f'</div>'
-                    )
-
-                _bt_rows = (
-                    (
-                        f'<div style="margin-top:10px;padding-top:8px;border-top:1px solid #21262d;">'
-                        f'<div style="color:#58a6ff;font-size:11px;text-transform:uppercase;'
-                        f'letter-spacing:1px;font-weight:700;margin-bottom:8px;">'
-                        f'🎯 Top Candidates — Chosen from Time-Decay Analysis</div>'
-                        + _provenance_html
-                        + _candidate_cards_html
-                        + _best_buckets_html
-                        + f'</div>'
-                    ) if _bt_valid else
-                    f'<div style="color:#8892b0;font-size:12px;padding:5px 0;">📊 Backtest: {_bt_res.get("error","No matching setups")}</div>'
-                )
-
-                # AI verdict block
-                _ai_block = ""
-                if _ai_res:
-                    # Handle legacy single-verdict fallback (shouldn't happen but safe)
-                    if not _ai_res.get("dual"):
-                        # Legacy format wrapper
-                        _ai_res = {
-                            "dual": True,
-                            "candidate_a": {
-                                "verdict":   _ai_res.get("verdict", "WAIT"),
-                                "confidence":_ai_res.get("confidence", "MEDIUM"),
-                                "rationale": _ai_res.get("rationale", ""),
-                                "execution": _ai_res.get("execution", ""),
-                                "risk":      _ai_res.get("risk", ""),
-                                "conflicts": _ai_res.get("conflicts", ""),
-                            },
-                            "candidate_b": {
-                                "verdict": "—", "confidence": "",
-                                "rationale": "", "execution": "", "risk": "", "conflicts": "",
-                            },
-                            "winner": "A", "winner_rationale": "",
-                            "unanimous": True,
-                            "source": _ai_res.get("source", ""),
-                        }
-
-                    _cA = _ai_res.get("candidate_a", {}) or {}
-                    _cB = _ai_res.get("candidate_b", {}) or {}
-                    _winner = _ai_res.get("winner", "NONE")
-                    _winner_why = _ai_res.get("winner_rationale", "")
-                    _unanimous_ai = _ai_res.get("unanimous", False)
-                    _src = _ai_res.get("source", "")
-
-                    def _render_cand_verdict(c, letter, accent, title, is_winner):
-                        _v = c.get("verdict", "WAIT")
-                        _cc= c.get("confidence", "")
-                        _v_color = ("#3fb950" if _v == "TRADE"
-                                    else "#e3b341" if _v == "WAIT"
-                                    else "#f85149" if _v == "NO TRADE"
-                                    else "#8892b0")
-                        _v_bg    = ("#091a0d" if _v == "TRADE"
-                                    else "#1a1500" if _v == "WAIT"
-                                    else "#1a0505" if _v == "NO TRADE"
-                                    else "#0d1117")
-                        _c_badge = (f'<span style="background:#1f2b1f;color:#3fb950;font-size:9px;'
-                                    f'border-radius:3px;padding:1px 5px;margin-left:5px;">{_cc}</span>'
-                                    if _cc in ("HIGH", "MEDIUM", "LOW") else "")
-                        _winner_badge = (
-                            f'<span style="background:#2d2200;color:#ffd700;font-size:10px;'
-                            f'border-radius:3px;padding:2px 6px;margin-left:6px;font-weight:800;">👑 WINNER</span>'
-                            if is_winner else ""
-                        )
-
-                        _exec_str = c.get("execution", "")
-                        _exec_row = (
-                            f'<div style="background:#0a1628;border:1px solid #1f6feb;border-radius:4px;'
-                            f'padding:6px 8px;margin-top:6px;">'
-                            f'<div style="color:#58a6ff;font-size:9px;text-transform:uppercase;'
-                            f'letter-spacing:1px;margin-bottom:2px;">📋 Execution</div>'
-                            f'<div style="color:#ccd6f6;font-size:11px;line-height:1.5;">{_exec_str}</div>'
-                            f'</div>'
-                        ) if _exec_str else ""
-
-                        _conflicts_str = c.get("conflicts", "")
-                        _conflicts_is_clean = (not _conflicts_str
-                                               or _conflicts_str.lower() == "none detected"
-                                               or _conflicts_str.lower() == "none")
-                        if _conflicts_is_clean:
-                            _conflicts_row = (
-                                f'<div style="background:#0a1a0a;border-radius:4px;padding:5px 8px;margin-top:4px;">'
-                                f'<span style="color:#3fb950;font-size:9px;text-transform:uppercase;">✅ Conflicts:</span>'
-                                f'<span style="color:#ccd6f6;font-size:10px;"> None detected</span></div>'
-                            )
-                        elif _conflicts_str:
-                            _conflicts_row = (
-                                f'<div style="background:#1a1500;border-radius:4px;padding:5px 8px;margin-top:4px;">'
-                                f'<span style="color:#e3b341;font-size:9px;text-transform:uppercase;">⚠️ Conflicts:</span>'
-                                f'<span style="color:#ccd6f6;font-size:10px;"> {_conflicts_str}</span></div>'
-                            )
-                        else:
-                            _conflicts_row = ""
-
-                        _risk_str = c.get("risk", "")
-                        _risk_row = (
-                            f'<div style="background:#1a0a0a;border-radius:4px;padding:5px 8px;margin-top:4px;">'
-                            f'<span style="color:#e3b341;font-size:9px;text-transform:uppercase;">⚠️ Risk:</span>'
-                            f'<span style="color:#ccd6f6;font-size:10px;"> {_risk_str}</span></div>'
-                        ) if _risk_str else ""
-
-                        return (
-                            f'<div style="background:{_v_bg};border:1px solid {accent};'
-                            f'border-radius:6px;padding:10px 12px;">'
-                            f'<div style="color:{accent};font-size:10px;font-weight:700;'
-                            f'text-transform:uppercase;letter-spacing:1px;margin-bottom:4px;">'
-                            f'{letter} · {title}{_winner_badge}</div>'
-                            f'<div style="color:{_v_color};font-size:20px;font-weight:900;margin-bottom:4px;">'
-                            f'{_v}{_c_badge}</div>'
-                            f'<div style="color:#ccd6f6;font-size:11px;line-height:1.5;">'
-                            f'{c.get("rationale","")}</div>'
-                            + _exec_row
-                            + _conflicts_row
-                            + _risk_row
-                            + f'</div>'
-                        )
-
-                    if _unanimous_ai:
-                        # Single card
-                        _ai_cards_html = _render_cand_verdict(
-                            _cA, "🟢 A ≡ B", "#3fb950",
-                            "UNANIMOUS Analysis",
-                            is_winner=True,
-                        )
-                    else:
-                        _cardA = _render_cand_verdict(
-                            _cA, "🟢 A", "#238636",
-                            "Best Newest-Bucket",
-                            is_winner=(_winner == "A"),
-                        )
-                        _cardB = _render_cand_verdict(
-                            _cB, "🔵 B", "#1f6feb",
-                            "Best Weighted All-Time",
-                            is_winner=(_winner == "B"),
-                        )
-                        _ai_cards_html = (
-                            f'<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">'
-                            f'{_cardA}{_cardB}</div>'
-                        )
-
-                    # Winner banner (only when dual and one is picked)
-                    _winner_banner = ""
-                    if not _unanimous_ai and _winner in ("A", "B") and _winner_why:
-                        _w_color = "#3fb950" if _winner == "A" else "#58a6ff"
-                        _w_bg    = "#091a0d" if _winner == "A" else "#0a1628"
-                        _ab_trade_a = _cA.get("verdict") == "TRADE"
-                        _ab_trade_b = _cB.get("verdict") == "TRADE"
-                        if _ab_trade_a and _ab_trade_b:
-                            _banner_label = f"👑 AI Recommends Candidate {_winner}"
-                        elif _ab_trade_a or _ab_trade_b:
-                            _banner_label = f"👑 Only Candidate {_winner} is Tradeable"
-                        else:
-                            _banner_label = "⚠️ Neither Candidate is Tradeable"
-                        _winner_banner = (
-                            f'<div style="margin-top:10px;background:{_w_bg};'
-                            f'border:2px solid {_w_color};border-radius:8px;padding:10px 14px;">'
-                            f'<div style="color:{_w_color};font-size:12px;font-weight:800;'
-                            f'text-transform:uppercase;letter-spacing:1px;margin-bottom:4px;">'
-                            f'{_banner_label}</div>'
-                            f'<div style="color:#ccd6f6;font-size:12px;line-height:1.5;">'
-                            f'{_winner_why}</div></div>'
-                        )
-                    elif _winner == "NONE" and not _unanimous_ai:
-                        # Both untradeable or parse error
-                        _winner_banner = (
-                            f'<div style="margin-top:10px;background:#1a0a0a;'
-                            f'border:2px solid #6b2222;border-radius:8px;padding:10px 14px;">'
-                            f'<div style="color:#ff6b6b;font-size:12px;font-weight:800;'
-                            f'text-transform:uppercase;letter-spacing:1px;">'
-                            f'⚠️ No Clear Winner</div>'
-                            f'<div style="color:#ccd6f6;font-size:11px;margin-top:4px;">'
-                            f'{_winner_why or "Neither candidate passed the decision rules — wait for better conditions."}</div></div>'
-                        )
-
-                    _ai_block = (
-                        f'<div style="margin-top:12px;padding-top:12px;border-top:1px solid #21262d;">'
-                        f'<div style="color:#8892b0;font-size:10px;text-transform:uppercase;'
-                        f'letter-spacing:1px;margin-bottom:8px;">'
-                        f'🤖 AI Dual-Candidate Analysis{" (Unanimous)" if _unanimous_ai else ""}</div>'
-                        + _ai_cards_html
-                        + _winner_banner
-                        + (f'<div style="color:#3a3f4b;font-size:10px;margin-top:6px;">{_src}</div>'
-                           if _src and _src != "error" else "")
-                        + f'</div>'
-                    )
-
-                _ml_color = "#3fb950" if _ml_res["pct"] >= 70 else "#e3b341" if _ml_res["pct"] >= 55 else "#f85149"
-                _edge_bt  = (
-                    f' · Best: {_best_key} WR={_best.get("win_rate",0):.0f}% EV={_best.get("ev",0):+.2f}R'
-                    if _bt_valid and _best_key else
-                    f' · {_bt_res["win_2r"]:.0f}% hist win · EV {_bt_res["ev_2r"]:+.2f}R'
-                    if _bt_valid else ""
-                )
-                _html = (
-                    f'<div style="background:#0d1117;border:1px solid #2d3250;border-radius:10px;padding:16px 20px;margin-top:8px;">'
-                    f'<div style="display:flex;align-items:center;gap:16px;padding-bottom:12px;border-bottom:1px solid #21262d;margin-bottom:12px;">'
-                    f'<div style="text-align:center;"><div style="color:#8892b0;font-size:10px;text-transform:uppercase;letter-spacing:1px;">Grade</div>'
-                    f'<div style="color:{_grade_color};font-size:40px;font-weight:900;line-height:1;">{_grade}</div></div>'
-                    f'<div><div style="color:#58a6ff;font-size:13px;font-weight:700;">📋 CONFLUENCE ANALYSIS</div>'
-                    f'<div style="color:#8892b0;font-size:12px;margin-top:2px;">{_grade_desc}</div></div></div>'
-                    f'<div style="display:flex;justify-content:space-between;padding:5px 0;">'
-                    f'<span style="color:#8892b0;font-size:12px;">🤖 ML Probability</span>'
-                    f'<span style="color:{_ml_color};font-size:13px;font-weight:700;">'
-                    f'{_ml_res["pct"]:.1f}% <span style="font-size:10px;color:#8892b0;">{_ml_res["label"]}</span></span></div>'
-                    + _bt_rows
-                    + _ml_card_html
-                    + _wfo_block_html
-                    + _intel_expander_html
-                    + f'<div style="margin-top:8px;padding-top:8px;border-top:1px solid #21262d;">'
-                    f'<div style="color:#8892b0;font-size:11px;text-transform:uppercase;letter-spacing:1px;margin-bottom:3px;">Edge Summary</div>'
-                    f'<div style="color:#ccd6f6;font-size:12px;">ML {_ml_res["pct"]:.0f}%'
-                    + _edge_bt
-                    + f' · Score {score_pct}/100 · {sig["regime"]} regime</div></div>'
-                    + _ai_block
-                    + f'</div>'
-                )
-                st.markdown(_html, unsafe_allow_html=True)
-
-                # ── Pulse panel (on-chain + derivatives confluence) ──────────
-                # Shows composite score + per-module badges + top whale txs.
-                # Populated by Step 1 (via _scanner_fetch_pulse). Renders
-                # nothing if Pulse wasn't fetched or the token isn't in any
-                # module map — the helper returns an empty string in that case.
-                _pulse_cached = st.session_state.get(f"pulse_{_sym_key}")
-                if _pulse_cached:
-                    _pulse_html = _render_pulse_panel_html(_pulse_cached)
-                    if _pulse_html:
-                        st.markdown(_pulse_html, unsafe_allow_html=True)
-
-                # ── Expanders for advanced details (collapsed by default) ─────
-                if _bt_valid:
-                    # Expander 1: Full 4-zone comparison (Aggressive/Standard/Golden Fibo/Sniper)
-                    with st.expander("▸ View Full 4-Zone Comparison  (Aggressive / Standard / Golden Fibo / Sniper)", expanded=False):
-                        _zone_expander_html = (
-                            f'<div style="padding:6px 0;">'
-                            f'<div style="color:#8892b0;font-size:11px;margin-bottom:8px;">'
-                            f'Best config found for each of the four entry zones, '
-                            f'plus the legacy "EXECUTE THIS" recommendation.</div>'
-                            + _zone_table_rows
-                            + _recommendation_html
-                            + f'</div>'
-                        )
-                        st.markdown(_zone_expander_html, unsafe_allow_html=True)
-
-                    # Expander 2: Full method breakdown (all 96 combinations)
-                    if _mgmt_table:
-                        with st.expander("▸ Full Method Breakdown  (all 96 combinations sorted by EVw)", expanded=False):
                             st.markdown(
-                                f'<div style="padding:6px 0;">'
-                                f'<div style="color:#8892b0;font-size:11px;margin-bottom:8px;">'
-                                f'All tested combinations of Entry Zone × SL Method × Management × TP multiplier. '
-                                f'Rows are sorted by <b>EVw (time-decay weighted EV)</b> so recent performance '
-                                f'surfaces first. The crown 👑 marks the overall best.</div>'
-                                + _mgmt_table
+                                f'<div style="background:#0d1117;border:1px solid #2d3250;'
+                                f'border-radius:8px;padding:12px 16px;margin-top:10px;">'
+                                f'<div style="color:#8892b0;font-size:11px;text-transform:uppercase;'
+                                f'letter-spacing:1px;margin-bottom:6px;">📊 Derivatives Sentiment</div>'
+                                + "".join(_badge_html_parts)
+                                + _combo_html
                                 + f'</div>',
                                 unsafe_allow_html=True,
                             )
-            else:
-                st.markdown(
-                    '<div style="color:#8892b0;font-size:12px;padding:8px 0;">'
-                    '▸ Click <b>Step 1</b> (Backtest + WFO) → <b>Step 2</b> (Train ML for Both Candidates) '
-                    '→ <b>Step 3</b> (AI Dual-Candidate Analysis).</div>',
-                    unsafe_allow_html=True,
+                        else:
+                            st.markdown(
+                                '<div style="color:#3a3f4b;font-size:11px;padding:4px 0;">'
+                                'Derivatives data unavailable</div>',
+                                unsafe_allow_html=True,
+                            )
+
+                # ── Confluence Panel (full-width, below both columns) ────────────
+                st.markdown("<div style='margin-top:14px;'></div>", unsafe_allow_html=True)
+
+                _sym_key       = f"{sig['symbol']}_{sig['timeframe']}_{sig['direction']}"
+                _bt_cache_key  = f"bt_{_sym_key}"
+                _ml_cache_key  = f"ml_{_sym_key}"            # legacy — primary/display ML
+                _ml_a_key      = f"mlA_{_sym_key}"           # Candidate A (newest bucket)
+                _ml_b_key      = f"mlB_{_sym_key}"           # Candidate B (weighted all-time)
+                _ml_primary    = f"ml_primary_{_sym_key}"    # "A" or "B" — which ML the UI/AI uses
+                _wfo_cache_key = f"wfo_{_sym_key}"
+                _ai_key        = f"ai_result_{_sym_key}"
+                _has_ai_key    = bool(st.session_state.get("groq_api_key", ""))
+
+                # ── Step 1: Backtest + WFO ───────────────────────────────────────
+                if st.button("📊 Step 1 — Backtest + WFO  (deep historical scan)",
+                             key=f"step1_{_sym_key}_{i}",
+                             use_container_width=True,
+                             help=("Deep fetch (up to 1000 bars) + multi-method backtest "
+                                   "with time-decay buckets + WFO mini-validation. "
+                                   "Also refreshes Pulse (on-chain + derivatives).")):
+                    with st.spinner("Deep backtest + WFO + Pulse…"):
+                        # Route to CT backtest when the highest-tier match is
+                        # countertrend (lowest tier number = first in sorted list).
+                        # Trend-only signals go to the standard multi-method backtest.
+                        _primary_match_for_bt = (sig.get("_qf_matches") or [None])[0]
+                        if (_primary_match_for_bt is not None
+                                and _primary_match_for_bt.get("combo_type") == "countertrend"):
+                            _bt = _scanner_countertrend_quick_backtest(
+                                sig, _primary_match_for_bt)
+                        else:
+                            _bt  = _scanner_quick_backtest(sig)
+                        _wfo = _scanner_mini_wfo(sig, _bt)
+                        # Pulse fetch runs alongside so the signal card can show
+                        # on-chain confluence before the user clicks Step 2/3.
+                        # Pulse has its own internal TTL cache (5min–4hr per module),
+                        # so repeat clicks within the cache window are near-free.
+                        _pulse = _scanner_fetch_pulse(sig["symbol"])
+                    st.session_state[_bt_cache_key]       = _bt
+                    st.session_state[_wfo_cache_key]      = _wfo
+                    st.session_state[f"pulse_{_sym_key}"] = _pulse
+                    # Clear any previously cached ML so user re-trains on fresh backtest
+                    for _k in (_ml_cache_key, _ml_a_key, _ml_b_key, _ml_primary, _ai_key):
+                        st.session_state.pop(_k, None)
+
+                _bt_ready = _bt_cache_key in st.session_state
+
+                # ── Step 2: Train ML (single button for both candidates) ─────────
+                if _bt_ready:
+                    _bt_for_pick  = st.session_state[_bt_cache_key]
+                    _cand_a_dict  = _bt_for_pick.get("candidate_newest")
+                    _cand_b_dict  = _bt_for_pick.get("candidate_weighted")
+
+                    def _cand_label(c):
+                        if not c:
+                            return "— n/a —"
+                        return (f"{c.get('zone','?')} / {c.get('sl_label','?')} / "
+                                f"{c.get('mgmt','?')} / TP{c.get('tp_mult',2.0):.1f}R")
+
+                    # Detect if A and B are the same method
+                    def _cfg_tuple(c):
+                        if not c:
+                            return None
+                        mc = c.get("method_cfg") or {}
+                        return (mc.get("zone"), mc.get("sl_label"), mc.get("mgmt"),
+                                round(float(mc.get("tp_mult", 2.0)), 2))
+
+                    _a_cfg = _cfg_tuple(_cand_a_dict)
+                    _b_cfg = _cfg_tuple(_cand_b_dict)
+                    _ab_same = (_a_cfg is not None and _a_cfg == _b_cfg)
+
+                    # Intro panel
+                    _intro_note = (
+                        "Candidate A &amp; B resolved to the <b>same method</b> — ML will be trained once."
+                        if _ab_same else
+                        "Train adaptive ML (LR/RF/GB auto-picked by sample size) on both candidates in one click. "
+                        "Each candidate is labeled by its own method outcomes."
+                    )
+                    st.markdown(
+                        f'<div style="margin-top:10px;padding:8px 12px;background:#0d1117;'
+                        f'border:1px solid #30363d;border-radius:6px;">'
+                        f'<div style="color:#58a6ff;font-size:11px;text-transform:uppercase;'
+                        f'letter-spacing:1px;font-weight:700;margin-bottom:4px;">'
+                        f'🧠 Step 2 — Train ML for Both Candidates</div>'
+                        f'<div style="color:#8892b0;font-size:11px;">{_intro_note}</div>'
+                        f'<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px;">'
+                        f'<div style="background:#0d1f0d;border:1px solid #238636;border-radius:4px;padding:6px 8px;">'
+                        f'<div style="color:#3fb950;font-size:9px;font-weight:700;text-transform:uppercase;">'
+                        f'🟢 Candidate A {"(= B)" if _ab_same else ""}</div>'
+                        f'<div style="color:#ccd6f6;font-size:10px;font-family:monospace;margin-top:2px;">'
+                        f'{_cand_label(_cand_a_dict)}</div></div>'
+                        + (f'<div style="background:#0a1628;border:1px solid #1f6feb;border-radius:4px;padding:6px 8px;">'
+                           f'<div style="color:#58a6ff;font-size:9px;font-weight:700;text-transform:uppercase;">🔵 Candidate B</div>'
+                           f'<div style="color:#ccd6f6;font-size:10px;font-family:monospace;margin-top:2px;">'
+                           f'{_cand_label(_cand_b_dict)}</div></div>'
+                           if not _ab_same else
+                           f'<div style="background:#1a1500;border:1px solid #e3b341;border-radius:4px;padding:6px 8px;opacity:0.7;">'
+                           f'<div style="color:#e3b341;font-size:9px;font-weight:700;text-transform:uppercase;">'
+                           f'🔵 Candidate B — Same as A</div>'
+                           f'<div style="color:#8892b0;font-size:10px;margin-top:2px;">Unanimous — single training</div></div>')
+                        + f'</div></div>',
+                        unsafe_allow_html=True,
+                    )
+
+                    _ml_btn_disabled = (_cand_a_dict is None and _cand_b_dict is None)
+                    _ml_btn_label = ("🧠 Step 2 — Train ML (Unanimous)"
+                                     if _ab_same else
+                                     "🧠 Step 2 — Train ML for Both Candidates")
+                    if st.button(_ml_btn_label,
+                                 key=f"ml_both_btn_{_sym_key}_{i}",
+                                 use_container_width=True,
+                                 disabled=_ml_btn_disabled):
+                        if _ab_same and _cand_a_dict:
+                            with st.spinner("Training ML (unanimous method)…"):
+                                _ml_shared = _scanner_train_ml(sig, _cand_a_dict["method_cfg"])
+                            st.session_state[_ml_a_key] = _ml_shared
+                            st.session_state[_ml_b_key] = _ml_shared
+                            st.session_state[_ml_cache_key] = _ml_shared
+                        else:
+                            with st.spinner("Training ML on Candidate A…"):
+                                if _cand_a_dict:
+                                    _ml_a_new = _scanner_train_ml(sig, _cand_a_dict["method_cfg"])
+                                    st.session_state[_ml_a_key] = _ml_a_new
+                            with st.spinner("Training ML on Candidate B…"):
+                                if _cand_b_dict:
+                                    _ml_b_new = _scanner_train_ml(sig, _cand_b_dict["method_cfg"])
+                                    st.session_state[_ml_b_key] = _ml_b_new
+                            # Primary display ML = A by default (can be changed)
+                            st.session_state[_ml_cache_key] = st.session_state.get(
+                                _ml_a_key, st.session_state.get(_ml_b_key)
+                            )
+                        st.session_state[_ml_primary] = "A"
+                        st.session_state.pop(_ai_key, None)
+
+                # ── Step 3: AI Final Verdict (dual-candidate analysis) ───────────
+                _ml_ready = (_ml_a_key in st.session_state) or (_ml_b_key in st.session_state)
+                _ai_disabled = not _has_ai_key or not (_bt_ready and _ml_ready)
+                _ai_tip = (
+                    "Run Step 1 + Step 2 (train ML) first."
+                    if not (_bt_ready and _ml_ready) else
+                    "Ask Groq (gpt-oss-120b) to analyze both candidates and pick the winner."
+                    if _has_ai_key else
+                    "Add Groq API key in sidebar to enable."
                 )
+                if st.button("🤖 Step 3 — AI Dual-Candidate Analysis",
+                             key=f"step3_{_sym_key}_{i}",
+                             use_container_width=True,
+                             type="primary",
+                             disabled=_ai_disabled,
+                             help=_ai_tip):
+                    with st.spinner("AI analyzing both candidates (may take 20-40s)…"):
+                        _bt_for_ai = st.session_state.get(_bt_cache_key, {}) or {}
+                        # Prefer Pulse cached by Step 1; only refetch if Step 1
+                        # didn't populate it (e.g. Pulse tab hadn't loaded yet).
+                        _pulse_for_ai = (st.session_state.get(f"pulse_{_sym_key}")
+                                         or _scanner_fetch_pulse(sig["symbol"]))
+                        st.session_state[f"pulse_{_sym_key}"] = _pulse_for_ai
+                        _ai_res = _scanner_ai_verdict(
+                            sig,
+                            ml_a   = st.session_state.get(_ml_a_key),
+                            ml_b   = st.session_state.get(_ml_b_key),
+                            bt     = _bt_for_ai,
+                            wfo    = st.session_state.get(_wfo_cache_key),
+                            cand_a = _bt_for_ai.get("candidate_newest"),
+                            cand_b = _bt_for_ai.get("candidate_weighted"),
+                            pulse  = _pulse_for_ai,
+                        )
+                    st.session_state[_ai_key] = _ai_res
+
+                _bt_res  = st.session_state.get(_bt_cache_key)
+                _ml_res  = st.session_state.get(_ml_cache_key)
+                _wfo_res = st.session_state.get(_wfo_cache_key)
+                _ai_res  = st.session_state.get(_ai_key)
+
+                # ── Decision Matrix — synthesised verdict panel (TOP of confluence) ─
+                # Renders BEFORE all existing detail sections. Uses only data that is
+                # already cached in session_state — never triggers a new AI call.
+                _dm_html = _render_decision_matrix_html(
+                    sig    = sig,
+                    ai_res = _ai_res,
+                    ml_a   = st.session_state.get(_ml_a_key),
+                    ml_b   = st.session_state.get(_ml_b_key),
+                    bt_res = _bt_res,
+                )
+                if _dm_html:
+                    st.markdown(_dm_html, unsafe_allow_html=True)
+
+                # ── Piece 2: 📓 Add to Journal buttons ───────────────────────────
+                # Three decision buttons below the decision matrix. Clicking one
+                # writes a row to quantflow_journal.csv via _qf_journal_capture().
+                # The plan dict is populated from the signal's aggressive-zone
+                # entry/SL/TP and the primary combo's sizing info.
+                # Key suffix uses _sym_key so each card has independent buttons.
+                _jbtn_c1, _jbtn_c2, _jbtn_c3, _jbtn_c4 = st.columns([0.8, 0.8, 0.8, 2.6])
+                _jplan = {
+                    "entry_price": sig.get("entry", ""),
+                    "sl_price":    sig.get("sl", ""),
+                    "tp_price":    sig.get("tp2r", ""),
+                    "risk_pct":    (
+                        _qf_effective_size_pct(
+                            (sig.get("_qf_matches") or [{}])[0].get(
+                                "primary", {}).get("sizing", "FULL"),
+                            float((sig.get("_qf_matches") or [{}])[0].get("_size_factor", 1.0)),
+                        )
+                        if sig.get("_qf_matches") else 0.50
+                    ),
+                }
+                _taken_key = f"_journal_taken_{_sym_key}"
+                with _jbtn_c1:
+                    if st.button("✅ TAKE", key=f"jbtntake_{_sym_key}_{i}",
+                                 use_container_width=True,
+                                 help="Log this signal as a live trade entry"):
+                        try:
+                            _qf_journal_capture(sig, "TAKE", _jplan)
+                            st.session_state[_taken_key] = "TAKE"
+                            st.toast("📓 Logged as TAKE — good luck!", icon="✅")
+                        except Exception as _je:
+                            st.error(f"Journal write failed: {_je}")
+                with _jbtn_c2:
+                    if st.button("📄 PAPER", key=f"jbtnpaper_{_sym_key}_{i}",
+                                 use_container_width=True,
+                                 help="Log as paper trade (simulated, no real money)"):
+                        try:
+                            _qf_journal_capture(sig, "PAPER", _jplan)
+                            st.session_state[_taken_key] = "PAPER"
+                            st.toast("📓 Logged as PAPER trade", icon="📄")
+                        except Exception as _je:
+                            st.error(f"Journal write failed: {_je}")
+                with _jbtn_c3:
+                    if st.button("⛔ SKIP", key=f"jbtnkip_{_sym_key}_{i}",
+                                 use_container_width=True,
+                                 help="Log this signal as deliberately skipped"):
+                        try:
+                            _qf_journal_capture(sig, "SKIP", _jplan)
+                            st.session_state[_taken_key] = "SKIP"
+                            st.toast("📓 Logged as SKIP", icon="⛔")
+                        except Exception as _je:
+                            st.error(f"Journal write failed: {_je}")
+                with _jbtn_c4:
+                    _taken_tag = st.session_state.get(_taken_key, "")
+                    if _taken_tag:
+                        _tag_color = {
+                            "TAKE": "#3fb950", "PAPER": "#58a6ff", "SKIP": "#8892b0",
+                        }.get(_taken_tag, "#ccd6f6")
+                        st.markdown(
+                            f'<div style="margin-top:6px;color:{_tag_color};'
+                            f'font-size:11px;font-weight:700;">📓 {_taken_tag} logged this session</div>',
+                            unsafe_allow_html=True,
+                        )
+
+                if _bt_res or _ml_res:
+                    _ml_res = _ml_res or _scanner_heuristic_ml(sig)
+                    _bt_res = _bt_res or {}
+                    _grade, _grade_color, _grade_desc = _scanner_setup_grade(sig, _ml_res, _bt_res)
+
+                    # ── WFO Results Block ──────────────────────────────────────────
+                    _wfo_block_html = ""
+                    if _wfo_res:
+                        _wv      = _wfo_res.get("verdict", "INSUFFICIENT")
+                        _wv_col  = {"PASS": "#3fb950", "BORDERLINE": "#e3b341",
+                                    "FAIL": "#f85149", "INSUFFICIENT": "#8892b0"}.get(_wv, "#8892b0")
+                        _wv_bg   = {"PASS": "#091a0d", "BORDERLINE": "#1a1500",
+                                    "FAIL": "#1a0505", "INSUFFICIENT": "#0d1117"}.get(_wv, "#0d1117")
+                        _wv_icon = {"PASS": "✅", "BORDERLINE": "⚠️",
+                                    "FAIL": "❌", "INSUFFICIENT": "⚠️"}.get(_wv, "—")
+                        _wfo_ran   = _wfo_res.get("ok", False)
+                        _wfo_note  = _wfo_res.get("note", "")
+                        _wfo_meth  = _wfo_res.get("method_used", "—") or "—"
+
+                        if _wvo_ran := _wfo_ran and _wv != "INSUFFICIENT":
+                            # Purge/embargo diagnostics — proves the leak protection
+                            # is actively dropping trades at the IS/OOS boundary.
+                            _pd_w = _wfo_res.get("purge_diag") or {}
+                            if _pd_w:
+                                _pd_html = (
+                                    f'<div style="background:#0a0f1a;border-radius:4px;'
+                                    f'padding:5px 8px;margin-top:4px;color:#8892b0;font-size:10px;">'
+                                    f'🛡️ <b style="color:#58a6ff;">Purge/Embargo (de Prado)</b>: '
+                                    f'IS raw={_pd_w.get("n_is_raw",0)} → kept {_wfo_res.get("is_n",0)} '
+                                    f'(<span style="color:#f0883e;">purged {_pd_w.get("n_purged",0)} '
+                                    f'label-overlap</span>) | '
+                                    f'OOS raw={_pd_w.get("n_oos_raw",0)} → kept {_wfo_res.get("oos_n",0)} '
+                                    f'(<span style="color:#f0883e;">embargoed {_pd_w.get("n_embargoed",0)}, '
+                                    f'E={_pd_w.get("embargo_bars",0)} bars</span>)</div>'
+                                )
+                            else:
+                                _pd_html = ""
+
+                            # Honest-PF diagnostic — strips out near-breakeven outcomes
+                            # (|r_mult| <= 0.30R) so you can see how much of the edge is
+                            # actually clean WIN vs LOSS, vs how much is breakeven mush
+                            # from Partial+BE auto-stop-out.
+                            _ld = _wfo_res.get("label_diag") or {}
+                            if _ld and (_ld.get("n_neutral_is", 0) > 0 or _ld.get("n_neutral_oos", 0) > 0):
+                                _is_pfc = _ld.get("is_pf_clean", 0)
+                                _oos_pfc = _ld.get("oos_pf_clean", 0)
+                                _is_pfc_s = "∞" if _is_pfc >= 9.9 else f"{_is_pfc:.2f}"
+                                _oos_pfc_s = "∞" if _oos_pfc >= 9.9 else f"{_oos_pfc:.2f}"
+                                # Highlight when "honest" PF differs meaningfully from
+                                # raw PF (suggests Partial+BE inflation)
+                                _gap = abs(_oos_pfc - _wfo_res.get("oos_pf", 0))
+                                _gap_warn = ""
+                                if _gap >= 0.5 and _ld.get("n_neutral_oos", 0) >= 3:
+                                    _gap_warn = (
+                                        ' <span style="color:#f0883e;">'
+                                        '⚠ Raw PF inflated by breakeven outcomes — trust the honest column more</span>'
+                                    )
+                                _ld_html = (
+                                    f'<div style="background:#0a0f1a;border-radius:4px;'
+                                    f'padding:5px 8px;margin-top:4px;color:#8892b0;font-size:10px;">'
+                                    f'🎯 <b style="color:#58a6ff;">Honest PF</b> '
+                                    f'(excludes |r_mult| ≤ {_ld.get("neutral_threshold",0.30)}R breakevens): '
+                                    f'IS={_is_pfc_s} <span style="color:#8892b0;">'
+                                    f'(n_clean={_ld.get("is_n_clean",0)}, '
+                                    f'{_ld.get("n_neutral_is",0)} excluded)</span> | '
+                                    f'OOS={_oos_pfc_s} WR={_ld.get("oos_wr_clean",0):.1f}% '
+                                    f'<span style="color:#8892b0;">'
+                                    f'(n_clean={_ld.get("oos_n_clean",0)}, '
+                                    f'{_ld.get("n_neutral_oos",0)} excluded)</span>'
+                                    f'{_gap_warn}</div>'
+                                )
+                            else:
+                                _ld_html = ""
+
+                            # Bootstrap CI on OOS PF — honest accounting for sample size
+                            _ci = _wfo_res.get("oos_pf_ci") or {}
+                            if _ci.get("ok"):
+                                _ci_lo = _ci.get("lo", 0); _ci_hi = _ci.get("hi", 0)
+                                _ci_html = (
+                                    f'<div style="background:#0a0f1a;border-radius:4px;'
+                                    f'padding:5px 8px;margin-top:4px;color:#8892b0;font-size:10px;">'
+                                    f'📊 <b style="color:#58a6ff;">OOS PF 95% CI</b> '
+                                    f'(block bootstrap, 1000x): '
+                                    f'<span style="color:#ccd6f6;">'
+                                    f'[{("∞" if _ci_lo>=4.99 else f"{_ci_lo:.2f}")}, '
+                                    f'{("∞" if _ci_hi>=4.99 else f"{_ci_hi:.2f}")}]</span> '
+                                    f'<span style="color:#8892b0;">'
+                                    f'— wide CI = small sample = treat point estimate with caution</span>'
+                                    f'</div>'
+                                )
+                            else:
+                                _ci_html = ""
+
+                            # Rolling WFO — distribution across 5 cut points
+                            _rwfo = _wfo_res.get("rolling_wfo") or {}
+                            if _rwfo.get("ok"):
+                                _ehr = _rwfo.get("edge_hit_rate", 0)
+                                _ehr_color = ("#3fb950" if _ehr >= 80 else
+                                              "#e3b341" if _ehr >= 50 else "#f85149")
+                                _dist = _rwfo.get("oos_pf_dist", {}) or {}
+                                _wins = _rwfo.get("windows", []) or []
+                                # Compact table of windows
+                                _wins_rows = ""
+                                for w in _wins:
+                                    _is_pf_v = w.get("is_pf", 0)
+                                    _opf = w.get("oos_pf", 0)
+                                    _is_pf_s = "∞" if _is_pf_v >= 9.9 else f"{_is_pf_v:.2f}"
+                                    _opf_str = "∞" if _opf >= 9.9 else f"{_opf:.2f}"
+                                    _opf_color = ("#3fb950" if _opf >= 1.3 else
+                                                  "#e3b341" if _opf >= 1.0 else "#f85149")
+                                    _wins_rows += (
+                                        f'<tr>'
+                                        f'<td style="color:#ccd6f6;padding:1px 6px;">{int(w.get("cut_pct",0))}%</td>'
+                                        f'<td style="color:#ccd6f6;padding:1px 6px;">{_is_pf_s} <span style="color:#8892b0;">(n={w.get("is_n",0)})</span></td>'
+                                        f'<td style="color:{_opf_color};font-weight:700;padding:1px 6px;">{_opf_str} <span style="color:#8892b0;font-weight:400;">(n={w.get("oos_n",0)}, WR={w.get("oos_wr",0):.0f}%)</span></td>'
+                                        f'</tr>'
+                                    )
+                                _rwfo_html = (
+                                    f'<div style="background:#0a0f1a;border-radius:4px;'
+                                    f'padding:6px 10px;margin-top:4px;color:#8892b0;font-size:10px;">'
+                                    f'🔄 <b style="color:#58a6ff;">Rolling WFO ({len(_wins)} windows, anchored)</b>: '
+                                    f'<span style="color:{_ehr_color};font-weight:700;">{_ehr}% edge hit rate</span> '
+                                    f'<span style="color:#8892b0;">'
+                                    f'({_rwfo.get("n_valid",0)}/{_rwfo.get("n_total",0)} windows valid; '
+                                    f'OOS PF median {_dist.get("median","—")}, '
+                                    f'range [{_dist.get("min","—")}, {_dist.get("max","—")}])</span>'
+                                    f'<table style="margin-top:4px;font-size:10px;border-collapse:collapse;">'
+                                    f'<tr style="color:#8892b0;">'
+                                    f'<th style="text-align:left;padding:1px 6px;">Cut</th>'
+                                    f'<th style="text-align:left;padding:1px 6px;">IS PF</th>'
+                                    f'<th style="text-align:left;padding:1px 6px;">OOS PF</th></tr>'
+                                    f'{_wins_rows}</table>'
+                                    f'</div>'
+                                )
+                            else:
+                                _rwfo_html = ""
+
+                            # Regime-conditional breakdown
+                            _rb = _wfo_res.get("regime_breakdown") or {}
+                            if _rb.get("ok") and _rb.get("buckets"):
+                                _rb_rows = ""
+                                for bk in _rb["buckets"]:
+                                    _bpf = bk.get("pf", 0)
+                                    _bpf_s = "∞" if _bpf >= 9.9 else f"{_bpf:.2f}"
+                                    _bpf_color = ("#3fb950" if _bpf >= 1.3 else
+                                                  "#e3b341" if _bpf >= 1.0 else "#f85149")
+                                    _rb_rows += (
+                                        f'<tr>'
+                                        f'<td style="color:#ccd6f6;padding:1px 6px;">{bk["regime"]}</td>'
+                                        f'<td style="color:{_bpf_color};font-weight:700;padding:1px 6px;">{_bpf_s}</td>'
+                                        f'<td style="color:#ccd6f6;padding:1px 6px;">{bk["wr"]:.0f}%</td>'
+                                        f'<td style="color:#ccd6f6;padding:1px 6px;">{bk["avg_r"]:+.2f}R</td>'
+                                        f'<td style="color:#8892b0;padding:1px 6px;">n={bk["n"]}</td>'
+                                        f'</tr>'
+                                    )
+                                _rb_html = (
+                                    f'<div style="background:#0a0f1a;border-radius:4px;'
+                                    f'padding:6px 10px;margin-top:4px;color:#8892b0;font-size:10px;">'
+                                    f'🎯 <b style="color:#58a6ff;">OOS by Regime</b> '
+                                    f'(proxy: ATR ratio):'
+                                    f'<table style="margin-top:4px;font-size:10px;border-collapse:collapse;">'
+                                    f'<tr style="color:#8892b0;">'
+                                    f'<th style="text-align:left;padding:1px 6px;">Regime</th>'
+                                    f'<th style="text-align:left;padding:1px 6px;">PF</th>'
+                                    f'<th style="text-align:left;padding:1px 6px;">WR</th>'
+                                    f'<th style="text-align:left;padding:1px 6px;">Avg R</th>'
+                                    f'<th style="text-align:left;padding:1px 6px;">n</th></tr>'
+                                    f'{_rb_rows}</table>'
+                                    f'</div>'
+                                )
+                            else:
+                                _rb_html = ""
+
+                            # Full result card with metric grid
+                            _wfo_block_html = (
+                                f'<div style="margin-top:10px;background:{_wv_bg};'
+                                f'border:1px solid {_wv_col};border-radius:8px;padding:10px 14px;">'
+                                f'<div style="color:{_wv_col};font-size:11px;text-transform:uppercase;'
+                                f'letter-spacing:1px;font-weight:700;margin-bottom:6px;">'
+                                f'🔬 WFO Mini-Validation — {_wv_icon} {_wv}</div>'
+                                f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:6px;margin-bottom:6px;">'
+                                f'<div style="background:#0a0f1a;border-radius:4px;padding:5px 8px;">'
+                                f'<div style="color:#8892b0;font-size:9px;text-transform:uppercase;">IS PF</div>'
+                                f'<div style="color:#ccd6f6;font-size:14px;font-weight:800;">'+("∞" if _wfo_res.get("is_pf",0)>=9.9 else f"{_wfo_res.get('is_pf',0):.2f}")+'</div>'
+                                f'<div style="color:#8892b0;font-size:9px;">n={_wfo_res.get("is_n",0)}</div></div>'
+                                f'<div style="background:#0a0f1a;border-radius:4px;padding:5px 8px;">'
+                                f'<div style="color:#8892b0;font-size:9px;text-transform:uppercase;">OOS PF</div>'
+                                f'<div style="color:{_wv_col};font-size:14px;font-weight:800;">'+("∞" if _wfo_res.get("oos_pf",0)>=9.9 else f"{_wfo_res.get('oos_pf',0):.2f}")+'</div>'
+                                f'<div style="color:#8892b0;font-size:9px;">n={_wfo_res.get("oos_n",0)}</div></div>'
+                                f'<div style="background:#0a0f1a;border-radius:4px;padding:5px 8px;">'
+                                f'<div style="color:#8892b0;font-size:9px;text-transform:uppercase;">OOS WR</div>'
+                                f'<div style="color:#ccd6f6;font-size:14px;font-weight:800;">{_wfo_res.get("oos_wr",0):.1f}%</div></div>'
+                                f'<div style="background:#0a0f1a;border-radius:4px;padding:5px 8px;">'
+                                f'<div style="color:#8892b0;font-size:9px;text-transform:uppercase;">OOS/IS Ratio</div>'
+                                f'<div style="color:#ccd6f6;font-size:14px;font-weight:800;">{_wfo_res.get("oos_is_ratio",0):.2f}</div></div>'
+                                f'</div>'
+                                f'<div style="color:#8892b0;font-size:10px;">'
+                                f'Method: {_wfo_meth} &nbsp;|&nbsp; {_wfo_res.get("tier_label","70% IS / 30% OOS")}</div>'
+                                f'{_pd_html}'
+                                f'{_ld_html}'
+                                f'{_ci_html}'
+                                f'{_rwfo_html}'
+                                f'{_rb_html}'
+                                f'<div style="color:{_wv_col};font-size:11px;margin-top:4px;">{_wfo_note}</div>'
+                                f'</div>'
+                            )
+                        else:
+                            # INSUFFICIENT or failed-to-start — show simple explanatory card
+                            _ins_is_n = _wfo_res.get("is_n", 0)
+                            _ins_desc = (
+                                f"IS: {_ins_is_n} trades, OOS: {_wfo_res.get('oos_n',0)} trades"
+                                if _wfo_ran else ""
+                            )
+                            _wfo_block_html = (
+                                f'<div style="margin-top:10px;background:#0d1117;'
+                                f'border:1px solid #8892b0;border-radius:8px;padding:10px 14px;">'
+                                f'<div style="color:#8892b0;font-size:11px;text-transform:uppercase;'
+                                f'letter-spacing:1px;font-weight:700;margin-bottom:4px;">'
+                                f'🔬 WFO Mini-Validation — ⚠️ INSUFFICIENT SAMPLE</div>'
+                                f'<div style="color:#ccd6f6;font-size:12px;margin-bottom:4px;">'
+                                f'Method tested: <b>{_wfo_meth}</b>'
+                                + (f' &nbsp;|&nbsp; {_ins_desc}' if _ins_desc else '')
+                                + f'</div>'
+                                f'<div style="color:#e3b341;font-size:11px;">{_wfo_note}</div>'
+                                f'<div style="color:#8892b0;font-size:10px;margin-top:4px;">'
+                                f'WFO result ignored — signal may still be considered based on backtest and ML alone.</div>'
+                                f'</div>'
+                            )
+
+                    # ── 6 Intelligence Layers Expander ────────────────────────────
+                    # ── Layer 2: Macro Context ────────────────────────────────────
+                    # Read from session state first (already fetched by live scanner /
+                    # main analysis tab). Fall back to fresh cached fetch (alternative.me
+                    # for F&G, CoinGecko for BTC.D — both free, no API key needed).
+                    _l2_fg_data   = (st.session_state.get("live_fg_data")
+                                     or st.session_state.get("_regime_fg_cache"))
+                    if not _l2_fg_data or not _l2_fg_data.get("ok"):
+                        _l2_fg_data = fetch_fear_greed()
+                        if _l2_fg_data.get("ok"):
+                            st.session_state["_regime_fg_cache"] = _l2_fg_data
+
+                    _l2_btcd_data = st.session_state.get("_regime_btcd_cache")
+                    if not _l2_btcd_data or not _l2_btcd_data.get("ok"):
+                        _l2_btcd_data = fetch_btc_dominance()
+                        if _l2_btcd_data.get("ok"):
+                            st.session_state["_regime_btcd_cache"] = _l2_btcd_data
+
+                    _l2_fng_val  = _l2_fg_data.get("value") if _l2_fg_data and _l2_fg_data.get("ok") else None
+                    _l2_fng_lbl  = _l2_fg_data.get("classification", "") if _l2_fg_data else ""
+                    _l2_btcd_val = _l2_btcd_data.get("btc_d") if _l2_btcd_data and _l2_btcd_data.get("ok") else None
+
+                    _layer2_btcd = (f"BTC.D: {_l2_btcd_val:.1f}%" if _l2_btcd_val is not None
+                                    else "BTC.D: N/A")
+                    _layer2_fng  = (f"F&G: {_l2_fng_val} ({_l2_fng_lbl})" if _l2_fng_val is not None
+                                    else "F&G: N/A")
+                    _layer2 = f"{_layer2_btcd} | {_layer2_fng}"
+
+                    # ── Layer 3: Derivatives Sentiment ────────────────────────────
+                    # OI / Funding are set on sig{} by the derivatives display block
+                    # that ran earlier in this same render cycle (above the columns).
+                    # Also check session-state cache as a fallback.
+                    _l3_cache_key = f"deriv_{sig['symbol']}"
+                    _l3_cached    = st.session_state.get(_l3_cache_key, {})
+                    _l3_oi_val    = (sig.get("oi_change_pct")
+                                     if sig.get("oi_change_pct") is not None
+                                     else (_l3_cached.get("oi", {}).get("oi_change_pct")
+                                           if _l3_cached.get("oi", {}).get("ok") else None))
+                    _l3_fr_val    = (sig.get("funding_rate")
+                                     if sig.get("funding_rate") is not None
+                                     else (_l3_cached.get("fr", {}).get("rate")
+                                           if _l3_cached.get("fr", {}).get("ok") else None))
+                    _l3_tbr_val   = sig.get("taker_buy_ratio", 0.5)
+                    _l3_tbr_real  = abs(_l3_tbr_val - 0.5) > 0.001   # False if still at default
+
+                    _layer3_oi  = (f"OI 24h: {_l3_oi_val:+.1f}%" if _l3_oi_val is not None
+                                   else "OI 24h: N/A (spot-only or derivatives API unavailable)")
+                    _layer3_fr  = (f"Funding: {_l3_fr_val*100:.4f}%" if _l3_fr_val is not None
+                                   else "Funding: N/A")
+                    _layer3_tbr = (f"Taker Buy: {_l3_tbr_val*100:.1f}%" if _l3_tbr_real
+                                   else "Taker Buy: N/A")
+                    _layer3 = f"{_layer3_oi} | {_layer3_fr} | {_layer3_tbr}"
+
+                    # ── Layers 1, 4, 5 ────────────────────────────────────────────
+                    _layer1 = (
+                        f"Body {sig['body_pct']:.1f}% | Vol {sig['vol_mult']:.2f}× | "
+                        f"ADX {sig['adx']:.1f} | DI+ {sig['di_plus']:.1f} vs DI− {sig['di_minus']:.1f} | "
+                        f"ATR× {sig['atr_ratio']:.2f} | Candle Rank top {round((1-sig.get('candle_rank',0.5))*100):.0f}% | "
+                        f"Regime {sig['regime']} ({sig['regime_score']}/100) | Age: {max(sig.get('bar_offset',1)-1, 0)} candle(s)"
+                    )
+                    _ml_res_disp = _ml_res or _scanner_heuristic_ml(sig)
+                    # Layer 4 — ML engine: show method name + CV accuracy + sample count
+                    _ml_pct_d   = _ml_res_disp.get('pct', 50)
+                    _ml_lbl_d   = _ml_res_disp.get('label', '—')
+                    _ml_mname_d = _ml_res_disp.get('method_name', 'Heuristic')
+                    _ml_ns_d    = _ml_res_disp.get('n_samples', 0)
+                    _ml_cv_d    = _ml_res_disp.get('cv_accuracy')
+                    _ml_trained = _ml_res_disp.get('trained', False)
+                    if _ml_trained:
+                        _cv_str = f"CV={_ml_cv_d*100:.1f}%" if _ml_cv_d is not None else "CV=n/a"
+                        _layer4 = (f"ML Probability: {_ml_pct_d:.1f}% ({_ml_lbl_d}) | "
+                                   f"Model: {_ml_mname_d} | n={_ml_ns_d} "
+                                   f"({_ml_res_disp.get('n_wins',0)}W/{_ml_res_disp.get('n_losses',0)}L) | "
+                                   f"{_cv_str}")
+                    else:
+                        _layer4 = (f"ML Probability: {_ml_pct_d:.1f}% ({_ml_lbl_d}) | "
+                                   f"{_ml_mname_d} — train a model in Step 2 for real ML")
+
+                    # Layer 5 — Backtest: show best method + WR + EV + PF + bars used
+                    _best_disp = _bt_res.get("best", {})
+                    _bk_disp   = _bt_res.get("best_key", "—") or "—"
+                    _meta_d    = _bt_res.get("meta", {}) or {}
+                    _bars_used = _meta_d.get("bars_used", 0)
+                    _bkt_cnt   = _meta_d.get("bucket_count", 1)
+                    if _bk_disp != "—":
+                        _pf_d = _best_disp.get('pf', 0)
+                        _pf_str = "∞" if _pf_d >= 9.9 else f"{_pf_d:.2f}"
+                        _layer5 = (
+                            f"Best: {_bk_disp} | "
+                            f"WR={_best_disp.get('win_rate',0):.1f}% | "
+                            f"EV={_best_disp.get('ev',0):+.2f}R | "
+                            f"EVw={_best_disp.get('ev_weighted',0):+.2f}R | "
+                            f"PF={_pf_str} | n={_best_disp.get('n',0)} | "
+                            f"Bars={_bars_used} ({_bkt_cnt} decay buckets)"
+                        )
+                    else:
+                        _layer5 = f"Backtest: no valid method found (bars={_bars_used})"
+
+                    # ── Rich ML card (detailed, shown inline in the main card) ───
+                    # Builds a block showing method name, sample size, CV, top features,
+                    # and — if Candidate A & B are BOTH trained — a comparison strip.
+                    _ml_a_show = st.session_state.get(_ml_a_key)
+                    _ml_b_show = st.session_state.get(_ml_b_key)
+                    _ml_primary_show = st.session_state.get(_ml_primary, "A")
+
+                    def _render_ml_block(ml_dict, title, accent_color, bg_color):
+                        if not ml_dict:
+                            return ""
+                        _trained = ml_dict.get("trained", False)
+                        _mname   = ml_dict.get("method_name", "Heuristic")
+                        _mcfg    = ml_dict.get("method_cfg") or {}
+                        _pct     = ml_dict.get("pct", 50)
+                        _lbl     = ml_dict.get("label", "—")
+                        _ns      = ml_dict.get("n_samples", 0)
+                        _nw      = ml_dict.get("n_wins",  0)
+                        _nl      = ml_dict.get("n_losses", 0)
+                        _cv      = ml_dict.get("cv_accuracy")
+                        _cv_std  = ml_dict.get("cv_std")
+                        _note    = ml_dict.get("note", "")
+                        _fi      = ml_dict.get("feature_importance", [])
+
+                        _mcfg_str = (
+                            f"{_mcfg.get('zone','?')} / {_mcfg.get('sl_label','?')} / "
+                            f"{_mcfg.get('mgmt','?')} / TP{_mcfg.get('tp_mult',2.0):.1f}R"
+                        ) if _mcfg else "n/a"
+
+                        _prob_color = ("#3fb950" if _pct >= 65 else
+                                       "#e3b341" if _pct >= 50 else "#f85149")
+                        _cv_color   = ("#3fb950" if (_cv or 0) >= 0.65 else
+                                       "#e3b341" if (_cv or 0) >= 0.55 else "#f85149")
+                        _cv_str = (
+                            f"{_cv*100:.1f}% ± {(_cv_std or 0)*100:.1f}%"
+                            if _cv is not None else "n/a"
+                        )
+
+                        # Top-3 feature importance bars
+                        _fi_html = ""
+                        if _fi:
+                            _top = _fi[:3]
+                            _max_imp = max((f["importance"] for f in _fi), default=1.0) or 1.0
+                            for _f in _top:
+                                _pct_bar = int((_f["importance"] / _max_imp) * 100)
+                                _fi_html += (
+                                    f'<div style="display:grid;grid-template-columns:90px 1fr 50px;'
+                                    f'gap:6px;align-items:center;padding:2px 0;">'
+                                    f'<div style="color:#ccd6f6;font-size:10px;font-family:monospace;">{_f["feature"]}</div>'
+                                    f'<div style="background:#21262d;border-radius:3px;height:8px;overflow:hidden;">'
+                                    f'<div style="background:{accent_color};width:{_pct_bar}%;height:100%;"></div></div>'
+                                    f'<div style="color:#8892b0;font-size:10px;text-align:right;">{_f["importance"]:.2f}</div>'
+                                    f'</div>'
+                                )
+                            _fi_html = (
+                                f'<div style="margin-top:6px;padding-top:6px;border-top:1px solid #21262d;">'
+                                f'<div style="color:#8892b0;font-size:9px;text-transform:uppercase;'
+                                f'letter-spacing:1px;margin-bottom:3px;">Top Feature Importance</div>'
+                                + _fi_html + '</div>'
+                            )
+
+                        _status_badge = (
+                            f'<span style="background:#0d2818;color:#3fb950;font-size:9px;'
+                            f'padding:2px 6px;border-radius:3px;margin-left:6px;">✓ TRAINED</span>'
+                            if _trained else
+                            f'<span style="background:#2d2200;color:#e3b341;font-size:9px;'
+                            f'padding:2px 6px;border-radius:3px;margin-left:6px;">⚠ HEURISTIC</span>'
+                        )
+
+                        # Filter ratchet badge — shows whether the analog filter
+                        # was strict (close match to current signal) or loose
+                        # (broad analogs, less specific to this exact setup).
+                        _filter_ratio = ml_dict.get("filter_ratio")
+                        _filter_min_body = ml_dict.get("filter_min_body")
+                        _filter_min_vol  = ml_dict.get("filter_min_vol")
+                        if _filter_ratio is not None and _trained:
+                            _fr_pct = int(_filter_ratio * 100)
+                            if _filter_ratio >= 0.55:
+                                _fr_color = "#3fb950"
+                                _fr_label = f"STRICT {_fr_pct}%"
+                            elif _filter_ratio >= 0.35:
+                                _fr_color = "#e3b341"
+                                _fr_label = f"RELAXED {_fr_pct}%"
+                            else:
+                                _fr_color = "#f0883e"
+                                _fr_label = f"LOOSE {_fr_pct}%"
+                            _filter_badge = (
+                                f'<span style="background:#0d1117;color:{_fr_color};font-size:9px;'
+                                f'padding:2px 6px;border-radius:3px;margin-left:4px;'
+                                f'border:1px solid {_fr_color};" '
+                                f'title="Analog filter ratchet — body≥{_filter_min_body:.2f}, vol≥{_filter_min_vol:.2f}">'
+                                f'🔍 {_fr_label}</span>'
+                            )
+                        else:
+                            _filter_badge = ""
+
+                        _note_html = (
+                            f'<div style="color:#8892b0;font-size:10px;margin-top:4px;font-style:italic;">{_note}</div>'
+                            if _note else ""
+                        )
+
+                        return (
+                            f'<div style="background:{bg_color};border:1px solid {accent_color};'
+                            f'border-radius:6px;padding:8px 10px;margin-top:6px;">'
+                            f'<div style="display:flex;justify-content:space-between;align-items:center;'
+                            f'margin-bottom:4px;">'
+                            f'<div style="color:{accent_color};font-size:10px;font-weight:700;'
+                            f'text-transform:uppercase;letter-spacing:1px;">{title}{_status_badge}{_filter_badge}</div>'
+                            f'<div style="color:{_prob_color};font-size:16px;font-weight:800;">{_pct:.1f}%</div>'
+                            f'</div>'
+                            f'<div style="color:#ccd6f6;font-size:11px;font-family:monospace;">{_mname}</div>'
+                            f'<div style="color:#8892b0;font-size:10px;margin-top:2px;">Labeled by: {_mcfg_str}</div>'
+                            f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;margin-top:6px;'
+                            f'padding-top:6px;border-top:1px solid #21262d;">'
+                            f'<div><div style="color:#8892b0;font-size:9px;">Samples</div>'
+                            f'<div style="color:#ccd6f6;font-size:12px;font-weight:700;">{_ns} ({_nw}W/{_nl}L)</div></div>'
+                            f'<div><div style="color:#8892b0;font-size:9px;">CV Accuracy</div>'
+                            f'<div style="color:{_cv_color};font-size:12px;font-weight:700;">{_cv_str}</div></div>'
+                            f'<div><div style="color:#8892b0;font-size:9px;">Verdict</div>'
+                            f'<div style="color:{_prob_color};font-size:12px;font-weight:700;">{_lbl}</div></div>'
+                            f'</div>'
+                            + _note_html
+                            + _fi_html
+                            + f'</div>'
+                        )
+
+                    _ml_card_html = ""
+                    if _ml_a_show or _ml_b_show:
+                        # Detect if A and B are the same object (unanimous case)
+                        _ml_unanimous_disp = (
+                            _ml_a_show is _ml_b_show and _ml_a_show is not None
+                        ) or (
+                            _ml_a_show and _ml_b_show
+                            and (_ml_a_show.get("method_cfg") or {}) == (_ml_b_show.get("method_cfg") or {})
+                        )
+
+                        _header = (
+                            f'<div style="margin-top:10px;padding-top:8px;border-top:1px solid #21262d;">'
+                            f'<div style="color:#58a6ff;font-size:11px;text-transform:uppercase;'
+                            f'letter-spacing:1px;font-weight:700;margin-bottom:4px;">'
+                            f'🧠 Trained ML — Adaptive Model'
+                            f'{" (Unanimous: A ≡ B)" if _ml_unanimous_disp else ""}</div>'
+                            f'</div>'
+                        )
+                        if _ml_unanimous_disp:
+                            _ml_card_html = _header + _render_ml_block(
+                                _ml_a_show or _ml_b_show,
+                                "🟢 A ≡ B — Unanimous Method",
+                                "#3fb950", "#091a0d",
+                            )
+                        else:
+                            _a_block = _render_ml_block(
+                                _ml_a_show,
+                                "🟢 Candidate A — Best Newest-Bucket Method",
+                                "#3fb950", "#091a0d",
+                            )
+                            _b_block = _render_ml_block(
+                                _ml_b_show,
+                                "🔵 Candidate B — Weighted All-Time Best",
+                                "#58a6ff", "#0a1628",
+                            )
+                            _ml_card_html = _header + _a_block + _b_block
+
+                    # ── Layer 6: WFO ───────────────────────────────────────────────
+                    # Show WFO result whenever it ran (ok=True = ran, even if INSUFFICIENT).
+                    # ok=False = could not start at all.
+                    _wfo_l = _wfo_res or {}
+                    if _wfo_l.get("ok"):
+                        _wfo_v = _wfo_l.get("verdict", "—")
+                        if _wfo_v == "INSUFFICIENT":
+                            _layer6 = (
+                                f"WFO ran: {_wfo_v} | IS={_wfo_l.get('is_n',0)} trades | "
+                                f"OOS={_wfo_l.get('oos_n',0)} trades — "
+                                f"insufficient sample — result ignored | Method: {_wfo_l.get('method_used','—')}"
+                            )
+                        else:
+                            _layer6 = (
+                                f"WFO: {_wfo_v} | "
+                                f"IS PF={'∞' if _wfo_l.get('is_pf',0)>=9.9 else f"{_wfo_l.get('is_pf',0):.2f}"} (n={_wfo_l.get('is_n',0)}) | "
+                                f"OOS PF={'∞' if _wfo_l.get('oos_pf',0)>=9.9 else f"{_wfo_l.get('oos_pf',0):.2f}"} WR={_wfo_l.get('oos_wr',0):.1f}% "
+                                f"(n={_wfo_l.get('oos_n',0)}) | Ratio={_wfo_l.get('oos_is_ratio',0):.2f}"
+                            )
+                    elif _wfo_l.get("verdict") == "INSUFFICIENT":
+                        # Ran but failed before simulation (no data / no method)
+                        _layer6 = f"WFO: could not run — {_wfo_l.get('note', 'insufficient data')}"
+                    else:
+                        _layer6 = "WFO: not yet run (click Step 1 first)"
+
+                    _intelligence_rows = [
+                        ("1. Signal Raw Data",       "#58a6ff", _layer1),
+                        ("2. Macro Context",          "#7ee787", _layer2),
+                        ("3. Derivatives Sentiment",  "#e3b341", _layer3),
+                        ("4. ML Engine",              "#64ffda", _layer4),
+                        ("5. Backtest",               "#ccd6f6", _layer5),
+                        ("6. WFO Validation",         "#f0883e", _layer6),
+                    ]
+                    _intel_rows_html = "".join(
+                        f'<div style="display:grid;grid-template-columns:160px 1fr;gap:8px;'
+                        f'padding:5px 0;border-bottom:1px solid #21262d;">'
+                        f'<div style="color:{c};font-size:11px;font-weight:700;">{lbl}</div>'
+                        f'<div style="color:#ccd6f6;font-size:11px;font-family:monospace;">{val}</div></div>'
+                        for lbl, c, val in _intelligence_rows
+                    )
+                    _intel_expander_html = (
+                        f'<div style="background:#0d1117;border:1px solid #30363d;border-radius:8px;'
+                        f'padding:12px 14px;margin-top:8px;">'
+                        f'<div style="color:#8892b0;font-size:11px;text-transform:uppercase;'
+                        f'letter-spacing:1px;font-weight:700;margin-bottom:8px;">🔭 6 Intelligence Layers</div>'
+                        + _intel_rows_html
+                        + f'</div>'
+                    )
+
+
+                    # Build backtest rows — enhanced multi-method comparison
+                    _bt_valid    = _bt_res.get("error") is None and _bt_res.get("n", 0) >= 3
+                    _zone_best   = _bt_res.get("zone_best", {})
+                    _best        = _bt_res.get("best", {})
+                    _best_key    = _bt_res.get("best_key", "")
+                    _per_method  = _bt_res.get("per_method", {})
+
+                    def _ev_color(ev):
+                        return "#3fb950" if ev > 0.3 else "#e3b341" if ev > 0 else "#f85149"
+                    def _wr_color(wr):
+                        return "#3fb950" if wr >= 55 else "#e3b341" if wr >= 45 else "#f85149"
+                    def _fill_color(fr):
+                        # Fill rate sensitivity: Aggressive zone ~100% always, so
+                        # green starts at 80% (where even Standard/Golden Fibo/
+                        # Sniper become credible); 50-80% = yellow ("half the
+                        # signals fill, half vanish — so reported WR is a lucky-
+                        # subset stat"); <50% = red (most signals never fill,
+                        # selection bias severe).
+                        return "#3fb950" if fr >= 80 else "#e3b341" if fr >= 50 else "#f85149"
+
+
+                    # ── Zone comparison table with execution detail ───────────────
+                    _etp_card   = sig.get("_trade_plan", {})
+                    _direction  = sig["direction"]
+                    _close_ref  = sig.get("close", 0)
+
+                    # Zone → _etp field prefix mapping
+                    _zone_etp = {
+                        "Aggressive":  ("agg_entry",    "agg_sl",    "agg_tp1",    "agg_tp2",    "agg_tp3"),
+                        "Standard":    ("std_entry",    "std_sl",    "std_tp1",    "std_tp2",    "std_tp3"),
+                        "Golden Fibo": ("golden_entry", "golden_sl", "golden_tp1", "golden_tp2", "golden_tp3"),
+                        "Sniper":      ("sniper_entry", "sniper_sl", "sniper_tp1", "sniper_tp2", "sniper_tp3"),
+                    }
+                    FIXED_SL_PCT = 0.015
+
+                    def _zone_fixed_sl(entry_px):
+                        if _direction == "long":
+                            return round(entry_px * (1 - FIXED_SL_PCT), 8)
+                        else:
+                            return round(entry_px * (1 + FIXED_SL_PCT), 8)
+
+                    def _zone_fixed_tps(entry_px, sl_px):
+                        risk = abs(entry_px - sl_px)
+                        if _direction == "long":
+                            return (round(entry_px + risk, 8),
+                                    round(entry_px + 2 * risk, 8),
+                                    round(entry_px + 3 * risk, 8))
+                        else:
+                            return (round(entry_px - risk, 8),
+                                    round(entry_px - 2 * risk, 8),
+                                    round(entry_px - 3 * risk, 8))
+
+                    def _fmt_px(v):
+                        return f"{v:.6g}" if v else "—"
+
+                    def _mgmt_detail_html(entry_px, sl_px, tp1_px, tp2_px, mgmt_mode, sl_label):
+                        risk = abs(entry_px - sl_px)
+                        be_px = entry_px
+                        if mgmt_mode == "Simple":
+                            return (
+                                f'<div style="color:#8892b0;font-size:10px;margin-top:6px;">'
+                                f'📋 <b style="color:#ccd6f6;">Simple:</b> '
+                                f'Hold full position → TP at <b style="color:#64ffda;">{_fmt_px(tp2_px)}</b> (2R) '
+                                f'or SL at <b style="color:#ff6b6b;">{_fmt_px(sl_px)}</b> ({sl_label})</div>'
+                            )
+                        elif mgmt_mode == "Partial":
+                            return (
+                                f'<div style="color:#8892b0;font-size:10px;margin-top:6px;">'
+                                f'📋 <b style="color:#ccd6f6;">Partial (auto-BE):</b> '
+                                f'At <b style="color:#64ffda;">{_fmt_px(tp1_px)}</b> (1R) → close 50% → '
+                                f'move SL to BE <b style="color:#e3b341;">{_fmt_px(be_px)}</b> → '
+                                f'hold rest to <b style="color:#64ffda;">{_fmt_px(tp2_px)}</b> (2R)</div>'
+                            )
+                        elif mgmt_mode == "Partial-NoBE":
+                            return (
+                                f'<div style="color:#8892b0;font-size:10px;margin-top:6px;">'
+                                f'📋 <b style="color:#ccd6f6;">Partial (no BE):</b> '
+                                f'At <b style="color:#64ffda;">{_fmt_px(tp1_px)}</b> (1R) → close 50% → '
+                                f'<b style="color:#f0883e;">KEEP original SL</b> at <b style="color:#ff6b6b;">{_fmt_px(sl_px)}</b> → '
+                                f'hold rest to <b style="color:#64ffda;">{_fmt_px(tp2_px)}</b> (2R). '
+                                f'<span style="color:#8892b0;">Real downside on remaining half but full upside if it works.</span></div>'
+                            )
+                        elif mgmt_mode == "Trailing":
+                            return (
+                                f'<div style="color:#8892b0;font-size:10px;margin-top:6px;">'
+                                f'📋 <b style="color:#ccd6f6;">Trailing:</b> '
+                                f'At <b style="color:#64ffda;">{_fmt_px(tp1_px)}</b> (1R) → move SL to BE '
+                                f'<b style="color:#e3b341;">{_fmt_px(be_px)}</b> → '
+                                f'trail SL by 0.5× ATR until TP or stopped out</div>'
+                            )
+                        return ""
+
+                    _zone_table_rows = ""
+                    _zone_icons = {"Aggressive": "⚡", "Standard": "✅", "Golden Fibo": "🥇", "Sniper": "🎯"}
+                    _zone_desc  = {
+                        "Aggressive":  "Enter at candle close — highest fill chance",
+                        "Standard":    "Wait for 38.2% retrace into candle body",
+                        "Golden Fibo": "Wait for 61.8% golden ratio retrace — balanced R:R + fill",
+                        "Sniper":      "Wait for 78.6% Fib retrace — deepest pullback, lowest fill rate",
+                    }
+
+                    for _zn in ("Aggressive", "Standard", "Golden Fibo", "Sniper"):
+                        _zd       = _zone_best.get(_zn, {})
+                        _is_best_zone = _best_key and _zd.get("key", "") == _best_key
+                        _border   = "border:1px solid #3fb950;" if _is_best_zone else "border:1px solid #30363d;"
+                        _crown    = " 👑 BEST" if _is_best_zone else ""
+                        _bg       = "background:#091a0d;" if _is_best_zone else "background:#0d1117;"
+
+                        # Pull prices from _etp
+                        _ep_keys   = _zone_etp.get(_zn, ())
+                        _ep        = _etp_card.get(_ep_keys[0], 0) if _ep_keys else 0
+                        _atr_sl_p  = _etp_card.get(_ep_keys[1], 0) if _ep_keys else 0
+                        _tp1_p     = _etp_card.get(_ep_keys[2], 0) if _ep_keys else 0
+                        _tp2_p     = _etp_card.get(_ep_keys[3], 0) if _ep_keys else 0
+                        _tp3_p     = _etp_card.get(_ep_keys[4], 0) if _ep_keys else 0
+                        _fix_sl_p  = _zone_fixed_sl(_ep) if _ep else 0
+                        _fix_tp1, _fix_tp2, _fix_tp3 = _zone_fixed_tps(_ep, _fix_sl_p) if _ep else (0, 0, 0)
+
+                        # ── Structural validity check ─────────────────────────────
+                        # If the Fibonacci retrace zone overshoots the structural SL,
+                        # the zone is physically impossible — show a hard warning.
+                        # We check BOTH the _etp_card validity flags AND the zone_best
+                        # flag that _scanner_quick_backtest now sets for filtered zones.
+                        _structurally_invalid = False
+                        if _zd.get("structurally_invalid"):
+                            _structurally_invalid = True
+                        elif _zn == "Standard"    and not _etp_card.get("std_valid",    True):
+                            _structurally_invalid = True
+                        elif _zn == "Golden Fibo" and not _etp_card.get("golden_valid", True):
+                            _structurally_invalid = True
+                        elif _zn == "Sniper"      and not _etp_card.get("sniper_valid", True):
+                            _structurally_invalid = True
+
+                        if _structurally_invalid:
+                            _sl_pct_conf = _etp_card.get("sl_dist_pct", 0)
+                            _fib_label   = (
+                                "38.2%" if _zn == "Standard"    else
+                                "61.8%" if _zn == "Golden Fibo" else
+                                "78.6%"  # Sniper
+                            )
+                            _zone_table_rows += (
+                                f'<div style="background:#1a0a0a;border:2px solid #6b2222;border-radius:6px;'
+                                f'padding:10px 12px;margin-bottom:6px;">'
+                                f'<div style="color:#ff6b6b;font-size:12px;font-weight:700;margin-bottom:4px;">'
+                                f'{_zone_icons.get(_zn,"•")} {_zn} — ❌ STRUCTURALLY INVALID</div>'
+                                f'<div style="color:#cc8888;font-size:11px;line-height:1.4;">'
+                                f'Candle body is too large for this SL distance ({_sl_pct_conf:.1f}%). '
+                                f'The {_fib_label} retrace zone falls at or beyond the structural stop-loss level. '
+                                f'Entering this zone would mean your SL is already triggered at fill. '
+                                f'<b style="color:#ffaa88;">Use Aggressive zone only.</b></div>'
+                                f'</div>'
+                            )
+                            continue
+
+                        # Best config for this zone
+                        _best_sl_label = _zd.get("sl_label", "Fixed SL") if _zd else "Fixed SL"
+                        _best_mgmt     = _zd.get("mgmt", "Simple") if _zd else "Simple"
+                        _best_tp_mult  = _zd.get("tp_mult", 2.0) if _zd else 2.0
+                        _use_atr       = "ATR" in _best_sl_label
+
+                        # ── Price alignment fix ───────────────────────────────────
+                        # All prices (SL, TP1, TP2) must be derived from the SAME
+                        # config that produced the EV/WR stats shown in the card.
+                        # SL distance: ATR-based (from _etp_card) or Fixed 1.5%
+                        # TP target:   entry ± tp_mult × risk (NOT always 2R)
+                        if _use_atr and _atr_sl_p:
+                            _sl_show     = _atr_sl_p
+                            _sl_pct_show = _etp_card.get("sl_dist_pct", FIXED_SL_PCT * 100)
+                        else:
+                            _sl_show     = _fix_sl_p
+                            _sl_pct_show = FIXED_SL_PCT * 100
+                        # Recompute TP1 and TP2 from the actual risk distance of this config
+                        _risk_show = abs(_ep - _sl_show) if _ep and _sl_show else 0
+                        if _risk_show > 0 and _ep:
+                            _sign      = 1 if _direction == "long" else -1
+                            _tp1_show  = round(_ep + _sign * 1.0            * _risk_show, 8)
+                            _tp2_show  = round(_ep + _sign * _best_tp_mult  * _risk_show, 8)
+                            _tp3_show  = round(_ep + _sign * (_best_tp_mult + 1.0) * _risk_show, 8)
+                        else:
+                            # Fallback to _etp values if risk calc not possible
+                            _tp1_show = _tp1_p if (_use_atr and _ep) else _fix_tp1
+                            _tp2_show = _tp2_p if (_use_atr and _ep) else _fix_tp2
+                            _tp3_show = _tp3_p if (_use_atr and _ep) else _fix_tp3
+
+                        if _zd and not _zd.get("insufficient") and _zd.get("n", 0) >= 4:
+                            _expiry_note = "" if _zn == "Aggressive" else (
+                                f' <span style="color:#e3b341;font-size:10px;">· Expires in 3 bars if not filled</span>'
+                            )
+                            _below_wr_floor = _zd.get("below_wr_floor", False)
+                            _wr_floor_badge = (
+                                f' <span style="background:#2d1a00;color:#e3b341;font-size:9px;'
+                                f'padding:1px 6px;border-radius:3px;margin-left:4px;">'
+                                f'⚠️ WR {_zd.get("win_rate",0):.1f}% — below 35% floor (EV shown, not recommended)</span>'
+                            ) if _below_wr_floor else ""
+                            _mgmt_html = _mgmt_detail_html(_ep, _sl_show, _tp1_show, _tp2_show, _best_mgmt, _best_sl_label)
+
+                            _zone_table_rows += (
+                                f'<div style="{_bg}{_border}border-radius:8px;padding:12px 14px;margin-bottom:8px;">'
+
+                                # Header row
+                                f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">'
+                                f'<div>'
+                                f'<span style="color:#ccd6f6;font-size:13px;font-weight:700;">{_zone_icons.get(_zn,"•")} {_zn}'
+                                f'<span style="color:#3fb950;font-size:12px;">{_crown}</span></span>'
+                                f'{_wr_floor_badge}'
+                                f'<div style="color:#8892b0;font-size:10px;margin-top:1px;">{_zone_desc.get(_zn,"")}{_expiry_note}</div>'
+                                f'</div>'
+                                f'<div style="text-align:right;">'
+                                f'<span style="background:#1a2030;border-radius:4px;padding:2px 8px;font-size:10px;color:#58a6ff;">{_best_sl_label} · {_best_mgmt}</span>'
+                                f'<div style="color:#8892b0;font-size:10px;margin-top:2px;">n={_zd.get("n",0)} historical setups</div>'
+                                f'</div>'
+                                f'</div>'
+
+                                # Stats row
+                                f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;margin-bottom:8px;">'
+                                f'<div style="background:#0a0f1a;border-radius:4px;padding:5px 8px;">'
+                                f'<div style="color:#8892b0;font-size:10px;">Win Rate</div>'
+                                f'<div style="color:{_wr_color(_zd.get("win_rate",0))};font-size:15px;font-weight:800;">{_zd.get("win_rate",0):.1f}%</div>'
+                                f'</div>'
+                                f'<div style="background:#0a0f1a;border-radius:4px;padding:5px 8px;">'
+                                f'<div style="color:#8892b0;font-size:10px;">Exp. Value</div>'
+                                f'<div style="color:{_ev_color(_zd.get("ev",0))};font-size:15px;font-weight:800;">{_zd.get("ev",0):+.2f}R</div>'
+                                f'</div>'
+                                f'<div style="background:#0a0f1a;border-radius:4px;padding:5px 8px;">'
+                                f'<div style="color:#8892b0;font-size:10px;">Avg Hold</div>'
+                                f'<div style="color:#ccd6f6;font-size:15px;font-weight:800;">{_zd.get("avg_bars",0):.1f} bars</div>'
+                                f'</div>'
+                                f'</div>'
+
+                                # Price levels
+                                f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:5px;margin-bottom:6px;">'
+                                f'<div style="background:#0a0f1a;border-radius:4px;padding:5px 8px;">'
+                                f'<div style="color:#8892b0;font-size:9px;text-transform:uppercase;">Entry</div>'
+                                f'<div style="color:#58a6ff;font-size:12px;font-weight:700;">{_fmt_px(_ep)}</div>'
+                                f'</div>'
+                                f'<div style="background:#0a0f1a;border-radius:4px;padding:5px 8px;">'
+                                f'<div style="color:#8892b0;font-size:9px;text-transform:uppercase;">SL ({_sl_pct_show:.1f}%)</div>'
+                                f'<div style="color:#ff6b6b;font-size:12px;font-weight:700;">{_fmt_px(_sl_show)}</div>'
+                                f'</div>'
+                                f'<div style="background:#0a0f1a;border-radius:4px;padding:5px 8px;">'
+                                f'<div style="color:#8892b0;font-size:9px;text-transform:uppercase;">TP1 (1R)</div>'
+                                f'<div style="color:#64ffda;font-size:12px;font-weight:700;">{_fmt_px(_tp1_show)}</div>'
+                                f'</div>'
+                                f'<div style="background:#0a0f1a;border-radius:4px;padding:5px 8px;">'
+                                f'<div style="color:#8892b0;font-size:9px;text-transform:uppercase;">TP2 ({_zd.get("tp_mult",2.0):.1f}R) / TP3</div>'
+                                f'<div style="color:#64ffda;font-size:12px;font-weight:700;">{_fmt_px(_tp2_show)}</div>'
+                                f'<div style="color:#3fb950;font-size:10px;">{_fmt_px(_tp3_show)}</div>'
+                                f'</div>'
+                                f'</div>'
+
+                                # Management instructions
+                                + _mgmt_html
+                                + f'</div>'
+                            )
+                        else:
+                            # Check if excluded due to low win rate (35% floor) vs truly insufficient data
+                            _best_wr_for_zone = max(
+                                (v.get("win_rate", 0) for v in _per_method.values()
+                                 if v.get("zone") == _zn and not v.get("insufficient") and v.get("n", 0) >= 4),
+                                default=None
+                            )
+                            if _best_wr_for_zone is not None and _best_wr_for_zone < 35:
+                                _zone_table_rows += (
+                                    f'<div style="background:#0d1117;border:1px solid #2d2200;border-radius:6px;'
+                                    f'padding:8px 10px;margin-bottom:6px;">' 
+                                    f'<div style="display:flex;justify-content:space-between;align-items:center;">'
+                                    f'<span style="color:#8892b0;font-size:12px;">{_zone_icons.get(_zn,"•")} {_zn}</span>'
+                                    f'<span style="background:#2d2200;color:#e3b341;font-size:10px;padding:2px 8px;border-radius:4px;">'
+                                    f'⚠️ Excluded — Win Rate {_best_wr_for_zone:.1f}% below 35% minimum</span></div>'
+                                    f'<div style="color:#8892b0;font-size:10px;margin-top:4px;">'
+                                    f'EV may be positive but strategy wins fewer than 1 in 3 trades — not recommended for live trading.</div>'
+                                    f'</div>'
+                                )
+                            else:
+                                _zone_table_rows += (
+                                    f'<div style="background:#0d1117;border:1px solid #21262d;border-radius:6px;'
+                                    f'padding:8px 10px;margin-bottom:6px;opacity:0.5;">'
+                                    f'<span style="color:#8892b0;font-size:12px;">{_zone_icons.get(_zn,"•")} {_zn} — insufficient data (&lt;4 setups)</span>'
+                                    f'</div>'
+                                )
+
+                    # ── Best method recommendation with full execution plan ────────
+                    # Extra safety: never recommend a structurally invalid zone even if
+                    # best_key somehow slipped through (e.g. cached from earlier run).
+                    _best_zone_name = _best.get("zone", "Aggressive") if _best else "Aggressive"
+                    _best_structurally_ok = True
+                    if _best_zone_name == "Standard"    and not _etp_card.get("std_valid",    True):
+                        _best_structurally_ok = False
+                    elif _best_zone_name == "Golden Fibo" and not _etp_card.get("golden_valid", True):
+                        _best_structurally_ok = False
+                    elif _best_zone_name == "Sniper"    and not _etp_card.get("sniper_valid", True):
+                        _best_structurally_ok = False
+
+                    if _best and _best_key and not _best_structurally_ok:
+                        # Demote to best VALID zone instead
+                        _fallback_best_key = None
+                        _fallback_best     = {}
+                        for _fb_k, _fb_v in sorted(
+                            _per_method.items(), key=lambda x: -x[1].get("ev", -99)
+                        ):
+                            if _fb_v.get("insufficient") or _fb_v.get("n", 0) < 4:
+                                continue
+                            _fb_zone = _fb_v.get("zone", "Aggressive")
+                            if _fb_zone == "Standard"    and not _etp_card.get("std_valid",    True):
+                                continue
+                            if _fb_zone == "Golden Fibo" and not _etp_card.get("golden_valid", True):
+                                continue
+                            if _fb_zone == "Sniper"      and not _etp_card.get("sniper_valid", True):
+                                continue
+                            _fallback_best_key = _fb_k
+                            _fallback_best     = _fb_v
+                            break
+                        _best     = _fallback_best
+                        _best_key = _fallback_best_key
+
+                    if _best and _best_key:
+                        _bev    = _best.get("ev", 0)
+                        _bwr    = _best.get("win_rate", 0)
+                        _bn     = _best.get("n", 0)
+                        _bzone  = _best.get("zone", "Aggressive")
+                        _bsl    = _best.get("sl_label", "Fixed SL")
+                        _bmgmt  = _best.get("mgmt", "Simple")
+                        _btp    = _best.get("tp_mult", 2.0)
+                        _bbars  = _best.get("avg_bars", 0)
+
+                        _bep_keys  = _zone_etp.get(_bzone, ())
+                        _bep       = _etp_card.get(_bep_keys[0], 0) if _bep_keys else 0
+                        _b_atr_sl  = _etp_card.get(_bep_keys[1], 0) if _bep_keys else 0
+                        _b_tp1     = _etp_card.get(_bep_keys[2], 0) if _bep_keys else 0
+                        _b_tp2     = _etp_card.get(_bep_keys[3], 0) if _bep_keys else 0
+                        _b_fix_sl  = _zone_fixed_sl(_bep) if _bep else 0
+                        _b_fix_tp1, _b_fix_tp2, _ = _zone_fixed_tps(_bep, _b_fix_sl) if _bep else (0, 0, 0)
+                        _b_use_atr = "ATR" in _bsl
+                        _b_sl_px   = _b_atr_sl if (_b_use_atr and _b_atr_sl) else _b_fix_sl
+                        # Recompute TP prices from actual config SL distance and tp_mult
+                        # so EXECUTE THIS prices align with the EV/WR stats shown
+                        _b_risk    = abs(_bep - _b_sl_px) if _bep and _b_sl_px else 0
+                        if _b_risk > 0 and _bep:
+                            _b_sign    = 1 if _direction == "long" else -1
+                            _b_tp1_px  = round(_bep + _b_sign * 1.0   * _b_risk, 8)
+                            _b_tp2_px  = round(_bep + _b_sign * _btp  * _b_risk, 8)
+                        else:
+                            _b_tp1_px  = _b_tp1 if (_b_use_atr and _bep) else _b_fix_tp1
+                            _b_tp2_px  = _b_tp2 if (_b_use_atr and _bep) else _b_fix_tp2
+
+                        _exec_detail = _mgmt_detail_html(_bep, _b_sl_px, _b_tp1_px, _b_tp2_px, _bmgmt, _bsl)
+                        _wait_note   = (
+                            f'<div style="color:#e3b341;font-size:11px;margin-top:4px;">'
+                            f'⏳ Wait for retrace to <b>{_fmt_px(_bep)}</b> — expires if not filled within 3 bars</div>'
+                        ) if _bzone != "Aggressive" else ""
+
+                        _recommendation_html = (
+                            f'<div style="background:#091a0d;border:1px solid #3fb950;border-radius:8px;'
+                            f'padding:12px 14px;margin-top:10px;">'
+                            f'<div style="color:#3fb950;font-size:11px;text-transform:uppercase;'
+                            f'letter-spacing:1px;font-weight:700;margin-bottom:8px;">🏆 EXECUTE THIS — Best Proven Method</div>'
+                            f'<div style="color:#ccd6f6;font-size:13px;font-weight:700;margin-bottom:8px;">{_bzone} / {_bsl} / {_bmgmt} &nbsp;<span style="color:#e3b341;font-size:12px;">TP {_btp:.1f}R</span></div>'
+                            f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:5px;margin-bottom:8px;">'
+                            f'<div style="background:#0a1a0a;border-radius:4px;padding:5px 8px;">'
+                            f'<div style="color:#8892b0;font-size:9px;text-transform:uppercase;">Entry</div>'
+                            f'<div style="color:#58a6ff;font-size:13px;font-weight:800;">{_fmt_px(_bep)}</div></div>'
+                            f'<div style="background:#0a1a0a;border-radius:4px;padding:5px 8px;">'
+                            f'<div style="color:#8892b0;font-size:9px;text-transform:uppercase;">Stop Loss</div>'
+                            f'<div style="color:#ff6b6b;font-size:13px;font-weight:800;">{_fmt_px(_b_sl_px)}</div></div>'
+                            f'<div style="background:#0a1a0a;border-radius:4px;padding:5px 8px;">'
+                            f'<div style="color:#8892b0;font-size:9px;text-transform:uppercase;">TP1 (1R)</div>'
+                            f'<div style="color:#64ffda;font-size:13px;font-weight:800;">{_fmt_px(_b_tp1_px)}</div></div>'
+                            f'<div style="background:#0a1a0a;border-radius:4px;padding:5px 8px;">'
+                            f'<div style="color:#8892b0;font-size:9px;text-transform:uppercase;">TP ({_btp:.1f}R)</div>'
+                            f'<div style="color:#64ffda;font-size:13px;font-weight:800;">{_fmt_px(_b_tp2_px)}</div></div>'
+                            f'</div>'
+                            + _wait_note
+                            + _exec_detail
+                            + f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;margin-top:10px;'
+                            f'padding-top:8px;border-top:1px solid #1a3a1a;">'
+                            f'<div><div style="color:#8892b0;font-size:10px;">Historical Win Rate</div>'
+                            f'<div style="color:{_wr_color(_bwr)};font-size:16px;font-weight:800;">{_bwr:.1f}%</div></div>'
+                            f'<div><div style="color:#8892b0;font-size:10px;">Expected Value</div>'
+                            f'<div style="color:{_ev_color(_bev)};font-size:16px;font-weight:800;">{_bev:+.2f}R</div></div>'
+                            f'<div><div style="color:#8892b0;font-size:10px;">Sample / Avg Hold</div>'
+                            f'<div style="color:#ccd6f6;font-size:16px;font-weight:800;">{_bn}t / {_bbars:.0f}b</div></div>'
+                            f'</div></div>'
+                        )
+                    else:
+                        _recommendation_html = (
+                            f'<div style="color:#8892b0;font-size:12px;padding:8px 0;">'
+                            f'Not enough data to determine best method (&lt;4 setups per zone).</div>'
+                        )
+
+                    # ── NEW: 2 CANDIDATE EXECUTION CARDS (A = newest, B = weighted) ───
+                    # These replace the 3 zone cards at the top of the view. The 3 zone
+                    # cards are still available inside an expander for power users.
+                    _cand_a_card = _bt_res.get("candidate_newest")
+                    _cand_b_card = _bt_res.get("candidate_weighted")
+
+                    def _cfg_of_card(c):
+                        if not c:
+                            return None
+                        mc = c.get("method_cfg") or {}
+                        return (mc.get("zone"), mc.get("sl_label"), mc.get("mgmt"),
+                                round(float(mc.get("tp_mult", 2.0)), 2))
+                    _a_cfg_disp = _cfg_of_card(_cand_a_card)
+                    _b_cfg_disp = _cfg_of_card(_cand_b_card)
+                    _ab_unanimous_disp = (_a_cfg_disp is not None and _a_cfg_disp == _b_cfg_disp)
+
+                    def _build_cand_exec_card(cand, letter, title, accent, bg, border):
+                        """Render one candidate execution card with prices + decay buckets."""
+                        if not cand:
+                            return (
+                                f'<div style="background:{bg};border:1px solid {border};'
+                                f'border-radius:8px;padding:12px 14px;margin-top:10px;">'
+                                f'<div style="color:{accent};font-size:11px;font-weight:700;'
+                                f'text-transform:uppercase;letter-spacing:1px;">{letter} · {title}</div>'
+                                f'<div style="color:#8892b0;font-size:12px;margin-top:8px;">'
+                                f'No valid method found — not enough historical data or all filters fail.</div>'
+                                f'</div>'
+                            )
+
+                        _mc   = cand.get("method_cfg") or {}
+                        _czn  = _mc.get("zone", "Aggressive")
+                        _csl  = _mc.get("sl_label", "Fixed SL")
+                        _cmg  = _mc.get("mgmt", "Simple")
+                        _ctp  = float(_mc.get("tp_mult", 2.0))
+                        _cwr  = cand.get("win_rate", 0)
+                        _cev  = cand.get("ev", 0)
+                        _cevw = cand.get("ev_weighted", 0)
+                        _cpf  = cand.get("pf", 0)
+                        _cpfs = "∞" if _cpf >= 9.9 else f"{_cpf:.2f}"
+                        _cpfc = ("#3fb950" if _cpf >= 1.5 else
+                                 "#e3b341" if _cpf >= 1.0 else "#f85149")
+                        _cn   = cand.get("n", 0)
+                        _cbars= cand.get("avg_bars", 0)
+                        _cnb  = cand.get("newest_bucket", {}) or {}
+
+                        # Fill rate: % of qualifying signals whose limit order was
+                        # actually filled within 3 bars. Aggressive zones are
+                        # market-entry (always 100%), Standard/Golden Fibo/Sniper
+                        # require a retrace to the zone band and can fall far below
+                        # 100%. Low fill = the reported WR/EV only include the lucky
+                        # filled subset — so a "great" Standard method that fills
+                        # 30% of the time is materially different from one that
+                        # fills 90%.
+                        _cfr = cand.get("fill_rate", None)
+                        if _cfr is None or _cfr <= 0:
+                            _cfr_str = "—"
+                            _cfr_val = 100.0
+                        else:
+                            _cfr_val = float(_cfr)
+                            _cfr_str = f"{_cfr_val:.0f}%"
+
+                        # CANONICAL prices — same helper the AI prompt uses, so
+                        # the prices the user sees here are guaranteed identical
+                        # to what the AI receives. Single source of truth.
+                        _px = _compute_candidate_prices(cand, sig)
+                        if _px["ok"]:
+                            _c_ep     = _px["entry"]
+                            _c_sl_px  = _px["sl"]
+                            _c_sl_pct = _px["sl_pct"]
+                            _c_tp1_px = _px["tp1"]
+                            _c_tp2_px = _px["tp2"]
+                        else:
+                            _c_ep = _c_sl_px = _c_tp1_px = _c_tp2_px = 0
+                            _c_sl_pct = 0
+
+                        _exec_detail = _mgmt_detail_html(_c_ep, _c_sl_px, _c_tp1_px, _c_tp2_px, _cmg, _csl) if _c_ep else ""
+                        _wait_note = (
+                            f'<div style="color:#e3b341;font-size:11px;margin-top:4px;">'
+                            f'⏳ Wait for retrace to <b>{_fmt_px(_c_ep)}</b> — expires if not filled within 3 bars</div>'
+                        ) if _czn != "Aggressive" and _c_ep else ""
+
+                        # Time-decay bucket strip for this candidate
+                        _buckets = cand.get("buckets", []) or []
+                        _bkt_cells = ""
+                        if _buckets:
+                            _n_bkt = len(_buckets)
+                            for _bi, _br in enumerate(_buckets):
+                                _bn_i   = _br.get("n", 0)
+                                _bwr_i  = _br.get("wr", 0)
+                                _bev_i  = _br.get("ev", 0)
+                                _bw_i   = _br.get("weight", 1.0)
+                                _blbl_i = _br.get("label", "—")
+                                _is_newest = (_bi == _n_bkt - 1)
+                                _cell_bg = "#091a0d" if _is_newest else "#0d1117"
+                                _cell_border = accent if _is_newest else "#21262d"
+                                _wr_col_c = _wr_color(_bwr_i) if _bn_i >= 2 else "#555"
+                                _ev_col_c = _ev_color(_bev_i) if _bn_i >= 2 else "#555"
+                                _bkt_cells += (
+                                    f'<div style="background:{_cell_bg};border:1px solid {_cell_border};'
+                                    f'border-radius:4px;padding:5px 6px;">'
+                                    f'<div style="color:#8892b0;font-size:9px;text-transform:uppercase;">'
+                                    f'{_blbl_i} · w={_bw_i:.2f}</div>'
+                                    f'<div style="display:flex;justify-content:space-between;align-items:baseline;margin-top:2px;">'
+                                    f'<span style="color:{_wr_col_c};font-size:11px;font-weight:700;">{_bwr_i:.0f}%</span>'
+                                    f'<span style="color:{_ev_col_c};font-size:10px;">{_bev_i:+.1f}R</span>'
+                                    f'<span style="color:#8892b0;font-size:9px;">n={_bn_i}</span>'
+                                    f'</div></div>'
+                                )
+                            _bkt_strip = (
+                                f'<div style="margin-top:8px;">'
+                                f'<div style="color:#8892b0;font-size:9px;text-transform:uppercase;'
+                                f'letter-spacing:1px;margin-bottom:4px;">⏱ Time-Decay Breakdown (oldest → newest)</div>'
+                                f'<div style="display:grid;grid-template-columns:repeat({_n_bkt},1fr);gap:4px;">'
+                                f'{_bkt_cells}</div></div>'
+                            )
+                        else:
+                            _bkt_strip = ""
+
+                        return (
+                            f'<div style="background:{bg};border:1px solid {border};'
+                            f'border-radius:8px;padding:12px 14px;margin-top:10px;">'
+                            # Header
+                            f'<div style="display:flex;justify-content:space-between;align-items:center;'
+                            f'margin-bottom:6px;">'
+                            f'<div style="color:{accent};font-size:11px;font-weight:700;'
+                            f'text-transform:uppercase;letter-spacing:1px;">{letter} · {title}</div>'
+                            f'<div style="color:#8892b0;font-size:10px;">'
+                            f'{_czn} / {_csl} / {_cmg} · <span style="color:#e3b341;">TP{_ctp:.1f}R</span></div>'
+                            f'</div>'
+                            # Price grid
+                            f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:5px;margin-bottom:6px;">'
+                            f'<div style="background:#0a0f1a;border-radius:4px;padding:5px 8px;">'
+                            f'<div style="color:#8892b0;font-size:9px;text-transform:uppercase;">Entry</div>'
+                            f'<div style="color:#58a6ff;font-size:13px;font-weight:800;">{_fmt_px(_c_ep)}</div></div>'
+                            f'<div style="background:#0a0f1a;border-radius:4px;padding:5px 8px;">'
+                            f'<div style="color:#8892b0;font-size:9px;text-transform:uppercase;">SL ({_c_sl_pct:.1f}%)</div>'
+                            f'<div style="color:#ff6b6b;font-size:13px;font-weight:800;">{_fmt_px(_c_sl_px)}</div></div>'
+                            f'<div style="background:#0a0f1a;border-radius:4px;padding:5px 8px;">'
+                            f'<div style="color:#8892b0;font-size:9px;text-transform:uppercase;">TP1 (1R)</div>'
+                            f'<div style="color:#64ffda;font-size:13px;font-weight:800;">{_fmt_px(_c_tp1_px)}</div></div>'
+                            f'<div style="background:#0a0f1a;border-radius:4px;padding:5px 8px;">'
+                            f'<div style="color:#8892b0;font-size:9px;text-transform:uppercase;">TP ({_ctp:.1f}R)</div>'
+                            f'<div style="color:#64ffda;font-size:13px;font-weight:800;">{_fmt_px(_c_tp2_px)}</div></div>'
+                            f'</div>'
+                            + _wait_note
+                            + _exec_detail
+                            # Stats strip — expanded to include Fill% so the user
+                            # can see the pragmatic question: "how often does this
+                            # method's limit order even get filled within 3 bars?"
+                            # Low fill = high selection bias in the WR/EV numbers
+                            # (only the filled trades count). Aggressive zone =
+                            # usually 100% fill. Standard/Golden Fibo/Sniper can
+                            # drop to 40-70% (Sniper at 0.786 is the lowest of all).
+                            + f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr 1fr 1fr;gap:6px;margin-top:8px;'
+                            f'padding-top:8px;border-top:1px solid #21262d;">'
+                            f'<div><div style="color:#8892b0;font-size:9px;">All-time WR</div>'
+                            f'<div style="color:{_wr_color(_cwr)};font-size:14px;font-weight:800;">{_cwr:.1f}%</div></div>'
+                            f'<div><div style="color:#8892b0;font-size:9px;">EV</div>'
+                            f'<div style="color:{_ev_color(_cev)};font-size:14px;font-weight:800;">{_cev:+.2f}R</div></div>'
+                            f'<div><div style="color:#8892b0;font-size:9px;">EVw</div>'
+                            f'<div style="color:{_ev_color(_cevw)};font-size:14px;font-weight:800;">{_cevw:+.2f}R</div></div>'
+                            f'<div><div style="color:#8892b0;font-size:9px;">PF</div>'
+                            f'<div style="color:{_cpfc};font-size:14px;font-weight:800;">{_cpfs}</div></div>'
+                            f'<div title="% of qualifying signals where the limit order actually filled within 3 bars">'
+                            f'<div style="color:#8892b0;font-size:9px;">Fill% (≤3 bars)</div>'
+                            f'<div style="color:{_fill_color(_cfr)};font-size:14px;font-weight:800;">{_cfr_str}</div></div>'
+                            f'<div><div style="color:#8892b0;font-size:9px;">Samples</div>'
+                            f'<div style="color:#ccd6f6;font-size:14px;font-weight:800;">{_cn}t/{_cbars:.0f}b</div></div>'
+                            f'</div>'
+                            + _bkt_strip
+                            + f'</div>'
+                        )
+
+                    if _ab_unanimous_disp:
+                        _candidate_cards_html = _build_cand_exec_card(
+                            _cand_a_card, "🟢 A ≡ B",
+                            "UNANIMOUS — Best in Both Views",
+                            "#3fb950", "#091a0d", "#3fb950",
+                        )
+                    else:
+                        _card_a_html = _build_cand_exec_card(
+                            _cand_a_card, "🟢 A",
+                            "Best in Newest Bucket",
+                            "#3fb950", "#091a0d", "#238636",
+                        ) if _cand_a_card else ""
+                        _card_b_html = _build_cand_exec_card(
+                            _cand_b_card, "🔵 B",
+                            "Best Weighted All-Time",
+                            "#58a6ff", "#0a1628", "#1f6feb",
+                        ) if _cand_b_card else ""
+                        _candidate_cards_html = _card_a_html + _card_b_html
+
+                    # ── Full management breakdown (expandable) ────────────────────
+                    _mgmt_table = ""
+                    if _per_method:
+                        _mgmt_rows_html = ""
+                        # Sort by weighted EV so time-decay ranking surfaces the best recent methods first
+                        for _mk, _mv in sorted(_per_method.items(),
+                                               key=lambda x: -x[1].get("ev_weighted", x[1].get("ev", -99))):
+                            if _mv.get("insufficient") or _mv.get("n", 0) < 4:
+                                continue
+                            _is_best = (_mk == _best_key)
+                            _row_bg  = "background:#091a0d;" if _is_best else ""
+                            _crown2  = " 👑" if _is_best else ""
+                            _tp_label = f"TP{_mv.get('tp_mult',2.0):.1f}R"
+                            _pf_val  = _mv.get("pf", 0)
+                            _pf_str  = "∞" if _pf_val >= 9.9 else f"{_pf_val:.2f}"
+                            _pf_c    = ("#3fb950" if _pf_val >= 1.5 else
+                                        "#e3b341" if _pf_val >= 1.0 else "#f85149")
+                            _evw     = _mv.get("ev_weighted", _mv.get("ev", 0))
+                            _nbkt    = _mv.get("newest_bucket", {}) or {}
+                            _nbkt_wr = _nbkt.get("wr", 0)
+                            _nbkt_n  = _nbkt.get("n",  0)
+                            _nbkt_ev = _nbkt.get("ev", 0)
+                            _nbkt_txt = f"{_nbkt_wr:.0f}%/{_nbkt_ev:+.1f}R (n{_nbkt_n})" if _nbkt_n > 0 else "—"
+                            _nbkt_color = _wr_color(_nbkt_wr) if _nbkt_n >= 3 else "#8892b0"
+                            _mgmt_rows_html += (
+                                f'<div style="{_row_bg}display:grid;grid-template-columns:2.6fr 0.7fr 0.7fr 0.7fr 0.7fr 0.7fr 1.1fr 0.8fr;'
+                                f'gap:4px;padding:5px 6px;border-bottom:1px solid #1a1f2e;font-size:11px;">'
+                                f'<div style="color:#ccd6f6;">{_mk}{_crown2}</div>'
+                                f'<div style="color:{_wr_color(_mv["win_rate"])};text-align:right;font-weight:700;">{_mv["win_rate"]:.0f}%</div>'
+                                f'<div style="color:{_ev_color(_mv["ev"])};text-align:right;font-weight:700;">{_mv["ev"]:+.2f}R</div>'
+                                f'<div style="color:{_ev_color(_evw)};text-align:right;font-weight:700;">{_evw:+.2f}R</div>'
+                                f'<div style="color:{_pf_c};text-align:right;font-weight:700;">{_pf_str}</div>'
+                                f'<div style="color:#e3b341;text-align:right;font-weight:600;">{_tp_label}</div>'
+                                f'<div style="color:{_nbkt_color};text-align:right;font-size:10px;">{_nbkt_txt}</div>'
+                                f'<div style="color:#8892b0;text-align:right;">{_mv["n"]}n/{_mv["avg_bars"]:.0f}b</div>'
+                                f'</div>'
+                            )
+                        if _mgmt_rows_html:
+                            _mgmt_table = (
+                                f'<div style="margin-top:10px;border:1px solid #21262d;border-radius:6px;overflow:hidden;">'
+                                f'<div style="background:#161b22;display:grid;grid-template-columns:2.6fr 0.7fr 0.7fr 0.7fr 0.7fr 0.7fr 1.1fr 0.8fr;'
+                                f'gap:4px;padding:5px 6px;border-bottom:1px solid #30363d;">'
+                                f'<div style="color:#8892b0;font-size:10px;text-transform:uppercase;">Method (sorted by EVw)</div>'
+                                f'<div style="color:#8892b0;font-size:10px;text-align:right;">WR%</div>'
+                                f'<div style="color:#8892b0;font-size:10px;text-align:right;">EV</div>'
+                                f'<div style="color:#8892b0;font-size:10px;text-align:right;">EVw</div>'
+                                f'<div style="color:#8892b0;font-size:10px;text-align:right;">PF</div>'
+                                f'<div style="color:#e3b341;font-size:10px;text-align:right;">TP</div>'
+                                f'<div style="color:#8892b0;font-size:10px;text-align:right;">Newest bkt</div>'
+                                f'<div style="color:#8892b0;font-size:10px;text-align:right;">n/bars</div>'
+                                f'</div>'
+                                f'{_mgmt_rows_html}'
+                                f'</div>'
+                            )
+
+                    # ── Data provenance strip ──────────────────────────────────
+                    # Shows what historical data the backtest ran on so the user
+                    # knows whether the numbers are backed by enough history.
+                    _meta_bt       = _bt_res.get("meta", {}) or {}
+                    _bars_used_p   = _meta_bt.get("bars_used", 0)
+                    _bars_req_p    = _meta_bt.get("bars_requested", 0)
+                    _coverage_p    = _meta_bt.get("bars_coverage", "—")
+                    _bkt_cnt_p     = _meta_bt.get("bucket_count", 1)
+                    _bkt_weights_p = _meta_bt.get("bucket_weights", [1.0])
+                    _bkt_labels_p  = _meta_bt.get("bucket_labels", ["All bars"])
+                    _bt_filter_r   = _meta_bt.get("filter_ratio")
+                    _bt_filt_mb    = _meta_bt.get("filter_min_body")
+                    _bt_filt_mv    = _meta_bt.get("filter_min_vol")
+
+                    _is_short_history = (_bars_req_p > 0 and _bars_used_p < _bars_req_p * 0.9)
+                    _weights_str = " → ".join(f"{int(w*100)}%" for w in _bkt_weights_p)
+                    _provenance_note = (
+                        f"⚠️ Coin is new: only {_bars_used_p} bars available (requested {_bars_req_p})"
+                        if _is_short_history else
+                        f"📅 {_bars_used_p} bars used"
+                    )
+
+                    # Filter ratio badge — same colour scheme as ML card
+                    if _bt_filter_r is not None:
+                        _br_pct = int(_bt_filter_r * 100)
+                        if _bt_filter_r >= 0.55:
+                            _br_color = "#3fb950"
+                            _br_label = f"STRICT {_br_pct}%"
+                        elif _bt_filter_r >= 0.35:
+                            _br_color = "#e3b341"
+                            _br_label = f"RELAXED {_br_pct}%"
+                        else:
+                            _br_color = "#f0883e"
+                            _br_label = f"LOOSE {_br_pct}%"
+                        _filter_badge_bt = (
+                            f' · <span style="color:{_br_color};font-weight:700;'
+                            f'border:1px solid {_br_color};padding:1px 6px;border-radius:3px;" '
+                            f'title="Backtest analog filter ratchet — body≥{(_bt_filt_mb or 0):.2f}, vol≥{(_bt_filt_mv or 0):.2f}">'
+                            f'🔍 {_br_label}</span>'
+                        )
+                    else:
+                        _filter_badge_bt = ""
+
+                    # Regime weighting badge — shows the current regime score the
+                    # backtest is biasing toward. Historical analogs in the same
+                    # regime contribute fully; opposite-regime analogs contribute
+                    # at the 0.15 floor.
+                    _bt_regime_w = _meta_bt.get("regime_weighted", False)
+                    _bt_curr_rs  = _meta_bt.get("current_regime_score")
+                    if _bt_regime_w and _bt_curr_rs is not None:
+                        if _bt_curr_rs >= 67:
+                            _rg_color = "#3fb950"
+                            _rg_label = f"GREEN {int(_bt_curr_rs)}"
+                        elif _bt_curr_rs >= 50:
+                            _rg_color = "#e3b341"
+                            _rg_label = f"YELLOW {int(_bt_curr_rs)}"
+                        else:
+                            _rg_color = "#f85149"
+                            _rg_label = f"RED {int(_bt_curr_rs)}"
+                        _regime_badge_bt = (
+                            f' · <span style="color:{_rg_color};font-weight:700;'
+                            f'border:1px solid {_rg_color};padding:1px 6px;border-radius:3px;" '
+                            f'title="Soft regime filter — historical analogs are weighted by similarity to today\'s regime score. Same-regime analogs count fully; opposite-regime analogs count at 15% floor.">'
+                            f'🎯 REGIME {_rg_label}</span>'
+                        )
+                    else:
+                        _regime_badge_bt = ""
+
+                    _provenance_html = (
+                        f'<div style="background:#0d1117;border:1px solid #21262d;border-radius:6px;'
+                        f'padding:8px 12px;margin-top:10px;font-family:monospace;">'
+                        f'<div style="color:#58a6ff;font-size:10px;text-transform:uppercase;'
+                        f'letter-spacing:1px;font-weight:700;margin-bottom:4px;">📊 Backtest Data &amp; Time-Decay Scheme</div>'
+                        f'<div style="color:#ccd6f6;font-size:11px;">'
+                        f'{_provenance_note} · Coverage: {_coverage_p}{_filter_badge_bt}{_regime_badge_bt}'
+                        f'</div>'
+                        f'<div style="color:#8892b0;font-size:10px;margin-top:3px;">'
+                        f'Time-decay: {_bkt_cnt_p} buckets (oldest→newest) with weights [{_weights_str}] · '
+                        f'Candidate A = best WR/EV in newest bucket · Candidate B = best by weighted-EV all-time'
+                        f'</div>'
+                        f'</div>'
+                    ) if _bt_valid else ""
+
+                    # ── Time-decay bucket breakdown for the BEST method ────────
+                    # Shows how the edge evolved over time for the winning method.
+                    _best_buckets_html = ""
+                    _best_for_buckets = _best if _best else {}
+                    _best_buckets     = _best_for_buckets.get("buckets", []) if _best_for_buckets else []
+                    if _best_buckets and _bt_valid:
+                        _bkt_row_html = ""
+                        for _br in _best_buckets:
+                            _br_wr = _br.get("wr", 0)
+                            _br_ev = _br.get("ev", 0)
+                            _br_n  = _br.get("n",  0)
+                            _br_w  = _br.get("weight", 1.0)
+                            _br_lb = _br.get("label", "—")
+                            _wr_c  = _wr_color(_br_wr) if _br_n > 0 else "#444"
+                            _ev_c  = _ev_color(_br_ev) if _br_n > 0 else "#444"
+                            _bkt_row_html += (
+                                f'<div style="display:grid;grid-template-columns:1.6fr 0.6fr 1fr 1fr 1fr;'
+                                f'gap:4px;padding:4px 6px;border-bottom:1px solid #1a1f2e;font-size:11px;">'
+                                f'<div style="color:#ccd6f6;">{_br_lb}</div>'
+                                f'<div style="color:#8892b0;text-align:right;">×{_br_w:.2f}</div>'
+                                f'<div style="color:{_wr_c};text-align:right;font-weight:700;">{_br_wr:.1f}%</div>'
+                                f'<div style="color:{_ev_c};text-align:right;font-weight:700;">{_br_ev:+.2f}R</div>'
+                                f'<div style="color:#8892b0;text-align:right;">n={_br_n}</div>'
+                                f'</div>'
+                            )
+                        _best_buckets_html = (
+                            f'<div style="margin-top:8px;border:1px solid #21262d;border-radius:6px;overflow:hidden;">'
+                            f'<div style="background:#161b22;padding:6px 8px;color:#58a6ff;font-size:10px;'
+                            f'text-transform:uppercase;letter-spacing:1px;font-weight:700;border-bottom:1px solid #30363d;">'
+                            f'⏱ Time-Decay Breakdown — Best Method ({_best_for_buckets.get("zone","?")} / '
+                            f'{_best_for_buckets.get("sl_label","?")} / {_best_for_buckets.get("mgmt","?")} / '
+                            f'TP{_best_for_buckets.get("tp_mult",2.0):.1f}R)'
+                            f'</div>'
+                            f'<div style="background:#161b22;display:grid;grid-template-columns:1.6fr 0.6fr 1fr 1fr 1fr;'
+                            f'gap:4px;padding:4px 6px;border-bottom:1px solid #30363d;">'
+                            f'<div style="color:#8892b0;font-size:10px;">Bucket</div>'
+                            f'<div style="color:#8892b0;font-size:10px;text-align:right;">Weight</div>'
+                            f'<div style="color:#8892b0;font-size:10px;text-align:right;">WR%</div>'
+                            f'<div style="color:#8892b0;font-size:10px;text-align:right;">EV</div>'
+                            f'<div style="color:#8892b0;font-size:10px;text-align:right;">Trades</div>'
+                            f'</div>'
+                            f'{_bkt_row_html}'
+                            f'</div>'
+                        )
+
+                    _bt_rows = (
+                        (
+                            f'<div style="margin-top:10px;padding-top:8px;border-top:1px solid #21262d;">'
+                            f'<div style="color:#58a6ff;font-size:11px;text-transform:uppercase;'
+                            f'letter-spacing:1px;font-weight:700;margin-bottom:8px;">'
+                            f'🎯 Top Candidates — Chosen from Time-Decay Analysis</div>'
+                            + _provenance_html
+                            + _candidate_cards_html
+                            + _best_buckets_html
+                            + f'</div>'
+                        ) if _bt_valid else
+                        f'<div style="color:#8892b0;font-size:12px;padding:5px 0;">📊 Backtest: {_bt_res.get("error","No matching setups")}</div>'
+                    )
+
+                    # AI verdict block
+                    _ai_block = ""
+                    if _ai_res:
+                        # Handle legacy single-verdict fallback (shouldn't happen but safe)
+                        if not _ai_res.get("dual"):
+                            # Legacy format wrapper
+                            _ai_res = {
+                                "dual": True,
+                                "candidate_a": {
+                                    "verdict":   _ai_res.get("verdict", "WAIT"),
+                                    "confidence":_ai_res.get("confidence", "MEDIUM"),
+                                    "rationale": _ai_res.get("rationale", ""),
+                                    "execution": _ai_res.get("execution", ""),
+                                    "risk":      _ai_res.get("risk", ""),
+                                    "conflicts": _ai_res.get("conflicts", ""),
+                                },
+                                "candidate_b": {
+                                    "verdict": "—", "confidence": "",
+                                    "rationale": "", "execution": "", "risk": "", "conflicts": "",
+                                },
+                                "winner": "A", "winner_rationale": "",
+                                "unanimous": True,
+                                "source": _ai_res.get("source", ""),
+                            }
+
+                        _cA = _ai_res.get("candidate_a", {}) or {}
+                        _cB = _ai_res.get("candidate_b", {}) or {}
+                        _winner = _ai_res.get("winner", "NONE")
+                        _winner_why = _ai_res.get("winner_rationale", "")
+                        _unanimous_ai = _ai_res.get("unanimous", False)
+                        _src = _ai_res.get("source", "")
+
+                        def _render_cand_verdict(c, letter, accent, title, is_winner):
+                            _v = c.get("verdict", "WAIT")
+                            _cc= c.get("confidence", "")
+                            _v_color = ("#3fb950" if _v == "TRADE"
+                                        else "#e3b341" if _v == "WAIT"
+                                        else "#f85149" if _v == "NO TRADE"
+                                        else "#8892b0")
+                            _v_bg    = ("#091a0d" if _v == "TRADE"
+                                        else "#1a1500" if _v == "WAIT"
+                                        else "#1a0505" if _v == "NO TRADE"
+                                        else "#0d1117")
+                            _c_badge = (f'<span style="background:#1f2b1f;color:#3fb950;font-size:9px;'
+                                        f'border-radius:3px;padding:1px 5px;margin-left:5px;">{_cc}</span>'
+                                        if _cc in ("HIGH", "MEDIUM", "LOW") else "")
+                            _winner_badge = (
+                                f'<span style="background:#2d2200;color:#ffd700;font-size:10px;'
+                                f'border-radius:3px;padding:2px 6px;margin-left:6px;font-weight:800;">👑 WINNER</span>'
+                                if is_winner else ""
+                            )
+
+                            _exec_str = c.get("execution", "")
+                            _exec_row = (
+                                f'<div style="background:#0a1628;border:1px solid #1f6feb;border-radius:4px;'
+                                f'padding:6px 8px;margin-top:6px;">'
+                                f'<div style="color:#58a6ff;font-size:9px;text-transform:uppercase;'
+                                f'letter-spacing:1px;margin-bottom:2px;">📋 Execution</div>'
+                                f'<div style="color:#ccd6f6;font-size:11px;line-height:1.5;">{_exec_str}</div>'
+                                f'</div>'
+                            ) if _exec_str else ""
+
+                            _conflicts_str = c.get("conflicts", "")
+                            _conflicts_is_clean = (not _conflicts_str
+                                                   or _conflicts_str.lower() == "none detected"
+                                                   or _conflicts_str.lower() == "none")
+                            if _conflicts_is_clean:
+                                _conflicts_row = (
+                                    f'<div style="background:#0a1a0a;border-radius:4px;padding:5px 8px;margin-top:4px;">'
+                                    f'<span style="color:#3fb950;font-size:9px;text-transform:uppercase;">✅ Conflicts:</span>'
+                                    f'<span style="color:#ccd6f6;font-size:10px;"> None detected</span></div>'
+                                )
+                            elif _conflicts_str:
+                                _conflicts_row = (
+                                    f'<div style="background:#1a1500;border-radius:4px;padding:5px 8px;margin-top:4px;">'
+                                    f'<span style="color:#e3b341;font-size:9px;text-transform:uppercase;">⚠️ Conflicts:</span>'
+                                    f'<span style="color:#ccd6f6;font-size:10px;"> {_conflicts_str}</span></div>'
+                                )
+                            else:
+                                _conflicts_row = ""
+
+                            _risk_str = c.get("risk", "")
+                            _risk_row = (
+                                f'<div style="background:#1a0a0a;border-radius:4px;padding:5px 8px;margin-top:4px;">'
+                                f'<span style="color:#e3b341;font-size:9px;text-transform:uppercase;">⚠️ Risk:</span>'
+                                f'<span style="color:#ccd6f6;font-size:10px;"> {_risk_str}</span></div>'
+                            ) if _risk_str else ""
+
+                            return (
+                                f'<div style="background:{_v_bg};border:1px solid {accent};'
+                                f'border-radius:6px;padding:10px 12px;">'
+                                f'<div style="color:{accent};font-size:10px;font-weight:700;'
+                                f'text-transform:uppercase;letter-spacing:1px;margin-bottom:4px;">'
+                                f'{letter} · {title}{_winner_badge}</div>'
+                                f'<div style="color:{_v_color};font-size:20px;font-weight:900;margin-bottom:4px;">'
+                                f'{_v}{_c_badge}</div>'
+                                f'<div style="color:#ccd6f6;font-size:11px;line-height:1.5;">'
+                                f'{c.get("rationale","")}</div>'
+                                + _exec_row
+                                + _conflicts_row
+                                + _risk_row
+                                + f'</div>'
+                            )
+
+                        if _unanimous_ai:
+                            # Single card
+                            _ai_cards_html = _render_cand_verdict(
+                                _cA, "🟢 A ≡ B", "#3fb950",
+                                "UNANIMOUS Analysis",
+                                is_winner=True,
+                            )
+                        else:
+                            _cardA = _render_cand_verdict(
+                                _cA, "🟢 A", "#238636",
+                                "Best Newest-Bucket",
+                                is_winner=(_winner == "A"),
+                            )
+                            _cardB = _render_cand_verdict(
+                                _cB, "🔵 B", "#1f6feb",
+                                "Best Weighted All-Time",
+                                is_winner=(_winner == "B"),
+                            )
+                            _ai_cards_html = (
+                                f'<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">'
+                                f'{_cardA}{_cardB}</div>'
+                            )
+
+                        # Winner banner (only when dual and one is picked)
+                        _winner_banner = ""
+                        if not _unanimous_ai and _winner in ("A", "B") and _winner_why:
+                            _w_color = "#3fb950" if _winner == "A" else "#58a6ff"
+                            _w_bg    = "#091a0d" if _winner == "A" else "#0a1628"
+                            _ab_trade_a = _cA.get("verdict") == "TRADE"
+                            _ab_trade_b = _cB.get("verdict") == "TRADE"
+                            if _ab_trade_a and _ab_trade_b:
+                                _banner_label = f"👑 AI Recommends Candidate {_winner}"
+                            elif _ab_trade_a or _ab_trade_b:
+                                _banner_label = f"👑 Only Candidate {_winner} is Tradeable"
+                            else:
+                                _banner_label = "⚠️ Neither Candidate is Tradeable"
+                            _winner_banner = (
+                                f'<div style="margin-top:10px;background:{_w_bg};'
+                                f'border:2px solid {_w_color};border-radius:8px;padding:10px 14px;">'
+                                f'<div style="color:{_w_color};font-size:12px;font-weight:800;'
+                                f'text-transform:uppercase;letter-spacing:1px;margin-bottom:4px;">'
+                                f'{_banner_label}</div>'
+                                f'<div style="color:#ccd6f6;font-size:12px;line-height:1.5;">'
+                                f'{_winner_why}</div></div>'
+                            )
+                        elif _winner == "NONE" and not _unanimous_ai:
+                            # Both untradeable or parse error
+                            _winner_banner = (
+                                f'<div style="margin-top:10px;background:#1a0a0a;'
+                                f'border:2px solid #6b2222;border-radius:8px;padding:10px 14px;">'
+                                f'<div style="color:#ff6b6b;font-size:12px;font-weight:800;'
+                                f'text-transform:uppercase;letter-spacing:1px;">'
+                                f'⚠️ No Clear Winner</div>'
+                                f'<div style="color:#ccd6f6;font-size:11px;margin-top:4px;">'
+                                f'{_winner_why or "Neither candidate passed the decision rules — wait for better conditions."}</div></div>'
+                            )
+
+                        _ai_block = (
+                            f'<div style="margin-top:12px;padding-top:12px;border-top:1px solid #21262d;">'
+                            f'<div style="color:#8892b0;font-size:10px;text-transform:uppercase;'
+                            f'letter-spacing:1px;margin-bottom:8px;">'
+                            f'🤖 AI Dual-Candidate Analysis{" (Unanimous)" if _unanimous_ai else ""}</div>'
+                            + _ai_cards_html
+                            + _winner_banner
+                            + (f'<div style="color:#3a3f4b;font-size:10px;margin-top:6px;">{_src}</div>'
+                               if _src and _src != "error" else "")
+                            + f'</div>'
+                        )
+
+                    _ml_color = "#3fb950" if _ml_res["pct"] >= 70 else "#e3b341" if _ml_res["pct"] >= 55 else "#f85149"
+                    _edge_bt  = (
+                        f' · Best: {_best_key} WR={_best.get("win_rate",0):.0f}% EV={_best.get("ev",0):+.2f}R'
+                        if _bt_valid and _best_key else
+                        f' · {_bt_res["win_2r"]:.0f}% hist win · EV {_bt_res["ev_2r"]:+.2f}R'
+                        if _bt_valid else ""
+                    )
+                    _html = (
+                        f'<div style="background:#0d1117;border:1px solid #2d3250;border-radius:10px;padding:16px 20px;margin-top:8px;">'
+                        f'<div style="display:flex;align-items:center;gap:16px;padding-bottom:12px;border-bottom:1px solid #21262d;margin-bottom:12px;">'
+                        f'<div style="text-align:center;"><div style="color:#8892b0;font-size:10px;text-transform:uppercase;letter-spacing:1px;">Grade</div>'
+                        f'<div style="color:{_grade_color};font-size:40px;font-weight:900;line-height:1;">{_grade}</div></div>'
+                        f'<div><div style="color:#58a6ff;font-size:13px;font-weight:700;">📋 CONFLUENCE ANALYSIS</div>'
+                        f'<div style="color:#8892b0;font-size:12px;margin-top:2px;">{_grade_desc}</div></div></div>'
+                        f'<div style="display:flex;justify-content:space-between;padding:5px 0;">'
+                        f'<span style="color:#8892b0;font-size:12px;">🤖 ML Probability</span>'
+                        f'<span style="color:{_ml_color};font-size:13px;font-weight:700;">'
+                        f'{_ml_res["pct"]:.1f}% <span style="font-size:10px;color:#8892b0;">{_ml_res["label"]}</span></span></div>'
+                        + _bt_rows
+                        + _ml_card_html
+                        + _wfo_block_html
+                        + _intel_expander_html
+                        + f'<div style="margin-top:8px;padding-top:8px;border-top:1px solid #21262d;">'
+                        f'<div style="color:#8892b0;font-size:11px;text-transform:uppercase;letter-spacing:1px;margin-bottom:3px;">Edge Summary</div>'
+                        f'<div style="color:#ccd6f6;font-size:12px;">ML {_ml_res["pct"]:.0f}%'
+                        + _edge_bt
+                        + f' · Score {score_pct}/100 · {sig["regime"]} regime</div></div>'
+                        + _ai_block
+                        + f'</div>'
+                    )
+                    st.markdown(_html, unsafe_allow_html=True)
+
+                    # ── Pulse panel (on-chain + derivatives confluence) ──────────
+                    # Shows composite score + per-module badges + top whale txs.
+                    # Populated by Step 1 (via _scanner_fetch_pulse). Renders
+                    # nothing if Pulse wasn't fetched or the token isn't in any
+                    # module map — the helper returns an empty string in that case.
+                    _pulse_cached = st.session_state.get(f"pulse_{_sym_key}")
+                    if _pulse_cached:
+                        _pulse_html = _render_pulse_panel_html(_pulse_cached)
+                        if _pulse_html:
+                            st.markdown(_pulse_html, unsafe_allow_html=True)
+
+                    # ── Expanders for advanced details (collapsed by default) ─────
+                    if _bt_valid:
+                        # Expander 1: Full 4-zone comparison (Aggressive/Standard/Golden Fibo/Sniper)
+                        with st.expander("▸ View Full 4-Zone Comparison  (Aggressive / Standard / Golden Fibo / Sniper)", expanded=False):
+                            _zone_expander_html = (
+                                f'<div style="padding:6px 0;">'
+                                f'<div style="color:#8892b0;font-size:11px;margin-bottom:8px;">'
+                                f'Best config found for each of the four entry zones, '
+                                f'plus the legacy "EXECUTE THIS" recommendation.</div>'
+                                + _zone_table_rows
+                                + _recommendation_html
+                                + f'</div>'
+                            )
+                            st.markdown(_zone_expander_html, unsafe_allow_html=True)
+
+                        # Expander 2: Full method breakdown (all 96 combinations)
+                        if _mgmt_table:
+                            with st.expander("▸ Full Method Breakdown  (all 96 combinations sorted by EVw)", expanded=False):
+                                st.markdown(
+                                    f'<div style="padding:6px 0;">'
+                                    f'<div style="color:#8892b0;font-size:11px;margin-bottom:8px;">'
+                                    f'All tested combinations of Entry Zone × SL Method × Management × TP multiplier. '
+                                    f'Rows are sorted by <b>EVw (time-decay weighted EV)</b> so recent performance '
+                                    f'surfaces first. The crown 👑 marks the overall best.</div>'
+                                    + _mgmt_table
+                                    + f'</div>',
+                                    unsafe_allow_html=True,
+                                )
+                else:
+                    st.markdown(
+                        '<div style="color:#8892b0;font-size:12px;padding:8px 0;">'
+                        '▸ Click <b>Step 1</b> (Backtest + WFO) → <b>Step 2</b> (Train ML for Both Candidates) '
+                        '→ <b>Step 3</b> (AI Dual-Candidate Analysis).</div>',
+                        unsafe_allow_html=True,
+                    )
+
+    def _render_tf_tab(signals):
+        """Render Trend-Following (T1/T2) tab: banner, summary table, and signal cards."""
+        if not signals:
+            st.info(
+                "📭 No T1/T2 trend setups passed the current filters. "
+                "Check the sidebar tier checkboxes, or widen the Body / Vol / ADX range filters."
+            )
+            return
+
+        # ── TF banner ─────────────────────────────────────────────────────────
+        st.markdown(
+            '<div style="background:#0a1929;border:1px solid #1f4068;border-radius:8px;'
+            'padding:10px 16px;margin:8px 0;font-size:13px;color:#8fb8e8;">'
+            '📈 <b>Trend setups</b> — Body 0.50–0.80, Vol 1.5–2.5×, ADX 30–50. '
+            'Audit: T1 PF 1.14 (shorts 1.28 strong, longs 1.00 random), T2 PF 1.04 marginal.'
+            '</div>', unsafe_allow_html=True)
+
+        # ── TF summary table ──────────────────────────────────────────────────
+        summary_rows = []
+        for i, s in enumerate(signals):
+            _etp_s = s.get("_trade_plan", {})
+            _sc    = s.get("score") or 0
+            _sc    = float(_sc) if _sc == _sc else 0.0
+            _entry = s.get("entry") or 0
+            _entry = float(_entry) if _entry == _entry else 0.0
+            summary_rows.append({
+                "Rank":                  f"#{i+1}",
+                "Coin":                  s["symbol"].replace("USDT", ""),
+                "TF":                    s["timeframe"],
+                "Dir":                   ("LONG" if s["direction"] == "long" else "SHORT"),
+                "Score":                 _sc,
+                "Regime":                s["regime"],
+                "Body%":                 s["body_pct"],
+                "Vol×":                 s["vol_mult"],
+                "ADX":                   s["adx"],
+                "Agg Entry":             _entry,
+                "Std Entry (38.2%)": _etp_s.get("std_entry", _entry),
+                "Sniper Entry (78.6%)": _etp_s.get("sniper_entry", _entry),
+                "SL%":                   _etp_s.get("sl_dist_pct", 1.5),
+                "TP2 (Std)":             _etp_s.get("std_tp2", s["tp2r"]),
+            })
+        summary_df = pd.DataFrame(summary_rows)
+        st.dataframe(
+            summary_df,
+            use_container_width=True,
+            hide_index=True,
+            height=min(40 + len(signals) * 35, 750),
+            column_config={
+                "Score":                   st.column_config.NumberColumn(width=60,  format="%.1f"),
+                "Body%":                   st.column_config.NumberColumn(width=65,  format="%.1f"),
+                "Vol×":                   st.column_config.NumberColumn(width=55,  format="%.2f"),
+                "ADX":                     st.column_config.NumberColumn(width=55,  format="%.1f"),
+                "Agg Entry":               st.column_config.NumberColumn(width=95,  format="%.6g"),
+                "Std Entry (38.2%)": st.column_config.NumberColumn(width=115, format="%.6g"),
+                "Sniper Entry (78.6%)": st.column_config.NumberColumn(width=120, format="%.6g"),
+                "SL%":                     st.column_config.NumberColumn(width=60,  format="%.2f%%"),
+                "TP2 (Std)":               st.column_config.NumberColumn(width=100, format="%.6g"),
+            },
+        )
+
+        st.markdown("---")
+        st.markdown("### 📋 Detailed Signal Cards — Point-by-Point Analysis")
+        _render_cards_loop(signals)
+
+    def _render_ct_tab(signals):
+        """Render Countertrend (T3) tab: banner, summary table, and signal cards."""
+        if not signals:
+            st.info(
+                "📭 No T3 countertrend fades passed the current filters. "
+                "Check the sidebar tier checkboxes, or widen the Body / Vol range filters."
+            )
+            return
+
+        # ── CT banner ─────────────────────────────────────────────────────────
+        st.markdown(
+            '<div style="background:#1a0e2a;border:1px solid #4a2a6a;border-radius:8px;'
+            'padding:10px 16px;margin:8px 0;font-size:13px;color:#c8a8e8;">'
+            '🔄 <b>Countertrend fades</b> — Body 0.80–1.01, Vol 4.0+×, no ADX filter. '
+            'Audit: T3 PF 1.14 (LONG 1.33 strong fade-bear, SHORT 1.08 marginal fade-bull).'
+            '</div>', unsafe_allow_html=True)
+
+        # ── CT summary table (CT zones, no ADX) ───────────────────────────────
+        ct_summary_rows = []
+        for i, s in enumerate(signals):
+            _etp_s = s.get("_trade_plan", {})
+            _sc    = s.get("score") or 0
+            _sc    = float(_sc) if _sc == _sc else 0.0
+            _entry = s.get("entry") or 0
+            _entry = float(_entry) if _entry == _entry else 0.0
+            ct_summary_rows.append({
+                "Rank":           f"#{i+1}",
+                "Coin":           s["symbol"].replace("USDT", ""),
+                "TF":             s["timeframe"],
+                "Dir":            ("LONG" if s["direction"] == "long" else "SHORT"),
+                "Score":          _sc,
+                "Regime":         s["regime"],
+                "Body%":          s["body_pct"],
+                "Vol×":          s["vol_mult"],
+                "Agg Entry (0%)": _entry,
+                "Shallow (-10%)": _ct_entry_price(s, -0.10),
+                "Std CT (-27%)": _ct_entry_price(s, -0.27),
+                "Deep (-61.8%)": _ct_entry_price(s, -0.618),
+                "SL%":            _etp_s.get("sl_dist_pct", 1.5),
+                "TP2 (Std)":      _etp_s.get("std_tp2", s["tp2r"]),
+            })
+        ct_summary_df = pd.DataFrame(ct_summary_rows)
+        st.dataframe(
+            ct_summary_df,
+            use_container_width=True,
+            hide_index=True,
+            height=min(40 + len(signals) * 35, 750),
+            column_config={
+                "Score":          st.column_config.NumberColumn(width=60,  format="%.1f"),
+                "Body%":          st.column_config.NumberColumn(width=65,  format="%.1f"),
+                "Vol×":          st.column_config.NumberColumn(width=55,  format="%.2f"),
+                "Agg Entry (0%)": st.column_config.NumberColumn(width=100, format="%.6g"),
+                "Shallow (-10%)": st.column_config.NumberColumn(width=105, format="%.6g"),
+                "Std CT (-27%)": st.column_config.NumberColumn(width=100, format="%.6g"),
+                "Deep (-61.8%)": st.column_config.NumberColumn(width=105, format="%.6g"),
+                "SL%":            st.column_config.NumberColumn(width=60,  format="%.2f%%"),
+                "TP2 (Std)":      st.column_config.NumberColumn(width=100, format="%.6g"),
+            },
+        )
+
+        st.markdown("---")
+        st.markdown("### 📋 Detailed Signal Cards — Point-by-Point Analysis")
+        _render_cards_loop(signals)
+
+    st.markdown("---")
+    _tab_tf, _tab_ct = st.tabs([
+        f"📈 Trend Following (T1/T2) — {len(_tf_signals)}",
+        f"🔄 Countertrend (T3) — {len(_ct_signals)}",
+    ])
+
+    with _tab_tf:
+        _render_tf_tab(_tf_signals)
+
+    with _tab_ct:
+        _render_ct_tab(_ct_signals)
+
 
     # Download button
     st.markdown("---")
@@ -10536,7 +11155,175 @@ def _render_enhanced_trade_plan_html(sig: dict) -> str:
     )
 
 
-def _render_method_breakdown_table(bt_result: dict) -> str:
+def _render_ct_tier3_trade_plan_html(sig: dict, ct_method_results: dict) -> str:
+    """
+    CT-specialized Enhanced Trade Plan card for unified TIER_3 signals.
+    Replaces the trend-tier 4-zone card (Aggressive/Standard/Golden/Sniper)
+    with 4 CT zones (Aggressive/Shallow/Standard CT/Deep) using NEGATIVE
+    retracements that wait for the move to extend before fading.
+
+    Args:
+        sig: signal dict with body_pct, candle close, etc.
+        ct_method_results: method_results dict from _scanner_countertrend_quick_backtest
+                           when run with unified TIER_3 (24-method grid).
+                           May be empty/None — falls back to predicted entries only.
+
+    Returns:
+        HTML string ready for st.markdown(unsafe_allow_html=True).
+    """
+    direction = sig.get("direction", "short")    # this is the TRADE direction
+    # body_pct may be percent or fraction — auto-normalize
+    body_raw = abs(float(sig.get("body_pct", 0) or 0))
+    body_abs_frac = body_raw / 100.0 if body_raw > 1.5 else body_raw
+    close_v   = float(sig.get("close", 0) or 0)
+    if close_v <= 0:
+        return ""
+
+    # Body in price units: use sig['body_abs_price'] if present,
+    # else estimate from close × body_abs_frac × candle_range_pct (default 2%).
+    body_price = float(sig.get("body_abs_price", 0) or 0)
+    if body_price <= 0:
+        # Estimate: assume candle range is ~2% of close, body fills body_abs_frac
+        body_price = close_v * 0.02 * body_abs_frac
+        if body_price <= 0:
+            body_price = close_v * 0.005
+
+    # Entry math — entry_ret negative means wait for extension
+    def _entry_for(retrace: float) -> float:
+        if direction == "long":   # fading short candle, entry below close
+            entry = close_v + body_price * retrace    # retrace<0 → entry below
+            return max(entry, close_v * 0.85)
+        else:                      # fading long candle, entry above close
+            entry = close_v - body_price * retrace    # -retrace>0 → entry above
+            return min(entry, close_v * 1.15)
+
+    # Find best per-zone method from ct_method_results (if provided)
+    def _best_for_zone(zone_name: str) -> dict:
+        if not ct_method_results:
+            return {}
+        best = None
+        for k, m in ct_method_results.items():
+            if m.get("zone") != zone_name:
+                continue
+            if m.get("n", 0) < 3:
+                continue
+            if best is None or m.get("ev", 0) > best.get("ev", -999):
+                best = m
+        return best or {}
+
+    # Map zone_cfg names to the 4-zone display
+    zones = [
+        {"name": "Aggressive",  "retrace":  0.000,
+         "color_bg": "#091a1a", "color_border": "#1a4a3a", "color_accent": "#3fb950",
+         "label_html": "💥 Aggressive Entry (0%)",
+         "desc": "Immediate fade at trigger close. Highest fill rate, lowest R:R."},
+        {"name": "Shallow",     "retrace": -0.100,
+         "color_bg": "#0d1726", "color_border": "#1f3a5a", "color_accent": "#58a6ff",
+         "label_html": "🌊 Shallow Wait (-10%)",
+         "desc": "Wait for 10% body extension past close, then fade."},
+        {"name": "Standard CT", "retrace": -0.270,
+         "color_bg": "#1a1530", "color_border": "#3a2a5a", "color_accent": "#a78bfa",
+         "label_html": "🎯 Standard CT (-27%)",
+         "desc": "Wait for 27% extension. Balanced fill rate vs entry quality."},
+        {"name": "Deep",        "retrace": -0.618,
+         "color_bg": "#2a1015", "color_border": "#5a2a35", "color_accent": "#f97583",
+         "label_html": "🪨 Deep Exhaustion (-61.8%)",
+         "desc": "Wait for 61.8% exhaustion. Best entry, lowest fill rate."},
+    ]
+
+    def _fmt(v): return f"{v:.6g}" if v else "—"
+
+    zone_blocks = []
+    for z in zones:
+        entry_p = _entry_for(z["retrace"])
+        best    = _best_for_zone(z["name"])
+        # SL/TP from primary plan (use audit-best method per zone if available)
+        sl_label = best.get("sl_label", "atr_1.5x")
+        tp_R     = float(best.get("tp_mult", 2.0))
+        # Approximate SL/TP prices from entry
+        if sl_label == "fixed_1.5pct":
+            risk = entry_p * 0.015
+        else:
+            risk = entry_p * 0.02   # rough ATR proxy without df access here
+        if direction == "long":
+            sl = entry_p - risk
+            tp_2  = entry_p + risk * 2.0
+            tp_25 = entry_p + risk * 2.5
+            tp_3  = entry_p + risk * 3.0
+        else:
+            sl = entry_p + risk
+            tp_2  = entry_p - risk * 2.0
+            tp_25 = entry_p - risk * 2.5
+            tp_3  = entry_p - risk * 3.0
+
+        # Audit stats
+        if best:
+            stats_html = (
+                f'<div style="color:#8892b0;font-size:10px;margin-top:6px;">'
+                f'AUDIT (n={best.get("n", 0)}): '
+                f'WR <b style="color:#3fb950">{best.get("win_rate", 0):.0f}%</b> · '
+                f'EV <b style="color:#3fb950">{best.get("ev", 0):+.3f}R</b> · '
+                f'PF <b style="color:#3fb950">{best.get("pf", 0):.2f}</b>'
+                f'</div>'
+            )
+        else:
+            stats_html = (
+                '<div style="color:#8892b0;font-size:10px;margin-top:6px;font-style:italic;">'
+                'AUDIT: no historical fills (zone may rarely trigger on this coin)'
+                '</div>'
+            )
+
+        block = (
+            f'<div style="background:{z["color_bg"]};border:1px solid {z["color_border"]};'
+            f'border-radius:6px;padding:10px;">'
+            f'<div style="color:{z["color_accent"]};font-size:10px;text-transform:uppercase;'
+            f'letter-spacing:1px;margin-bottom:6px;font-weight:700;">{z["label_html"]}</div>'
+            f'<div style="color:#aab;font-size:10px;margin-bottom:8px;">{z["desc"]}</div>'
+            f'<div style="color:#8892b0;font-size:10px;">ENTRY</div>'
+            f'<div style="color:#ccd6f6;font-weight:700;font-size:13px;">{_fmt(entry_p)}</div>'
+            f'<div style="color:#8892b0;font-size:10px;margin-top:5px;">STOP LOSS ({sl_label})</div>'
+            f'<div style="color:#f97583;font-weight:700;font-size:13px;">{_fmt(sl)}</div>'
+            f'<div style="color:#8892b0;font-size:10px;margin-top:5px;">TP1 / TP2 / TP3</div>'
+            f'<div style="color:#3fb950;font-weight:700;font-size:12px;">'
+            f'{_fmt(tp_2)} / {_fmt(tp_25)} / {_fmt(tp_3)}</div>'
+            f'{stats_html}'
+            f'</div>'
+        )
+        zone_blocks.append(block)
+
+    # CT-specific freshness note
+    bar_off = sig.get("bar_offset", 1)
+    is_fresh = bar_off == 1
+    if is_fresh:
+        freshness = (
+            "<span style='color:#3fb950;font-weight:700;'>🟢 FRESH — exhaustion candle just closed.</span> "
+            "All four CT zones are valid. Negative retracement = wait for further extension before fading."
+        )
+    else:
+        freshness = (
+            f"<span style='color:#e3b341;font-weight:700;'>⚠️ Signal is {bar_off-1} candle(s) old.</span> "
+            "Aggressive zone may have already filled. Shallow / Standard CT / Deep zones still potentially valid."
+        )
+
+    html = (
+        f'<div style="margin:14px 0;padding:14px;background:#0d1f2d;border:2px solid #58a6ff;border-radius:8px;">'
+        f'<div style="color:#58a6ff;font-weight:700;font-size:14px;margin-bottom:6px;">'
+        f'🎯 Tier 3 CT Trade Plan — 4 Entry Zones × 2 SL × 3 TP</div>'
+        f'<div style="color:#ccd6f6;font-size:11px;margin-bottom:10px;line-height:1.5;">{freshness}</div>'
+        f'<div style="display:grid;grid-template-columns:repeat(2, 1fr);gap:10px;margin-bottom:12px;">'
+        + "".join(zone_blocks)
+        + f'</div>'
+        f'<div style="background:#0a1521;border-top:1px solid #1a4a3a;padding:8px 10px;'
+        f'border-radius:4px;font-size:10px;color:#8892b0;line-height:1.6;">'
+        f'<b style="color:#58a6ff;">CT entry semantics:</b> negative retracement = wait for the original '
+        f'move to extend further before fading. '
+        f'<b style="color:#58a6ff;">SL methods tested:</b> atr_1.5x (volatility-tracking) and fixed_1.5pct (conservative cap). '
+        f'<b style="color:#58a6ff;">TP multiples tested:</b> 2R / 2.5R / 3R. '
+        f'Audit stats shown per zone show the best (highest EV) SL/TP combination for that zone.'
+        f'</div>'
+        f'</div>'
+    )
+    return html
     """
     Build the 'Full Method Breakdown' table HTML — all 96 method combinations
     sorted by EVw with the 👑 crown on the best. Used by both Scanner and
@@ -11208,7 +11995,18 @@ def render_manual_analyzer_tab():
     # ── Enhanced Trade Plan card (3 entry zones + management plan) ──────────
     # Same component the Scanner tab uses. Shows Aggressive / Standard / Sniper
     # entries with SL + TP1/2/3, structural zone validity, and the 4 mgmt modes.
-    _etp_html = _render_enhanced_trade_plan_html(sig)
+    # For unified TIER_3 countertrend signals, routes to the CT-specialized card.
+    _primary_match_etp = (sig.get("_qf_matches") or [{}])[0]
+    _is_unified_t3_etp = (
+        _primary_match_etp.get("_unified_tier") == "TIER_3"
+        or (_primary_match_etp.get("name") == "TIER_3"
+            and _primary_match_etp.get("combo_type") == "countertrend")
+    )
+    if _is_unified_t3_etp:
+        _ct_method_results_etp = sig.get("_bt_method_results") or {}
+        _etp_html = _render_ct_tier3_trade_plan_html(sig, _ct_method_results_etp)
+    else:
+        _etp_html = _render_enhanced_trade_plan_html(sig)
     if _etp_html:
         st.markdown(_etp_html, unsafe_allow_html=True)
 
