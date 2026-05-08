@@ -7786,7 +7786,7 @@ def render_auto_analyzer(ticker: str, df_full_1d: pd.DataFrame, tc: float,
     _reg_color = {"GREEN": "#3fb950", "YELLOW": "#e3b341", "RED": "#f85149"}
 
     def _ct_entry_price(sig: dict, retrace: float) -> float:
-        """Compute CT extension entry price. Same formula as _render_ct_tier3_trade_plan_html."""
+        """CT extension price — same formula as _render_ct_tier3_trade_plan_html."""
         direction  = sig.get("direction", "short")
         body_raw   = abs(float(sig.get("body_pct", 0) or 0))
         body_frac  = body_raw / 100.0 if body_raw > 1.5 else body_raw
@@ -7808,7 +7808,7 @@ def render_auto_analyzer(ticker: str, df_full_1d: pd.DataFrame, tc: float,
     def _render_cards_loop(signals):
         """Shared detailed signal cards loop — used by both TF and CT tabs.
         Contains the single call site for _render_ct_tier3_trade_plan_html
-        (routing is preserved: T3 signals get CT card, others get trend card)."""
+        (routing preserved: T3 signals get CT card, others get trend card)."""
         # Detailed cards
         for i, sig in enumerate(signals):
             dir_color   = "#64ffda" if sig["direction"] == "long"  else "#ff6b6b"
@@ -8049,148 +8049,148 @@ def render_auto_analyzer(ticker: str, df_full_1d: pd.DataFrame, tc: float,
                         # ── Standard zone HTML ────────────────────────────────────
                         if _std_valid:
                             _std_zone_html = f"""
-      <div style="background:#091a1a;border:1px solid #1a4a3a;border-radius:6px;padding:10px;">
-        <div style="color:#3fb950;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;">
-          ✅ Standard Entry (38.2%)</div>
-        <div style="color:#aab;font-size:10px;margin-bottom:8px;">Wait for 38.2% retrace into candle body. Recommended default.</div>
-        <div style="color:#8892b0;font-size:10px;">ENTRY</div>
-        <div style="color:#ccd6f6;font-weight:700;font-size:13px;">{_fmt(_etp['std_entry'])}</div>
-        <div style="color:#8892b0;font-size:10px;margin-top:5px;">STOP LOSS</div>
-        <div style="color:#ff6b6b;font-weight:700;font-size:13px;">{_fmt(_etp['std_sl'])}</div>
-        <div style="color:#8892b0;font-size:10px;margin-top:5px;">TP1 / TP2 / TP3</div>
-        <div style="color:#64ffda;font-size:12px;">{_fmt(_etp['std_tp1'])} / {_fmt(_etp['std_tp2'])} / {_fmt(_etp['std_tp3'])}</div>
-      </div>"""
+  <div style="background:#091a1a;border:1px solid #1a4a3a;border-radius:6px;padding:10px;">
+    <div style="color:#3fb950;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;">
+      ✅ Standard Entry (38.2%)</div>
+    <div style="color:#aab;font-size:10px;margin-bottom:8px;">Wait for 38.2% retrace into candle body. Recommended default.</div>
+    <div style="color:#8892b0;font-size:10px;">ENTRY</div>
+    <div style="color:#ccd6f6;font-weight:700;font-size:13px;">{_fmt(_etp['std_entry'])}</div>
+    <div style="color:#8892b0;font-size:10px;margin-top:5px;">STOP LOSS</div>
+    <div style="color:#ff6b6b;font-weight:700;font-size:13px;">{_fmt(_etp['std_sl'])}</div>
+    <div style="color:#8892b0;font-size:10px;margin-top:5px;">TP1 / TP2 / TP3</div>
+    <div style="color:#64ffda;font-size:12px;">{_fmt(_etp['std_tp1'])} / {_fmt(_etp['std_tp2'])} / {_fmt(_etp['std_tp3'])}</div>
+  </div>"""
                         else:
                             _sl_pct_used = _etp.get("sl_dist_pct", 0)
                             _std_zone_html = f"""
-      <div style="background:#1a0a0a;border:2px solid #6b2222;border-radius:6px;padding:10px;opacity:0.75;">
-        <div style="color:#ff6b6b;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;">
-          ❌ Standard Entry — UNAVAILABLE</div>
-        <div style="color:#cc8888;font-size:11px;line-height:1.4;">
-          Candle body is too large relative to the structural SL distance
-          ({_sl_pct_used:.1f}%). The 38.2% retrace zone falls at or beyond the
-          stop-loss level — entering here would mean your SL is already hit.
-          <br><br><strong style="color:#ffaa88;">Use Aggressive zone only.</strong>
-        </div>
-      </div>"""
+  <div style="background:#1a0a0a;border:2px solid #6b2222;border-radius:6px;padding:10px;opacity:0.75;">
+    <div style="color:#ff6b6b;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;">
+      ❌ Standard Entry — UNAVAILABLE</div>
+    <div style="color:#cc8888;font-size:11px;line-height:1.4;">
+      Candle body is too large relative to the structural SL distance
+      ({_sl_pct_used:.1f}%). The 38.2% retrace zone falls at or beyond the
+      stop-loss level — entering here would mean your SL is already hit.
+      <br><br><strong style="color:#ffaa88;">Use Aggressive zone only.</strong>
+    </div>
+  </div>"""
 
                         # ── Golden Fibo zone HTML (Apr 25 — 61.8%) ────────────────
                         if _golden_valid:
                             _golden_zone_html = f"""
-      <div style="background:#1a1208;border:1px solid #5a4015;border-radius:6px;padding:10px;">
-        <div style="color:#e3b341;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;">
-          🥇 Golden Fibo Entry (61.8%)</div>
-        <div style="color:#aab;font-size:10px;margin-bottom:8px;">Wait for 61.8% golden ratio retrace. Balanced R:R + fill rate.</div>
-        <div style="color:#8892b0;font-size:10px;">ENTRY</div>
-        <div style="color:#ccd6f6;font-weight:700;font-size:13px;">{_fmt(_etp['golden_entry'])}</div>
-        <div style="color:#8892b0;font-size:10px;margin-top:5px;">STOP LOSS</div>
-        <div style="color:#ff6b6b;font-weight:700;font-size:13px;">{_fmt(_etp['golden_sl'])}</div>
-        <div style="color:#8892b0;font-size:10px;margin-top:5px;">TP1 / TP2 / TP3</div>
-        <div style="color:#64ffda;font-size:12px;">{_fmt(_etp['golden_tp1'])} / {_fmt(_etp['golden_tp2'])} / {_fmt(_etp['golden_tp3'])}</div>
-      </div>"""
+  <div style="background:#1a1208;border:1px solid #5a4015;border-radius:6px;padding:10px;">
+    <div style="color:#e3b341;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;">
+      🥇 Golden Fibo Entry (61.8%)</div>
+    <div style="color:#aab;font-size:10px;margin-bottom:8px;">Wait for 61.8% golden ratio retrace. Balanced R:R + fill rate.</div>
+    <div style="color:#8892b0;font-size:10px;">ENTRY</div>
+    <div style="color:#ccd6f6;font-weight:700;font-size:13px;">{_fmt(_etp['golden_entry'])}</div>
+    <div style="color:#8892b0;font-size:10px;margin-top:5px;">STOP LOSS</div>
+    <div style="color:#ff6b6b;font-weight:700;font-size:13px;">{_fmt(_etp['golden_sl'])}</div>
+    <div style="color:#8892b0;font-size:10px;margin-top:5px;">TP1 / TP2 / TP3</div>
+    <div style="color:#64ffda;font-size:12px;">{_fmt(_etp['golden_tp1'])} / {_fmt(_etp['golden_tp2'])} / {_fmt(_etp['golden_tp3'])}</div>
+  </div>"""
                         else:
                             _sl_pct_used = _etp.get("sl_dist_pct", 0)
                             _golden_zone_html = f"""
-      <div style="background:#1a0a0a;border:2px solid #6b2222;border-radius:6px;padding:10px;opacity:0.75;">
-        <div style="color:#ff6b6b;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;">
-          ❌ Golden Fibo Entry — UNAVAILABLE</div>
-        <div style="color:#cc8888;font-size:11px;line-height:1.4;">
-          Candle body is too large relative to the structural SL distance
-          ({_sl_pct_used:.1f}%). The 61.8% retrace zone falls at or beyond the
-          stop-loss level — entering here would mean your SL is already hit.
-          <br><br><strong style="color:#ffaa88;">Use Aggressive or Standard zone only.</strong>
-        </div>
-      </div>"""
+  <div style="background:#1a0a0a;border:2px solid #6b2222;border-radius:6px;padding:10px;opacity:0.75;">
+    <div style="color:#ff6b6b;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;">
+      ❌ Golden Fibo Entry — UNAVAILABLE</div>
+    <div style="color:#cc8888;font-size:11px;line-height:1.4;">
+      Candle body is too large relative to the structural SL distance
+      ({_sl_pct_used:.1f}%). The 61.8% retrace zone falls at or beyond the
+      stop-loss level — entering here would mean your SL is already hit.
+      <br><br><strong style="color:#ffaa88;">Use Aggressive or Standard zone only.</strong>
+    </div>
+  </div>"""
 
                         # ── Sniper zone HTML (Apr 25 — moved to 78.6%) ────────────
                         if _sniper_valid:
                             _sniper_zone_html = f"""
-      <div style="background:#14100a;border:1px solid #4a3a1a;border-radius:6px;padding:10px;">
-        <div style="color:#e3b341;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;">
-          🎯 Sniper Entry (78.6%)</div>
-        <div style="color:#aab;font-size:10px;margin-bottom:8px;">Wait for 78.6% Fib retrace. Best R:R, lowest fill probability.</div>
-        <div style="color:#8892b0;font-size:10px;">ENTRY</div>
-        <div style="color:#ccd6f6;font-weight:700;font-size:13px;">{_fmt(_etp['sniper_entry'])}</div>
-        <div style="color:#8892b0;font-size:10px;margin-top:5px;">STOP LOSS</div>
-        <div style="color:#ff6b6b;font-weight:700;font-size:13px;">{_fmt(_etp['sniper_sl'])}</div>
-        <div style="color:#8892b0;font-size:10px;margin-top:5px;">TP1 / TP2 / TP3</div>
-        <div style="color:#64ffda;font-size:12px;">{_fmt(_etp['sniper_tp1'])} / {_fmt(_etp['sniper_tp2'])} / {_fmt(_etp['sniper_tp3'])}</div>
-      </div>"""
+  <div style="background:#14100a;border:1px solid #4a3a1a;border-radius:6px;padding:10px;">
+    <div style="color:#e3b341;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;">
+      🎯 Sniper Entry (78.6%)</div>
+    <div style="color:#aab;font-size:10px;margin-bottom:8px;">Wait for 78.6% Fib retrace. Best R:R, lowest fill probability.</div>
+    <div style="color:#8892b0;font-size:10px;">ENTRY</div>
+    <div style="color:#ccd6f6;font-weight:700;font-size:13px;">{_fmt(_etp['sniper_entry'])}</div>
+    <div style="color:#8892b0;font-size:10px;margin-top:5px;">STOP LOSS</div>
+    <div style="color:#ff6b6b;font-weight:700;font-size:13px;">{_fmt(_etp['sniper_sl'])}</div>
+    <div style="color:#8892b0;font-size:10px;margin-top:5px;">TP1 / TP2 / TP3</div>
+    <div style="color:#64ffda;font-size:12px;">{_fmt(_etp['sniper_tp1'])} / {_fmt(_etp['sniper_tp2'])} / {_fmt(_etp['sniper_tp3'])}</div>
+  </div>"""
                         else:
                             _sl_pct_used = _etp.get("sl_dist_pct", 0)
                             _sniper_zone_html = f"""
-      <div style="background:#1a0a0a;border:2px solid #6b2222;border-radius:6px;padding:10px;opacity:0.75;">
-        <div style="color:#ff6b6b;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;">
-          ❌ Sniper Entry — UNAVAILABLE</div>
-        <div style="color:#cc8888;font-size:11px;line-height:1.4;">
-          Candle body is too large relative to the structural SL distance
-          ({_sl_pct_used:.1f}%). The 78.6% retrace zone falls at or beyond the
-          stop-loss level — entering here would mean your SL is already hit.
-          <br><br><strong style="color:#ffaa88;">Use Aggressive or Standard zone only.</strong>
-        </div>
-      </div>"""
+  <div style="background:#1a0a0a;border:2px solid #6b2222;border-radius:6px;padding:10px;opacity:0.75;">
+    <div style="color:#ff6b6b;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;">
+      ❌ Sniper Entry — UNAVAILABLE</div>
+    <div style="color:#cc8888;font-size:11px;line-height:1.4;">
+      Candle body is too large relative to the structural SL distance
+      ({_sl_pct_used:.1f}%). The 78.6% retrace zone falls at or beyond the
+      stop-loss level — entering here would mean your SL is already hit.
+      <br><br><strong style="color:#ffaa88;">Use Aggressive or Standard zone only.</strong>
+    </div>
+  </div>"""
 
                         _zone_rows = f"""
-    <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:6px;margin:10px 0;">
+<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:6px;margin:10px 0;">
 
-      <div style="background:#0a1628;border:1px solid #1f3a5f;border-radius:6px;padding:10px;">
-        <div style="color:#8892b0;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;">
-          ⚡ Aggressive Entry</div>
-        <div style="color:#aab;font-size:10px;margin-bottom:8px;">Enter at candle close. Highest fill chance, lowest R:R.</div>
-        <div style="color:#8892b0;font-size:10px;">ENTRY</div>
-        <div style="color:#ccd6f6;font-weight:700;font-size:13px;">{_fmt(_etp['agg_entry'])}</div>
-        <div style="color:#8892b0;font-size:10px;margin-top:5px;">STOP LOSS</div>
-        <div style="color:#ff6b6b;font-weight:700;font-size:13px;">{_fmt(_etp['agg_sl'])}</div>
-        <div style="color:#8892b0;font-size:10px;margin-top:5px;">TP1 / TP2 / TP3</div>
-        <div style="color:#64ffda;font-size:12px;">{_fmt(_etp['agg_tp1'])} / {_fmt(_etp['agg_tp2'])} / {_fmt(_etp['agg_tp3'])}</div>
-      </div>
+  <div style="background:#0a1628;border:1px solid #1f3a5f;border-radius:6px;padding:10px;">
+    <div style="color:#8892b0;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;">
+      ⚡ Aggressive Entry</div>
+    <div style="color:#aab;font-size:10px;margin-bottom:8px;">Enter at candle close. Highest fill chance, lowest R:R.</div>
+    <div style="color:#8892b0;font-size:10px;">ENTRY</div>
+    <div style="color:#ccd6f6;font-weight:700;font-size:13px;">{_fmt(_etp['agg_entry'])}</div>
+    <div style="color:#8892b0;font-size:10px;margin-top:5px;">STOP LOSS</div>
+    <div style="color:#ff6b6b;font-weight:700;font-size:13px;">{_fmt(_etp['agg_sl'])}</div>
+    <div style="color:#8892b0;font-size:10px;margin-top:5px;">TP1 / TP2 / TP3</div>
+    <div style="color:#64ffda;font-size:12px;">{_fmt(_etp['agg_tp1'])} / {_fmt(_etp['agg_tp2'])} / {_fmt(_etp['agg_tp3'])}</div>
+  </div>
 
-      {_std_zone_html}
+  {_std_zone_html}
 
-      {_golden_zone_html}
+  {_golden_zone_html}
 
-      {_sniper_zone_html}
+  {_sniper_zone_html}
 
-    </div>"""
+</div>"""
 
                         _mgmt_html = f"""
-    <div style="background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:10px 14px;margin-top:8px;">
-      <div style="color:#58a6ff;font-size:11px;text-transform:uppercase;letter-spacing:1px;font-weight:700;margin-bottom:8px;">
-        📋 Trade Management Plan</div>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:12px;">
-        <div>
-          <div style="color:#8892b0;">SL Method</div>
-          <div style="color:#ccd6f6;">ATR-adaptive — {_sl_pct:.1f}% (ATR = {_atr_pct:.1f}%)</div>
-        </div>
-        <div>
-          <div style="color:#8892b0;">Invalidation Anchor</div>
-          <div style="color:#ccd6f6;">{'Below candle low' if _dir=='long' else 'Above candle high'} + 0.5× ATR buffer</div>
-        </div>
-        <div style="margin-top:6px;">
-          <div style="color:#8892b0;">At TP1</div>
-          <div style="color:#ccd6f6;">Close 30–50% of position → move SL to breakeven</div>
-        </div>
-        <div style="margin-top:6px;">
-          <div style="color:#8892b0;">At TP2</div>
-          <div style="color:#ccd6f6;">Close another 30% → trail SL below last swing</div>
-        </div>
-        <div style="margin-top:6px;">
-          <div style="color:#8892b0;">At TP3 / Let Run</div>
-          <div style="color:#ccd6f6;">Hold remaining 20–40% with trailing SL for extended move</div>
-        </div>
-        <div style="margin-top:6px;">
-          <div style="color:#8892b0;">Skip Signal If</div>
-          <div style="color:#ccd6f6;">Price already &gt;1R from aggressive entry without a retrace</div>
-        </div>
-      </div>
-      <div style="margin-top:10px;padding-top:8px;border-top:1px solid #21262d;color:#8892b0;font-size:10px;line-height:1.5;">
-        <b style="color:#58a6ff;">Mgmt modes the backtest tests (4):</b><br>
-        • <b style="color:#ccd6f6;">Simple</b> — full size, hold to TP2 or original SL<br>
-        • <b style="color:#ccd6f6;">Partial</b> — TP 50% at 1R + auto-move SL to breakeven on remaining (lower risk after 1R, capped upside)<br>
-        • <b style="color:#ccd6f6;">Partial-NoBE</b> — TP 50% at 1R, KEEP original SL on remaining (real downside but full upside if it works)<br>
-        • <b style="color:#ccd6f6;">Trailing</b> — full size, BE at 1R, then trail 0.5×ATR until SL or TP
-      </div>
-    </div>"""
+<div style="background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:10px 14px;margin-top:8px;">
+  <div style="color:#58a6ff;font-size:11px;text-transform:uppercase;letter-spacing:1px;font-weight:700;margin-bottom:8px;">
+    📋 Trade Management Plan</div>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:12px;">
+    <div>
+      <div style="color:#8892b0;">SL Method</div>
+      <div style="color:#ccd6f6;">ATR-adaptive — {_sl_pct:.1f}% (ATR = {_atr_pct:.1f}%)</div>
+    </div>
+    <div>
+      <div style="color:#8892b0;">Invalidation Anchor</div>
+      <div style="color:#ccd6f6;">{'Below candle low' if _dir=='long' else 'Above candle high'} + 0.5× ATR buffer</div>
+    </div>
+    <div style="margin-top:6px;">
+      <div style="color:#8892b0;">At TP1</div>
+      <div style="color:#ccd6f6;">Close 30–50% of position → move SL to breakeven</div>
+    </div>
+    <div style="margin-top:6px;">
+      <div style="color:#8892b0;">At TP2</div>
+      <div style="color:#ccd6f6;">Close another 30% → trail SL below last swing</div>
+    </div>
+    <div style="margin-top:6px;">
+      <div style="color:#8892b0;">At TP3 / Let Run</div>
+      <div style="color:#ccd6f6;">Hold remaining 20–40% with trailing SL for extended move</div>
+    </div>
+    <div style="margin-top:6px;">
+      <div style="color:#8892b0;">Skip Signal If</div>
+      <div style="color:#ccd6f6;">Price already &gt;1R from aggressive entry without a retrace</div>
+    </div>
+  </div>
+  <div style="margin-top:10px;padding-top:8px;border-top:1px solid #21262d;color:#8892b0;font-size:10px;line-height:1.5;">
+    <b style="color:#58a6ff;">Mgmt modes the backtest tests (4):</b><br>
+    • <b style="color:#ccd6f6;">Simple</b> — full size, hold to TP2 or original SL<br>
+    • <b style="color:#ccd6f6;">Partial</b> — TP 50% at 1R + auto-move SL to breakeven on remaining (lower risk after 1R, capped upside)<br>
+    • <b style="color:#ccd6f6;">Partial-NoBE</b> — TP 50% at 1R, KEEP original SL on remaining (real downside but full upside if it works)<br>
+    • <b style="color:#ccd6f6;">Trailing</b> — full size, BE at 1R, then trail 0.5×ATR until SL or TP
+  </div>
+</div>"""
 
                         st.markdown(
                             f'<div style="background:#0d1f2d;border:1px solid #1f6feb;'
@@ -10259,7 +10259,7 @@ def render_auto_analyzer(ticker: str, df_full_1d: pd.DataFrame, tc: float,
                     )
 
     def _render_tf_tab(signals):
-        """Render Trend-Following (T1/T2) tab: banner, summary table, and signal cards."""
+        """Render Trend-Following (T1/T2) tab: banner, summary table, cards."""
         if not signals:
             st.info(
                 "📭 No T1/T2 trend setups passed the current filters. "
@@ -10323,7 +10323,7 @@ def render_auto_analyzer(ticker: str, df_full_1d: pd.DataFrame, tc: float,
         _render_cards_loop(signals)
 
     def _render_ct_tab(signals):
-        """Render Countertrend (T3) tab: banner, summary table, and signal cards."""
+        """Render Countertrend (T3) tab: banner, summary table, cards."""
         if not signals:
             st.info(
                 "📭 No T3 countertrend fades passed the current filters. "
